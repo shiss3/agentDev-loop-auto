@@ -12,7 +12,7 @@
 |---|------|---------|
 | 1 | 多终端上下文隔离 | 共享上下文管理器（Phase 2） |
 | 2 | 上下文传递成本高 | LangGraph State + system_prompt 注入 |
-| 3 | 缺少代码审查 | Hooks（PreToolUse）自动拦截审查（Phase 3） |
+| 3 | 缺少代码审查 | Hooks（PreToolUse）自动拦截审查（Phase 3） | 目前 claude code 能不能对代码测试？
 | 4 | 经验无法沉淀 | .skills 知识库自动生成（Phase 4） |
 
 ---
