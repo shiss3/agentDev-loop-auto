@@ -1,6 +1,7 @@
 # Phase 2: CLI Chat 交互模式 + 上下文集成
 
-> **版本**: v1.0 | **日期**: 2026-06-07 | **前置**: Phase 1 已完成
+> **版本**: v1.1 | **日期**: 2026-06-07 | **前置**: Phase 1 已完成
+> **v1.1 修正**: prompt_async 替换 / ChatSession 过渡态标记 / 动态上下文热更新 / Markdown Buffer 策略
 
 ---
 
@@ -89,10 +90,10 @@
 
 | # | 原则 | 说明 |
 |---|------|------|
-| 1 | **SDK 直连** | Chat 模式绕过 LangGraph，直接用 ClaudeSDKClient 管理会话。LangGraph 编排留给后续阶段。 |
-| 2 | **事件驱动** | 定义 `ChatEvent` 统一事件类型，Session 只产出事件，Renderer 只消费事件，职责清晰。 |
+| 1 | **SDK 直连（过渡态）** | Chat 模式绕过 LangGraph，直接用 ClaudeSDKClient 管理会话。**⚠️ ChatSession 是过渡态组件**：Phase 3 引入多 Agent 路由时，多轮对话管理权将交还给 LangGraph StateGraph + Checkpointer。当前设计中 ChatSession 的事件流协议（`ChatEvent`）和渲染层（`ChatRenderer`）是长期资产，SDK 封装层则会被 LangGraph 节点替代。 |
+| 2 | **事件驱动** | 定义 `ChatEvent` 统一事件类型，Session 只产出事件，Renderer 只消费事件，职责清晰。**这是跨 Phase 的长期协议。** |
 | 3 | **渲染分离** | ChatSession 绝不 print。所有终端输出由 ChatRenderer 独占。 |
-| 4 | **上下文可插拔** | 共享上下文通过 `ContextProvider` 协议注入 ChatSession，方案由用户提供，本阶段只定义接口。 |
+| 4 | **上下文可插拔 + 可热更新** | 共享上下文通过 `ContextProvider` 协议注入 ChatSession。当上下文发生关键变更时（如新 .skills 沉淀、项目切换），ContextProvider 通过 `has_context_changed()` 信号触发 ChatSession 平滑重启底层 Client，并将历史摘要灌入新 Client 防止"失忆"。方案由用户提供，本阶段只定义接口。 |
 | 5 | **向后兼容** | 保留 `harness run` 命令不变，Phase 1 的 LangGraph 管道继续可用。 |
 
 ---
@@ -284,9 +285,27 @@ def usage_event(
    用户实现 ContextProvider 后注入 ChatSession 即可。
 
 接口职责：
-   1. build_system_prompt()  — 将上下文组装为 system_prompt 注入 SDK
-   2. on_turn_end()          — Agent 完成一轮对话后更新上下文
-   3. get_context_summary()  — 给 /context show 命令返回摘要
+   1. build_system_prompt()   — 将上下文组装为 system_prompt 注入 SDK
+   2. on_turn_end()           — Agent 完成一轮对话后更新上下文
+   3. has_context_changed()   — 检测上下文是否发生关键变更（触发 Client 热重启）
+   4. get_history_summary()   — 获取历史摘要（Client 重启时灌入防"失忆"）
+   5. get_context_summary()   — 给 /context show 命令返回摘要
+
+关于动态上下文热更新（v1.1 新增）：
+   ─────────────────────────────────────────
+   问题：ClaudeSDKClient 启动后，system_prompt 是固定的。
+   但在多轮对话中上下文可能变化（新 .skills 沉淀、项目切换等），
+   存活的 Client 实例无法动态热更新 System Prompt。
+
+   解决方案：
+   每轮对话结束后，ChatSession 调用 has_context_changed()。
+   如果返回 True，ChatSession 平滑重启底层 Client：
+     1. 调用 get_history_summary() 获取对话历史摘要
+     2. 关闭旧 Client
+     3. 用新的 system_prompt（含更新后的上下文）创建新 Client
+     4. 将历史摘要作为首条消息灌入新 Client
+   对用户完全透明，不中断聊天体验。
+   ─────────────────────────────────────────
 """
 
 from __future__ import annotations
@@ -333,6 +352,24 @@ class ContextProvider(Protocol):
         """
         ...
 
+    def has_context_changed(self) -> bool:
+        """检测上下文是否发生了关键变更
+        
+        ChatSession 在每轮对话结束后调用此方法。
+        如果返回 True，ChatSession 将平滑重启底层 Client
+        以应用最新的上下文。
+        """
+        ...
+
+    def get_history_summary(
+        self,
+        collected_texts: list[str],
+        tool_calls: list[dict],
+        turn_count: int,
+    ) -> str:
+        """生成对话历史摘要 — 用于 Client 重启时防"失忆""""
+        ...
+
     def get_context_summary(self) -> str:
         """返回当前上下文的摘要 — 供 /context show 命令使用"""
         ...
@@ -355,6 +392,17 @@ class DefaultContextProvider:
     ) -> None:
         pass  # 默认不做任何事
 
+    def has_context_changed(self) -> bool:
+        return False  # 默认上下文永远不变
+
+    def get_history_summary(
+        self,
+        collected_texts: list[str],
+        tool_calls: list[dict],
+        turn_count: int,
+    ) -> str:
+        return ""  # 默认无历史摘要
+
     def get_context_summary(self) -> str:
         return "[未配置共享上下文]"
 ```
@@ -376,6 +424,15 @@ class DefaultContextProvider:
 2. 将 SDK 的 Message/Block 转换为 ChatEvent 事件流
 3. 注入共享上下文到 system_prompt
 4. 维护对话统计（轮次 / Token / 工具调用数）
+5. 检测上下文变更，平滑重启底层 Client（v1.1）
+
+⚠️ 过渡态说明：
+   ChatSession 是 Phase 2 的单 Agent 封装，Phase 3 中
+   多轮对话管理权将交还给 LangGraph StateGraph + Checkpointer。
+   此时 ChatSession 退役，但以下部分会被复用：
+   - ChatEvent 事件协议 → LangGraph 节点也产出 ChatEvent
+   - ChatRenderer → 继续消费 ChatEvent
+   - ContextProvider → 继续通过 system_prompt 注入上下文
 
 绝不做的事：
 - ❌ print() / 终端输出（交给 Renderer）
@@ -468,6 +525,8 @@ class ChatSession:
         self._client: ClaudeSDKClient | None = None
         self.stats = SessionStats()
         self._is_active = False
+        self._all_collected_texts: list[str] = []
+        self._all_tool_calls: list[dict] = []
 
     @property
     def is_active(self) -> bool:
@@ -507,6 +566,28 @@ class ChatSession:
             await self._client.__aexit__(None, None, None)
             self._client = None
         self._is_active = False
+
+    async def _hot_restart_client(self) -> None:
+        """v1.1: 平滑重启底层 Client — 应用最新上下文"""
+        history_summary = self.context_provider.get_history_summary(
+            collected_texts=self._all_collected_texts,
+            tool_calls=self._all_tool_calls,
+            turn_count=self.stats.turn_count,
+        )
+
+        if self._client:
+            await self._client.__aexit__(None, None, None)
+
+        options = self._build_options()
+        self._client = ClaudeSDKClient(options=options)
+        await self._client.__aenter__()
+
+        if history_summary:
+            await self._client.query(
+                f"[系统] 以下是之前对话的摘要，请基于此继续：\n{history_summary}"
+            )
+            async for _ in self._client.receive_response():
+                pass
 
     async def send(self, prompt: str) -> AsyncIterator[ChatEvent]:
         """发送一条消息，返回事件流
@@ -588,8 +669,10 @@ class ChatSession:
             yield error_event(f"SDK 异常: {str(e)}")
             collected_texts.append(f"[错误] {str(e)}")
 
-        # ── 更新统计 ──
+        # ── 更新统计 + 历史记录 ──
         self.stats.total_tool_calls += turn_tool_count
+        self._all_collected_texts.extend(collected_texts)
+        self._all_tool_calls.extend(tool_calls)
         duration_ms = int((time.monotonic() - start_time) * 1000)
 
         # ── 通知 ContextProvider 更新上下文 ──
@@ -599,6 +682,10 @@ class ChatSession:
             response_summary=response_summary,
             tool_calls=tool_calls,
         )
+
+        # ── v1.1: 检测上下文变更，触发 Client 热重启 ──
+        if self.context_provider.has_context_changed():
+            await self._hot_restart_client()
 
         # ── TURN_END ──
         yield turn_end_event(
@@ -658,12 +745,22 @@ Phase 1 的 TerminalRenderer 做了什么：
   - 基本的工具名展示
 
 Phase 2 的 ChatRenderer 新增：
-  - Rich Markdown 渲染 Agent 文本
+  - Rich Markdown 渲染 Agent 文本（Buffer 策略）
   - Spinner 动画（Agent 思考时）
   - 工具调用折叠显示（名称 + 状态图标，输入可展开）
   - Turn 起止分隔线
   - Token 用量统计面板
   - 累计耗时
+
+v1.1 Markdown Buffer 策略：
+  ─────────────────────────────────────────
+  问题：如果 SDK 分块流式吐出文本（chunk-by-chunk），
+  半截 Markdown 丢给 Rich 渲染会导致格式错乱和终端闪烁。
+
+  解决方案（两阶段渲染）：
+  1. 流式阶段：每收到 TEXT 事件，先以纯文本打印到终端
+  2. 完成阶段：当 TURN_END 事件到来时，用完整的 Buffer 做一次 Markdown 精渲染
+  ─────────────────────────────────────────
 """
 
 from __future__ import annotations
@@ -689,6 +786,7 @@ class ChatRenderer:
         self.total_tool_count = 0
         self._current_text_buffer: list[str] = []
         self._spinner_live: Live | None = None
+        self._has_streamed_text = False
 
     # ── 公共入口 ──
 
@@ -714,28 +812,21 @@ class ChatRenderer:
         """渲染一轮对话的开始"""
         self.turn_tool_count = 0
         self._current_text_buffer = []
+        self._has_streamed_text = False
         self._stop_spinner()
         self.console.print()
         # 启动思考动画
         self._start_spinner()
 
     def _render_text(self, event: ChatEvent) -> None:
-        """渲染 Agent 文本输出
-
-        收到第一个 text 事件时停止 spinner，
-        使用 Rich Markdown 渲染。
-        """
+        """渲染 Agent 文本输出 — Buffer 策略"""
         self._stop_spinner()
         text = event.data.get("text", "")
         self._current_text_buffer.append(text)
 
-        # 用 Markdown 渲染整段文本
-        # 注意：SDK 可能一次性给完整文本块，而非逐字流式
-        try:
-            self.console.print(Markdown(text))
-        except Exception:
-            # Markdown 解析失败时回退到纯文本
-            self.console.print(text, end="")
+        # 流式阶段：纯文本即时输出
+        self.console.print(text, end="", highlight=False)
+        self._has_streamed_text = True
 
     def _render_tool_use(self, event: ChatEvent) -> None:
         """渲染工具调用 — 紧凑的单行显示"""
@@ -770,8 +861,16 @@ class ChatRenderer:
             self.console.print(f"  [green]✓ 完成[/green]")
 
     def _render_turn_end(self, event: ChatEvent) -> None:
-        """渲染一轮对话结束 — 统计信息"""
+        """渲染一轮对话结束 — Markdown 精渲染 + 统计信息"""
         self._stop_spinner()
+        
+        # Markdown 精渲染
+        if self._has_streamed_text and self._current_text_buffer:
+            full_text = "".join(self._current_text_buffer)
+            if any(indicator in full_text for indicator in ["```", "# ", "**", "- ", "1. ", "| ", "> "]):
+                self.console.print()
+                self.console.print(Panel(Markdown(full_text), border_style="dim", expand=True, padding=(0, 1)))
+
         tool_count = event.data.get("tool_count", 0)
         duration_ms = event.data.get("duration_ms", 0)
 
@@ -1168,11 +1267,7 @@ class ChatCLI:
     async def _get_input(self) -> str | None:
         """获取用户输入（带历史 / 自动补全）"""
         try:
-            # prompt_toolkit 在 asyncio 中需要用 run_in_executor
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self._prompt_session.prompt("You > "),
-            )
+            result = await self._prompt_session.prompt_async("You > ")
             return result
         except EOFError:
             return None
@@ -1441,6 +1536,14 @@ def test_default_provider_summary():
     assert "未配置" in provider.get_context_summary()
 
 
+def test_default_provider_context_never_changes():
+    provider = DefaultContextProvider()
+    assert provider.has_context_changed() is False
+
+def test_default_provider_empty_history():
+    provider = DefaultContextProvider()
+    assert provider.get_history_summary([], [], 0) == ""
+
 def test_protocol_compliance():
     """验证 DefaultContextProvider 实现了 ContextProvider 协议"""
     provider = DefaultContextProvider()
@@ -1477,10 +1580,11 @@ def test_protocol_compliance():
 |---|------|------|------|
 | 1 | **ClaudeSDKClient 多轮 API 行为不明** | `client.query()` 连续调用是否保持上下文未验证 | Step 3 开始时先写探测测试；准备 `query()` 降级方案 |
 | 2 | **SDK 的 Message 结构可能与 Phase 1 探测不同** | ChatSession 的事件转换逻辑可能需要调整 | 保持与 Phase 1 相同的 isinstance 判断，新类型走 fallback |
-| 3 | **prompt-toolkit 与 asyncio 冲突** | `PromptSession.prompt()` 是同步阻塞的 | 用 `run_in_executor` 包装为异步调用 |
-| 4 | **Rich Live/Spinner 与流式输出冲突** | Spinner 和文本输出可能交错 | 严格在 `_render_text` 前调用 `_stop_spinner` |
-| 5 | **Windows 终端 emoji 显示** | 某些 Windows 终端不支持 emoji | 提供配置项关闭 emoji，回退到 ASCII 符号 |
-| 6 | **用户尚未提供上下文方案** | Phase 2 可能在上下文集成部分阻塞 | `DefaultContextProvider` 做完整占位，不依赖用户方案即可完成其余功能 |
+| 3 | **Rich Live/Spinner 与流式输出冲突** | Spinner 和文本输出可能交错 | 严格在 `_render_text` 前调用 `_stop_spinner` |
+| 4 | **Windows 终端 emoji 显示** | 某些 Windows 终端不支持 emoji | 提供配置项关闭 emoji，回退到 ASCII 符号 |
+| 5 | **用户尚未提供上下文方案** | Phase 2 可能在上下文集成部分阻塞 | `DefaultContextProvider` 做完整占位，不依赖用户方案即可完成其余功能 |
+| 6 | **Client 热重启时的消息丢失** | 热重启期间如果用户恰好发送消息可能丢失 | 热重启发生在 `send()` 末尾、下一次 `_get_input()` 之前，不会与用户输入竞争 |
+| 7 | **ChatSession 过渡态带来的 Phase 3 重构成本** | Phase 3 引入 LangGraph 多 Agent 时需要替换 ChatSession | 已明确标记过渡态；ChatEvent 协议和 ChatRenderer 是长期资产，只需替换事件源 |
 
 ---
 
@@ -1517,3 +1621,37 @@ Step 5 (commands) ──→  Step 6 (repl) ──→  Step 7 (cli) ──→ Ste
 
 > **关键路径**: events → session → renderer → repl → cli  
 > **可并行**: Step 1+2 可同时进行；Step 5 可与 Step 4 并行
+
+---
+
+## 🔮 Phase 3 前瞻：LangGraph Checkpointer 与 ClaudeSDKClient 的整合
+
+> 以下是对你提出的「Phase 3 如何处理 LangGraph 持久化状态与 SDK 内部会话之间的整合」问题的架构思考。
+
+### 核心矛盾
+
+Phase 3 引入多 Agent 路由后，系统中会同时存在两套状态机：
+
+| 状态机 | 管理者 | 状态内容 | 持久化 |
+|--------|--------|----------|--------|
+| **图状态** | LangGraph StateGraph + Checkpointer | 路由决策、Agent 选择、重试计数、共享上下文 | ✅ 通过 Checkpointer 持久化 |
+| **会话状态** | ClaudeSDKClient 内部 | ReAct 循环、工具调用栈、对话历史 | ❌ 仅内存，Client 关闭即丢失 |
+
+这就是 Phase 1 文档中预警的「脑裂」问题的升级版。
+
+### 整合策略：LangGraph 为主，SDK 为从
+
+1. **SDK Client 降为短生命周期**：每个 LangGraph Agent 节点执行时，创建一个新的 `query()` 调用（不是 `ClaudeSDKClient` 长连接）。SDK 的内部会话状态不再需要跨节点保持。
+2. **LangGraph 的 Checkpointer 接管持久化**：所有需要跨轮次、跨 Agent 保持的状态，都通过 `HarnessState` 的字段 + Checkpointer 来管理。
+3. **上下文桥接**：每个 Agent 节点执行前，从 `state.agent_memory` 中提取上一轮的摘要，注入到 `query()` 的 prompt 中（而非依赖 SDK 内部的会话记忆）。
+4. **ChatEvent 协议复用**：Agent 节点内部仍然产出 `ChatEvent`，通过 LangGraph 的 `adispatch_custom_event` 桥接到 Renderer。Phase 2 的 ChatRenderer 无需修改。
+
+### Phase 2 → Phase 3 的迁移路径
+
+| Phase 2 组件 | Phase 3 命运 | 说明 |
+|-------------|-------------|------|
+| `ChatEvent` | ✅ **保留** | 长期事件协议 |
+| `ChatRenderer` | ✅ **保留** | 消费 ChatEvent |
+| `ContextProvider` | ✅ **保留** | 继续提供 system_prompt 注入 |
+| `ChatCLI` | ✅ **保留** | 输入循环不变，底层切到 LangGraph |
+| `ChatSession` | ❌ **退役** | 被 LangGraph 替代 |
