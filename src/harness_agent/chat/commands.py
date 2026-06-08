@@ -2,6 +2,9 @@
 
 用户在 REPL 中输入 / 开头的命令时，
 由此模块解析并执行，不发送给 Agent。
+
+Phase 2.5 (TUI 版):
+  命令输出通过 ChatCLI.renderer.render_command_result() → ContentBuffer 渲染。
 """
 
 from __future__ import annotations
@@ -56,10 +59,10 @@ def all_commands() -> dict[str, SlashCommand]:
 
 @slash_command("help", "显示所有可用命令")
 async def cmd_help(cli: "ChatCLI", args: str) -> None:
-    lines = ["[bold]可用命令:[/bold]"]
+    lines = ["可用命令:"]
     for name, cmd in sorted(_COMMANDS.items()):
         usage_str = f" {cmd.usage}" if cmd.usage else ""
-        lines.append(f"  [cyan]/{name}[/cyan]{usage_str}  — {cmd.description}")
+        lines.append(f"  /{name}{usage_str}  — {cmd.description}")
     cli.renderer.render_command_result("\n".join(lines))
 
 
@@ -76,7 +79,7 @@ async def cmd_quit(cli: "ChatCLI", args: str) -> None:
 @slash_command("clear", "清空当前会话，重新开始")
 async def cmd_clear(cli: "ChatCLI", args: str) -> None:
     await cli.reset_session()
-    cli.renderer.render_command_result("[green]✅ 会话已清空[/green]")
+    cli.renderer.render_command_result("会话已清空")
 
 
 @slash_command("context", "显示当前共享上下文摘要", usage="[show]")
@@ -102,12 +105,12 @@ async def cmd_project(cli: "ChatCLI", args: str) -> None:
     if args.strip():
         new_dir = args.strip()
         cli.renderer.render_command_result(
-            f"[yellow]切换项目到 {new_dir}，会话将重建...[/yellow]"
+            f"切换项目到 {new_dir}，会话将重建..."
         )
         await cli.switch_project(new_dir)
     else:
         cli.renderer.render_command_result(
-            f"当前项目: [cyan]{cli.session.project_dir}[/cyan]"
+            f"当前项目: {cli.session.project_dir}"
         )
 
 
@@ -115,9 +118,9 @@ async def cmd_project(cli: "ChatCLI", args: str) -> None:
 async def cmd_model(cli: "ChatCLI", args: str) -> None:
     if args.strip():
         cli.renderer.render_command_result(
-            f"[yellow]切换模型到 {args.strip()}，会话将重建...[/yellow]"
+            f"切换模型到 {args.strip()}，会话将重建..."
         )
         await cli.switch_model(args.strip())
     else:
         current = cli.session.model or "default"
-        cli.renderer.render_command_result(f"当前模型: [cyan]{current}[/cyan]")
+        cli.renderer.render_command_result(f"当前模型: {current}")

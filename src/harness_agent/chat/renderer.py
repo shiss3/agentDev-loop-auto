@@ -1,36 +1,53 @@
-"""ChatRenderer — 增强终端渲染器
+"""ChatRenderer — TUI 渲染器
 
-Phase 1 的 TerminalRenderer 做了什么：
-  - 简单 console.print 文本
-  - 基本的工具名展示
+消费 ChatEvent，驱动 TuiApp + ContentBuffer。
+不直接操作终端，所有输出通过 TuiApp 组件完成。
 
-Phase 2 的 ChatRenderer 新增：
-  - 流式纯文本渲染（无事后精渲染，避免双重打印）
-  - Spinner 动画（Agent 思考时）
-  - 工具调用折叠显示（名称 + 状态图标，输入可展开）
-  - Turn 起止分隔线
-  - Token 用量统计面板
-  - 累计耗时
+Phase 2.5 策略：流式阶段纯文本追加，Turn End 后暂不做 Markdown 精渲染。
 """
 
 from __future__ import annotations
 
-from rich.console import Console
-from rich.panel import Panel
-from rich.spinner import Spinner
-from rich.live import Live
-
 from harness_agent.chat.events import ChatEvent, EventType
+from harness_agent.chat.content_buffer import ContentBuffer
+from harness_agent.chat.tui_app import TuiApp
+
+
+# 工具名 → 图标
+_TOOL_ICONS = {
+    "Read": "📖",
+    "Write": "✏️",
+    "Edit": "📝",
+    "Bash": "⚡",
+    "Grep": "🔍",
+    "Glob": "📂",
+}
+
+
+def _tool_icon(name: str) -> str:
+    return _TOOL_ICONS.get(name, "🛠️")
 
 
 class ChatRenderer:
-    """消费 ChatEvent 流，渲染到终端"""
+    """消费 ChatEvent 流，驱动 TuiApp
 
-    def __init__(self, console: Console | None = None) -> None:
-        self.console = console or Console()
-        self.turn_tool_count = 0
-        self.total_tool_count = 0
-        self._spinner_live: Live | None = None
+    与 Phase 1 的 TerminalRenderer 对比：
+      Phase 1: console.print() → 直接输出到终端
+      Phase 2: tui.content_buffer.append_*() → 通过 prompt_toolkit 渲染
+
+    接口不变：handle(event: ChatEvent) -> None
+    """
+
+    def __init__(self, tui: TuiApp) -> None:
+        self.tui = tui
+        self.buf: ContentBuffer = tui.content_buffer
+        self.turn_tool_count: int = 0
+        self.total_tool_count: int = 0
+
+        # Turn 内统计（供 Turn End 使用）
+        self._turn_input_tokens: int = 0
+        self._turn_output_tokens: int = 0
+        self._turn_start_time: float = 0.0
 
     # ── 公共入口 ──
 
@@ -50,164 +67,109 @@ class ChatRenderer:
         if handler:
             handler(event)
 
-    # ── 各事件类型的渲染实现 ──
+    # ── 事件处理 ──
 
     def _render_turn_start(self, event: ChatEvent) -> None:
-        """渲染一轮对话的开始"""
+        """Turn 开始：追加用户输入 + 启动 Spinner"""
+        import time
+
         self.turn_tool_count = 0
-        self._stop_spinner()
-        self.console.print()
-        # 启动思考动画
-        self._start_spinner()
+        self._turn_input_tokens = 0
+        self._turn_output_tokens = 0
+        self._turn_start_time = time.monotonic()
+
+        prompt = event.data.get("prompt", "")
+        self.buf.append_user_input(prompt)
+        self.tui.start_spinner("思考中...")
+        self.tui.set_status_running()
 
     def _render_text(self, event: ChatEvent) -> None:
-        """渲染 Agent 文本输出 — 纯文本流式输出，无双重打印"""
-        self._stop_spinner()
+        """Agent 文本输出：纯文本流式追加"""
+        self.tui.stop_spinner()
         text = event.data.get("text", "")
-        self.console.print(text, end="", highlight=False)
+        if text:
+            self.buf.append_text(text)
 
     def _render_tool_use(self, event: ChatEvent) -> None:
-        """渲染工具调用 — 紧凑的单行显示"""
-        self._stop_spinner()
+        """工具调用：停止 Spinner → 单行工具日志 → 重启 Spinner"""
+        self.tui.stop_spinner()
+
         self.turn_tool_count += 1
         self.total_tool_count += 1
 
         tool_name = event.data.get("tool_name", "?")
         tool_input = event.data.get("tool_input", "")
-
-        # 工具图标映射
         icon = _tool_icon(tool_name)
 
-        self.console.print(
-            f"  [dim]{icon} [{self.total_tool_count}] "
-            f"[bold]{tool_name}[/bold][/dim]"
-            f" [dim italic]{tool_input}[/dim italic]"
+        self.buf.append_tool_line(
+            icon=icon,
+            index=self.total_tool_count,
+            tool_name=tool_name,
+            summary=tool_input,
+            status="running",
         )
-
-        # 工具执行期间显示 spinner
-        self._start_spinner("  执行中...")
+        self.tui.start_spinner("执行中...")
 
     def _render_tool_result(self, event: ChatEvent) -> None:
-        """渲染工具执行结果"""
-        self._stop_spinner()
-        is_error = event.data.get("is_error", False)
-        content = event.data.get("content", "")[:200]
+        """工具结果：停止 Spinner → 更新最后一行工具状态"""
+        self.tui.stop_spinner()
 
+        is_error = event.data.get("is_error", False)
+        # 目前 ContentBuffer 不支持 retroactively 更新已追加行的状态
+        # 作为简化，追加一个状态行
         if is_error:
-            self.console.print(f"  [red]✗ 失败[/red] [dim]{content}[/dim]")
-        else:
-            self.console.print(f"  [green]✓ 完成[/green]")
+            content = event.data.get("content", "")[:200]
+            self.buf.append_plain(f"  ✗ 失败: {content}")
+        # 成功时不额外输出（工具行本身的 running 状态已足够表达）
 
     def _render_turn_end(self, event: ChatEvent) -> None:
-        """渲染一轮对话结束 — 统计信息"""
-        self._stop_spinner()
+        """Turn 结束：停止 Spinner → 更新状态栏统计"""
+        self.tui.stop_spinner()
 
-        tool_count = event.data.get("tool_count", 0)
-        duration_ms = event.data.get("duration_ms", 0)
+        duration_s = round(
+            (event.data.get("duration_ms", 0) / 1000), 1
+        )
 
-        parts = []
-        if tool_count > 0:
-            parts.append(f"🛠️ {tool_count} 次工具调用")
-        if duration_ms > 0:
-            seconds = duration_ms / 1000
-            parts.append(f"⏱️ {seconds:.1f}s")
-
-        if parts:
-            summary = " · ".join(parts)
-            self.console.print(f"\n  [dim]{summary}[/dim]")
-
-        self.console.print()
+        self.tui.set_status_ready(
+            tool_count=self.turn_tool_count,
+            input_tokens=self._turn_input_tokens,
+            output_tokens=self._turn_output_tokens,
+            duration_s=duration_s,
+        )
+        self.tui.focus_input()
 
     def _render_thinking(self, event: ChatEvent) -> None:
-        """渲染思考状态"""
-        self._start_spinner()
+        """Agent 思考中"""
+        self.tui.start_spinner("思考中...")
 
     def _render_error(self, event: ChatEvent) -> None:
-        """渲染错误"""
-        self._stop_spinner()
+        """错误：停止 Spinner → 追加错误行"""
+        self.tui.stop_spinner()
         error = event.data.get("error", "未知错误")[:500]
-        self.console.print(
-            Panel(
-                f"[red]{error}[/red]",
-                title="💥 错误",
-                border_style="red",
-                expand=False,
-            )
-        )
+        self.buf.append_error(error)
+        self.tui.set_status_text(f"{self.tui.model_name} · 错误")
+        self.tui.focus_input()
 
     def _render_usage(self, event: ChatEvent) -> None:
-        """渲染 Token 用量"""
-        input_t = event.data.get("input_tokens", 0)
-        output_t = event.data.get("output_tokens", 0)
-        cache_r = event.data.get("cache_read_tokens", 0)
-        cache_c = event.data.get("cache_creation_tokens", 0)
+        """Token 用量：暂存统计，Turn End 时一起显示"""
+        self._turn_input_tokens += event.data.get("input_tokens", 0)
+        self._turn_output_tokens += event.data.get("output_tokens", 0)
 
-        parts = [f"📊 in={input_t} out={output_t}"]
-        if cache_r > 0:
-            parts.append(f"cache_read={cache_r}")
-        if cache_c > 0:
-            parts.append(f"cache_create={cache_c}")
+    # ── 辅助渲染（供斜杠命令等使用）──
 
-        self.console.print(f"  [dim]{' '.join(parts)}[/dim]")
-
-    # ── Spinner 管理 ──
-
-    def _start_spinner(self, text: str = "  思考中...") -> None:
-        """启动思考动画"""
-        if self._spinner_live is not None:
-            return  # 已经在转了
-        spinner = Spinner("dots", text=text, style="dim")
-        self._spinner_live = Live(spinner, console=self.console, refresh_per_second=10)
-        self._spinner_live.start()
-
-    def _stop_spinner(self) -> None:
-        """停止思考动画"""
-        if self._spinner_live is not None:
-            self._spinner_live.stop()
-            self._spinner_live = None
-
-    # ── 辅助渲染 ──
-
-    def render_welcome(self, project_dir: str) -> None:
+    def render_welcome(self, project_dir: str, version: str = "0.1.0") -> None:
         """渲染欢迎信息"""
-        self.console.print(
-            Panel(
-                "[bold cyan]🐴 Harness Agent — Chat Mode[/bold cyan]\n\n"
-                f"[dim]项目:[/dim] {project_dir}\n"
-                "[dim]输入消息开始对话，输入 [bold]/help[/bold] 查看命令[/dim]",
-                border_style="cyan",
-                expand=False,
-            )
-        )
-        self.console.print()
+        self.buf.append_plain(f" harness Agent v{version} · 工作区: {project_dir}")
+        self.buf.append_blank_line()
+        self.tui.set_status_text(f"{self.tui.model_name} · 就绪")
 
     def render_goodbye(self, stats: dict) -> None:
         """渲染退出信息"""
         turns = stats.get("turn_count", 0)
         tools = stats.get("total_tool_calls", 0)
-        self.console.print()
-        self.console.print(
-            Panel(
-                f"[dim]本次会话: {turns} 轮对话 · {tools} 次工具调用[/dim]",
-                title="👋 再见",
-                border_style="dim",
-                expand=False,
-            )
-        )
+        self.buf.append_blank_line()
+        self.buf.append_plain(f"本次会话: {turns} 轮对话 · {tools} 次工具调用")
 
     def render_command_result(self, text: str) -> None:
         """渲染斜杠命令结果"""
-        self.console.print(f"  {text}")
-
-
-def _tool_icon(tool_name: str) -> str:
-    """工具名 → 图标"""
-    icons = {
-        "Read": "📖",
-        "Write": "✏️",
-        "Edit": "📝",
-        "Bash": "⚡",
-        "Grep": "🔍",
-        "Glob": "📂",
-    }
-    return icons.get(tool_name, "🛠️")
+        self.buf.append_plain(text)
