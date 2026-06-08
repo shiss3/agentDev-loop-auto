@@ -434,3 +434,204 @@ def _to_home(event):
 prompt_toolkit 的 `Window.vertical_scroll` 是**派生量**，不是**控制量**。
 直接写它不会持久 —— 渲染时 `_scroll` 永远会按 `cursor_position` 把它重新算出来。
 要控制滚动位置，必须控制 **`ui_content.cursor_position.y`**，让 `_scroll` 替我们算 `vertical_scroll`。
+
+---
+
+# 第三轮修复 — Mouse Trap：开启鼠标后无法复制文本
+
+## 现象
+
+第二轮把 `mouse_support=True` 打开后，鼠标滚轮、PageUp/PageDown、内容自动跟随都正常工作了。
+但出现新问题：**无法用鼠标左键拖拽选择文本进行复制**。
+
+对一个 AI 辅助编程 TUI 而言，从内容区把 Agent 输出的代码、错误日志、命令拷出去是**最高频**的操作之一。
+当前行为相当于在每个复制动作前都加了一个隐藏前置键（Shift），用户极易踩坑。
+
+## 根因
+
+`mouse_support=True` 让 prompt_toolkit 向终端发送 `DECSET 1000/1002/1006` 序列（`input/vt100_parser.py`、`renderer.py` 中的 `ALTERNATE_SCREEN` + mouse tracking 开关），
+告诉终端把所有鼠标事件（按下、移动、滚轮）以**转义序列**形式回传给应用，而不是交给终端自己处理。
+
+一旦终端进入 mouse tracking 模式：
+
+| 行为 | 没开 mouse_support | 开了 mouse_support |
+|------|---------------------|---------------------|
+| 左键拖拽选中 | ✅ 终端处理，可复制 | ❌ 被应用吞掉 |
+| 右键菜单（粘贴） | ✅ 终端处理 | ❌ 被应用吞掉 |
+| 滚轮 | ❌ 应用收不到 | ✅ 应用收到 |
+| Shift+拖拽 | ✅ | ✅（终端开了 mouse bypass） |
+
+各终端实现差异：
+- **Windows Terminal / VS Code 终端**：必须按住 `Shift` 才能绕过应用做系统级选择
+- **iTerm2 (macOS)**：默认 `Option` 或 `Cmd`（看版本），新版也支持 `Shift`
+- **GNOME Terminal / Konsole**：`Shift`
+
+对刚切到 TUI 的用户而言，"为什么我选不中字"会是非常陡的体验断崖。
+
+## 解决方向梳理
+
+| 方案 | 思路 | 评价 |
+|------|------|------|
+| A. 不要鼠标，回到 `False` | 放弃滚轮，靠 PageUp/PageDown/Home/End | ❌ 滚轮是大多数用户最自然的滚动方式，舍弃太可惜 |
+| B. 用户教育（提示 Shift+拖拽） | 在状态栏写一行 hint | ⚠ 治标不治本，仍要按额外键 |
+| C. **运行时切换 mouse_support** | 默认关，按某个键临时进入"滚动模式"再关回去 | ✅ 可行，但状态切换成本高、易迷失 |
+| D. **mouse_support 默认开，加一个"复制模式"切换键** | 一键关掉鼠标捕获，再按一次开回来 | ✅✅ 与现代 IDE 终端体验最接近，本次推荐 |
+| E. 仅捕获滚轮，不捕获按下/拖拽 | 在 mouse handler 里只处理 SCROLL_UP/DOWN | ⚠ prompt_toolkit 在协议层就开了 button-event tracking，仍会拦截左键 |
+
+方案 D 是终极方案；但它依赖 prompt_toolkit 是否能在**应用运行时**切换 `mouse_support`（默认值是 `Application` 构造参数）。
+
+经查 `prompt_toolkit==3.0.52` 源码：
+- `Application.__init__` 把 `mouse_support` 存成 `self.mouse_support`（`application/application.py`）
+- 此值在每次 `Renderer.render` 时被读取，决定是否发送 `enable_mouse` / `disable_mouse` 转义序列
+- 它接受 `FilterOrBool`，所以可以传一个**动态 Filter**，每次渲染时回调判断
+
+→ **可以运行时切换**。只需把 `mouse_support` 从 `True` 改为 `Condition(lambda: self._mouse_enabled)`，配一个开关键即可。
+
+## 最终方案
+
+### 思路
+
+1. 默认 `mouse_support` **开启**（保持滚轮可用，覆盖 80% 的使用场景）
+2. 提供一个**复制模式**：按一次热键 → 关闭鼠标捕获 → 用户用鼠标自由选中/复制 → 再按一次热键 → 恢复鼠标捕获
+3. 在状态栏明确显示当前模式（`📋 复制模式` / `🖱 鼠标已启用`）
+4. 提供两条退路：
+   - 单字符快捷键：`F2`（不冲突任何输入；Ctrl+M = Enter 在终端是别名，必须避开）
+   - 命令式：用户可在配置里把默认值设成 `False`，彻底关掉鼠标
+5. 复制模式下，仍可用 PageUp/PageDown/Home/End 滚动 —— **滚动 ≠ 必须用鼠标**
+
+### 改动清单（仅 `src/harness_agent/chat/tui_app.py`）
+
+#### 改动 1：新增鼠标开关状态
+
+`__init__`：
+
+```python
+self._mouse_enabled: bool = True   # 默认开启鼠标支持
+```
+
+构造参数加一个开关，让上游可以默认关掉：
+
+```python
+def __init__(
+    self,
+    content_buffer: ContentBuffer,
+    model_name: str = "default",
+    history_file: str | None = None,
+    mouse_default: bool = True,    # ← 新增
+) -> None:
+    ...
+    self._mouse_enabled = mouse_default
+```
+
+#### 改动 2：把 `mouse_support` 改成动态 Filter
+
+```python
+from prompt_toolkit.filters import Condition
+
+# _build_app 中：
+return Application(
+    layout=layout,
+    style=_TUI_STYLE,
+    key_bindings=kb,
+    full_screen=True,
+    mouse_support=Condition(lambda: self._mouse_enabled),   # ← 动态
+)
+```
+
+`Condition` 每帧被 Renderer 读取；切换 `self._mouse_enabled` 后下一帧会自动发送对应的 enable/disable mouse 转义序列。
+
+#### 改动 3：F2 切换 + Shift+F2 永久关闭
+
+`_build_key_bindings` 中追加：
+
+```python
+@kb.add("f2")
+def _toggle_mouse(event):
+    """F2: 临时切换鼠标捕获（复制模式 ↔ 鼠标模式）"""
+    self._mouse_enabled = not self._mouse_enabled
+    self._update_status_for_mouse()
+    self._invalidate()
+```
+
+#### 改动 4：状态栏显示当前模式
+
+```python
+def _update_status_for_mouse(self) -> None:
+    if self._mouse_enabled:
+        self.set_status_text(f"{self.model_name} · 🖱 鼠标已启用（F2 进入复制模式）")
+    else:
+        self.set_status_text(f"{self.model_name} · 📋 复制模式：可自由选中文本（F2 退出）")
+```
+
+> ⚠ 注意：`set_status_running` / `set_status_ready` 也要保留这个 hint 的位置，
+> 否则一旦 Agent 开始运行，状态栏被覆盖，用户会忘记自己在哪个模式。
+> 最稳妥做法是把"模式"作为状态栏 **独立** 一段（拼接到末尾），不与运行/就绪互相覆盖。
+
+更彻底的写法是把状态栏拆成两段：
+
+```python
+def _get_status_fragments(self) -> StyleAndTextTuples:
+    mode_hint = "  [📋 复制模式 F2]" if not self._mouse_enabled else ""
+    return FormattedText([
+        ("class:statusbar.model", f" {self._status_text}"),
+        ("class:statusbar.info", mode_hint),
+    ])
+```
+
+这样 `_status_text` 只承载业务状态，模式 hint 不会被运行/就绪刷新覆盖。
+
+#### 改动 5：首次启动提示
+
+在 `run()` 开头往内容区追加一行提示（仅一次）：
+
+```python
+self.content_buffer.append_system_line(
+    "提示：鼠标滚轮可滚动内容；复制文本请按 F2 进入复制模式（或在该模式外按住 Shift 拖拽）"
+)
+```
+
+让用户不需要读文档就知道两条路：F2 / Shift+拖拽。
+
+### 关键决策点
+
+1. **为什么默认开鼠标，而不是默认关？**
+   滚轮是绝大多数现代用户的第一直觉。如果默认关，新用户根本不会发现有滚轮支持；
+   而"无法复制"在用户**第一次想复制**时才暴露 —— 此时状态栏的 F2 提示会立刻给出答案。
+   两害相权取其轻：先给最自然的体验，把"切换"成本留给低频但明确的需求。
+
+2. **为什么用 F2，不用 Ctrl+L / Esc / Alt+M？**
+   - `Ctrl+L`：传统是清屏；shell 用户肌肉记忆冲突
+   - `Esc`：prompt_toolkit 内部用作 Meta 前缀，按下后会等待 500ms 看是否有后续键
+   - `Alt+M`：部分终端会把 Alt 发送为 `\e` 前缀，与 Esc 一样有歧义
+   - `F2`：在 TUI 里几乎没人占用，单键，无歧义。备选 `F4`
+
+3. **为什么不在 mouse handler 里"只处理滚轮事件，放过其它"？**
+   prompt_toolkit 的 mouse tracking 协议层一旦开启就是全开（DECSET 1002 是 button-event），
+   即使应用代码 return `NotImplemented`，按下/拖拽**仍然不会**回到终端。
+   无法在协议层做"只收滚轮"，只能在整段开关之间切换。
+
+4. **为什么不依赖 Shift+拖拽？**
+   - 跨终端不一致（前文有列）
+   - 不是显眼的 affordance —— 普通用户根本不会想到
+   - 在禁用 Shift 直通的部分终端（如某些 SSH 客户端嵌套环境）完全失效
+
+### 交互一览（第三轮修复后）
+
+| 操作 | 行为 |
+|------|------|
+| 鼠标滚轮 | 滚动内容（默认模式下） |
+| 左键拖拽 | 默认模式：被 TUI 吞掉；按 F2 后：原生选择/复制 |
+| `F2` | 切换 复制模式 ↔ 鼠标模式 |
+| `PageUp` / `PageDown` / `Home` / `End` | 两种模式下都可用 |
+| 状态栏 | 显示当前模式提示 |
+| `Shift + 拖拽` | 终端 bypass，两种模式下都可（保底退路） |
+| `Ctrl+C` | 退出（不变） |
+
+## 经验教训（补充）
+
+`mouse_support` 不是一个简单的"功能开关"，它是**对终端鼠标控制权的独占请求**。
+任何 TUI 一旦打开它，都必须想好"用户怎么复制文本"。
+prompt_toolkit 的 `FilterOrBool` 支持让我们能把这个开关变成可切换状态，
+配合一个显眼的快捷键（F2），就能兼顾"滚轮自然"和"复制自由"两个看似冲突的体验目标。
+
+派生原则：**任何会改变终端默认交互的特性（鼠标、备用屏、原生光标），都必须提供一个用户可见、可逆的开关。**

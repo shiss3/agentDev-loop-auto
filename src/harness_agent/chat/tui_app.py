@@ -22,6 +22,7 @@ from typing import Awaitable, Callable
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.data_structures import Point
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import FormattedText, StyleAndTextTuples
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -94,6 +95,7 @@ class TuiApp:
         content_buffer: ContentBuffer,
         model_name: str = "default",
         history_file: str | None = None,
+        mouse_default: bool = True,
     ) -> None:
         self.content_buffer = content_buffer
         self.model_name = model_name
@@ -124,6 +126,15 @@ class TuiApp:
         # 跟随模式判定：_cursor_line >= _line_count - 1
         self._cursor_line: int = 0
         self._line_count: int = 1
+
+        # ── 鼠标捕获开关（F2 切换） ──
+        # mouse_support=True 会让终端把鼠标事件转发给应用，导致无法用左键拖拽复制。
+        # 提供 F2 一键切换：复制模式（关闭捕获）↔ 鼠标模式（开启滚轮）。
+        # 用动态 Condition 替代静态 bool —— prompt_toolkit Renderer 每帧会读取，
+        # 切换 self._mouse_enabled 后下一帧会自动发送 enable/disable mouse 转义序列。
+        self._mouse_enabled: bool = mouse_default
+        # 启动提示只在首次 run() 时打印一次
+        self._mouse_hint_printed: bool = False
 
     # ── 属性 ──
 
@@ -227,6 +238,12 @@ class TuiApp:
     async def run(self) -> None:
         """启动 TUI 应用（阻塞直到退出）"""
         app = self.app
+        # 首次启动：在内容区追加一行 onboarding 提示，告知用户两条复制路径
+        if not self._mouse_hint_printed:
+            self.content_buffer.append_plain(
+                "提示：鼠标滚轮可滚动；复制文本请按 F2 进入复制模式（或按住 Shift 拖拽）"
+            )
+            self._mouse_hint_printed = True
         try:
             await app.run_async()
         finally:
@@ -306,7 +323,8 @@ class TuiApp:
             style=_TUI_STYLE,
             key_bindings=kb,
             full_screen=True,
-            mouse_support=True,
+            # 动态 mouse_support：每帧由 Renderer 读取，F2 切换后自动生效
+            mouse_support=Condition(lambda: self._mouse_enabled),
         )
 
     def _make_history(self):
@@ -350,6 +368,18 @@ class TuiApp:
             self._cursor_line = max(0, self._line_count - 1)
             self._invalidate()
 
+        @kb.add("f2")
+        def _toggle_mouse(event):
+            """F2: 切换 鼠标模式 ↔ 复制模式
+
+            鼠标模式：滚轮可滚动，但终端会吞掉左键拖拽，无法系统级选中。
+            复制模式：关闭鼠标捕获，左键可正常拖拽选中复制；滚动改用 PageUp/PageDown/Home/End。
+            切换通过翻转 self._mouse_enabled —— Renderer 下一帧读取 Condition 后
+            会自动发送 enable/disable mouse 转义序列。
+            """
+            self._mouse_enabled = not self._mouse_enabled
+            self._invalidate()
+
         return kb
 
     def _on_buffer_accept(self, buffer: Buffer) -> None:
@@ -370,16 +400,41 @@ class TuiApp:
     # ── 内部：渲染辅助 ──
 
     def _get_status_fragments(self) -> StyleAndTextTuples:
-        """返回状态栏的 fragment 列表"""
+        """返回状态栏的 fragment 列表
+
+        结构：[业务状态] + [鼠标模式 hint]
+        模式 hint 作为独立段拼接到末尾，不会被 set_status_running / set_status_ready 覆盖。
+        """
+        if self._mouse_enabled:
+            mode_hint = "  [🖱 鼠标已启用 · F2 进入复制模式]"
+        else:
+            mode_hint = "  [📋 复制模式 · 可拖拽选中 · F2 退出]"
+
         return FormattedText([
             ("class:statusbar.model", f" {self._status_text}"),
+            ("class:statusbar.info", mode_hint),
         ])
 
     def _on_content_change(self) -> None:
-        """ContentBuffer 变更回调 → 跟随模式下把虚拟光标钉在末尾，触发重绘"""
-        if self._is_following():
-            # 给一个大值，下次 _get_content_cursor_position 会 clamp 到 line_count-1
-            self._cursor_line = 10**9
+        """ContentBuffer 变更回调 → 跟随模式下把虚拟光标钉在末尾，触发重绘
+
+        ⚠ 关键：必须在刷新 _line_count **之前** 判断 _is_following，否则首次内容追加
+        会把 line_count 从 1 跳到 N，cursor=0 < N-1 → 永远脱离跟随。
+
+        ⚠ 不能用 10**9 这种哨兵值 —— 那样 _is_following 永远为 True，
+        PageUp 即便修改了 _cursor_line（如 10^9 - 20），下次 spinner tick / status 更新
+        触发的 _on_content_change 会立刻把它钉回末尾，视觉上"完全无法滚动"。
+        """
+        # 1. 用 **旧** _line_count 判断当前是否处于跟随状态
+        was_following = self._is_following()
+
+        # 2. 刷新 _line_count（取一次最新 fragments）
+        self._get_content_fragments()
+
+        # 3. 跟随状态下，把虚拟光标钉在 **新** 末尾行（真实行号，非哨兵）
+        if was_following:
+            self._cursor_line = max(0, self._line_count - 1)
+
         self._invalidate()
 
     # ── 内部：内容滚动管理 ──
