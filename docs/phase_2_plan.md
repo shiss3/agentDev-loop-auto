@@ -1,7 +1,7 @@
 # Phase 2: CLI Chat 交互模式 + 上下文集成
 
 > **版本**: v1.1 | **日期**: 2026-06-07 | **前置**: Phase 1 已完成
-> **v1.1 修正**: prompt_async 替换 / ChatSession 过渡态标记 / 动态上下文热更新 / Markdown Buffer 策略
+> **v1.1 修正**: prompt_async 替换 / ChatSession 过渡态标记 / 动态上下文热更新 / 流式纯文本渲染（移除 Markdown 双重打印）
 
 ---
 
@@ -12,7 +12,7 @@
 **做的事**（Phase 2 范围）:
 - ✅ CLI Chat REPL 聊天循环
 - ✅ 直接监听 SDK 事件流，绕过 LangGraph astream_events
-- ✅ 增强终端渲染（Markdown / Spinner / 工具折叠 / Token 统计）
+- ✅ 增强终端渲染（流式纯文本 / Spinner / 工具折叠 / Token 统计）
 - ✅ 集成共享上下文与缓存方案（方案由用户提供，本阶段做接口对接）
 - ✅ 会话生命周期管理（创建 / 多轮 / 退出）
 - ✅ 斜杠命令系统
@@ -34,7 +34,7 @@
 | **入口** | `harness run "prompt"` 单次执行 | `harness chat` 多轮 REPL |
 | **SDK 调用** | `query()` 无状态单次查询 | `ClaudeSDKClient` 有状态会话 |
 | **事件管道** | LangGraph `astream_events` → `adispatch_custom_event` | SDK 原生事件流直接消费 |
-| **渲染** | 简单 print，无状态 | Rich Live + Markdown + Spinner + 统计 |
+| **渲染** | 简单 print，无状态 | Rich Live + Spinner + 统计 |
 | **对话状态** | 无（每次全新） | ChatSession 管理多轮对话 |
 | **上下文** | 硬编码 system_prompt | 接入共享上下文管理器（用户方案） |
 
@@ -78,7 +78,7 @@
               │                            │
               │  - 消费 ChatEvent 流        │
               │  - Rich Live 动态渲染       │
-              │  - Markdown 文本渲染        │
+              │  - 流式纯文本渲染         │
               │  - 工具调用折叠/展开         │
               │  - Spinner 思考动画         │
               │  - Token 用量统计           │
@@ -745,28 +745,17 @@ Phase 1 的 TerminalRenderer 做了什么：
   - 基本的工具名展示
 
 Phase 2 的 ChatRenderer 新增：
-  - Rich Markdown 渲染 Agent 文本（Buffer 策略）
+  - 流式纯文本渲染（无事后精渲染，避免双重打印）
   - Spinner 动画（Agent 思考时）
   - 工具调用折叠显示（名称 + 状态图标，输入可展开）
   - Turn 起止分隔线
   - Token 用量统计面板
   - 累计耗时
-
-v1.1 Markdown Buffer 策略：
-  ─────────────────────────────────────────
-  问题：如果 SDK 分块流式吐出文本（chunk-by-chunk），
-  半截 Markdown 丢给 Rich 渲染会导致格式错乱和终端闪烁。
-
-  解决方案（两阶段渲染）：
-  1. 流式阶段：每收到 TEXT 事件，先以纯文本打印到终端
-  2. 完成阶段：当 TURN_END 事件到来时，用完整的 Buffer 做一次 Markdown 精渲染
-  ─────────────────────────────────────────
 """
 
 from __future__ import annotations
 
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
 from rich.rule import Rule
@@ -784,9 +773,7 @@ class ChatRenderer:
         self.console = console or Console()
         self.turn_tool_count = 0
         self.total_tool_count = 0
-        self._current_text_buffer: list[str] = []
         self._spinner_live: Live | None = None
-        self._has_streamed_text = False
 
     # ── 公共入口 ──
 
@@ -811,22 +798,16 @@ class ChatRenderer:
     def _render_turn_start(self, event: ChatEvent) -> None:
         """渲染一轮对话的开始"""
         self.turn_tool_count = 0
-        self._current_text_buffer = []
-        self._has_streamed_text = False
         self._stop_spinner()
         self.console.print()
         # 启动思考动画
         self._start_spinner()
 
     def _render_text(self, event: ChatEvent) -> None:
-        """渲染 Agent 文本输出 — Buffer 策略"""
+        """渲染 Agent 文本输出 — 纯文本流式输出，无双重打印"""
         self._stop_spinner()
         text = event.data.get("text", "")
-        self._current_text_buffer.append(text)
-
-        # 流式阶段：纯文本即时输出
         self.console.print(text, end="", highlight=False)
-        self._has_streamed_text = True
 
     def _render_tool_use(self, event: ChatEvent) -> None:
         """渲染工具调用 — 紧凑的单行显示"""
@@ -861,15 +842,8 @@ class ChatRenderer:
             self.console.print(f"  [green]✓ 完成[/green]")
 
     def _render_turn_end(self, event: ChatEvent) -> None:
-        """渲染一轮对话结束 — Markdown 精渲染 + 统计信息"""
+        """渲染一轮对话结束 — 统计信息"""
         self._stop_spinner()
-        
-        # Markdown 精渲染
-        if self._has_streamed_text and self._current_text_buffer:
-            full_text = "".join(self._current_text_buffer)
-            if any(indicator in full_text for indicator in ["```", "# ", "**", "- ", "1. ", "| ", "> "]):
-                self.console.print()
-                self.console.print(Panel(Markdown(full_text), border_style="dim", expand=True, padding=(0, 1)))
 
         tool_count = event.data.get("tool_count", 0)
         duration_ms = event.data.get("duration_ms", 0)
@@ -1017,7 +991,7 @@ You > 再加个单元测试覆盖边界情况
   ...
 ```
 
-**Step 4 交付物**: `ChatRenderer` 支持全部 `EventType` 渲染，包含 Spinner / Markdown / Token 统计。
+**Step 4 交付物**: `ChatRenderer` 支持全部 `EventType` 渲染，包含 Spinner / Token 统计。
 
 ---
 
@@ -1377,14 +1351,12 @@ class ChatConfig:
         history_file:   输入历史文件路径
         show_usage:     是否显示 Token 用量
         show_timing:    是否显示耗时
-        markdown_render: 是否启用 Markdown 渲染
     """
 
     max_turns: int = 30
     history_file: str | None = None
     show_usage: bool = True
     show_timing: bool = True
-    markdown_render: bool = True
 
 
 @dataclass
@@ -1560,7 +1532,7 @@ def test_protocol_compliance():
 |---|--------|---------|
 | 1 | **Chat 启动** | `harness chat` 进入 REPL，显示欢迎面板 |
 | 2 | **多轮对话** | 连续发送多条消息，Agent 能理解上下文 |
-| 3 | **文本渲染** | Agent 文本以 Markdown 格式渲染 |
+| 3 | **文本渲染** | Agent 文本以流式纯文本输出，无双重打印 |
 | 4 | **工具可见** | 工具调用显示图标 + 名称 + 摘要，结果显示 ✓/✗ |
 | 5 | **Spinner** | Agent 思考/工具执行时显示动画 |
 | 6 | **统计面板** | 每轮结束显示工具调用数 + 耗时 |

@@ -5,7 +5,7 @@ from harness_agent.core.state import HarnessState
 from harness_agent.core.agents.base_agent import BaseAgent
 
 
-def build_graph() -> StateGraph:
+def build_graph(model: str | None = None) -> StateGraph:
     """构建 Phase 1 的极简状态图
 
     START ──→ default_agent ──→ END
@@ -14,7 +14,7 @@ def build_graph() -> StateGraph:
     只验证：用户任务 → Agent 执行 → 结果回传。
     """
     # 初始化 Agent 实例
-    default_agent = BaseAgent(name="default")
+    default_agent = BaseAgent(name="default", model=model)
 
     # 构建状态图
     graph = StateGraph(HarnessState)
@@ -32,9 +32,10 @@ def build_graph() -> StateGraph:
 class HarnessOrchestrator:
     """编排器封装 — 提供编译后的图实例"""
 
-    def __init__(self, project_dir: str = "."):
+    def __init__(self, project_dir: str = ".", model: str | None = None):
         self.project_dir = project_dir
-        self.graph = build_graph().compile()
+        self.model = model
+        self.graph = build_graph(model=model).compile()
 
     async def run(self, task: str) -> dict:
         """同步执行（非流式），用于测试"""

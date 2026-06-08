@@ -5,6 +5,23 @@ from pathlib import Path
 
 
 @dataclass
+class ChatConfig:
+    """Chat 模式配置
+
+    Attributes:
+        max_turns:    单轮对话最大 Agent 交互轮次
+        history_file: 输入历史文件路径（None 表示用默认 ~/.harness/chat_history）
+        show_usage:   是否显示 Token 用量
+        show_timing:  是否显示耗时
+    """
+
+    max_turns: int = 30
+    history_file: str | None = None
+    show_usage: bool = True
+    show_timing: bool = True
+
+
+@dataclass
 class HarnessConfig:
     """全局配置
 
@@ -13,6 +30,7 @@ class HarnessConfig:
         max_turns: Agent 最大交互轮次
         allowed_tools: 允许的工具列表
         log_level: 日志级别
+        chat: Chat 模式专属配置
     """
 
     project_dir: str = "."
@@ -21,6 +39,7 @@ class HarnessConfig:
         default_factory=lambda: ["Read", "Write", "Edit", "Bash"]
     )
     log_level: str = "INFO"
+    chat: ChatConfig = field(default_factory=ChatConfig)
 
     def __post_init__(self):
         self.project_dir = str(Path(self.project_dir).resolve())

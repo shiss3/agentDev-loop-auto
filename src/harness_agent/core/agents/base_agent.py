@@ -17,7 +17,12 @@ from harness_agent.core.state import HarnessState
 
 _BASE_SYSTEM_PROMPT = """你是 Harness Agent 系统中的通用开发助手。
 你可以读写文件、执行命令来完成用户的开发任务。
-请直接动手完成任务，不要只给建议。"""
+请直接动手完成任务，不要只给建议。
+
+## 路径说明
+- 所有相对路径（如 docs/1.md）都基于当前工作目录（cwd）解析。
+- 如果用户问"项目中某个文件"，先用 Glob 或 Bash 确认项目根目录结构，
+  再按 cwd 定位文件。不要跨 cwd 范围去寻找项目外的路径。"""
 
 
 class BaseAgent:
@@ -40,20 +45,31 @@ class BaseAgent:
         system_prompt: str = _BASE_SYSTEM_PROMPT,
         allowed_tools: list[str] | None = None,
         max_turns: int = 15,
+        model: str | None = None,
     ):
         self.name = name
         self.system_prompt = system_prompt
         self.allowed_tools = allowed_tools or ["Read", "Write", "Edit", "Bash"]
         self.max_turns = max_turns
+        self.model = model
 
     def _build_options(self, project_dir: str) -> ClaudeAgentOptions:
         """构建 SDK 配置"""
+        # 把 cwd 显式注入 system_prompt，避免 Agent 误将相对路径
+        # 解析到 shell 启动目录（如 C:\Users\root）
+        system_prompt = (
+            f"{self.system_prompt}\n\n"
+            f"## 当前工作目录\n"
+            f"cwd = {project_dir}\n"
+            f"所有相对路径都基于此目录解析。"
+        )
         return ClaudeAgentOptions(
-            system_prompt=self.system_prompt,
+            system_prompt=system_prompt,
             cwd=project_dir,
             allowed_tools=self.allowed_tools,
             max_turns=self.max_turns,
             permission_mode="acceptEdits",
+            model=self.model,
         )
 
     async def __call__(self, state: HarnessState) -> dict:
@@ -71,6 +87,11 @@ class BaseAgent:
 
         collected_texts: list[str] = []
         tool_calls: list[dict] = []
+        model_info: dict | None = None
+
+        # 计时
+        import time
+        start_time = time.monotonic()
 
         # 捕获可能由于 SDK 初始化失败或 Key 不正确导致的异常
         try:
@@ -107,6 +128,10 @@ class BaseAgent:
 
                 # ── ResultMessage: 任务整体执行结果 ──
                 elif isinstance(message, ResultMessage):
+                    # 提取实际模型信息
+                    if hasattr(message, "model_usage") and message.model_usage:
+                        model_info = dict(message.model_usage)
+
                     if getattr(message, "is_error", False):
                         errors = getattr(message, "errors", [])
                         err_text = "\\n".join(errors) if errors else "API 无法连接或其它错误"
@@ -118,6 +143,7 @@ class BaseAgent:
                             },
                         )
                     else:
+                        duration_s = round(time.monotonic() - start_time, 1)
                         res = getattr(message, "result", "")
                         await adispatch_custom_event(
                             "agent_result",
@@ -125,6 +151,8 @@ class BaseAgent:
                                 "agent": self.name,
                                 "content": str(res)[:500] if res else "✅ 任务顺利完成",
                                 "is_error": False,
+                                "model_usage": model_info,
+                                "duration_s": duration_s,
                             },
                         )
 

@@ -26,19 +26,12 @@ console = Console()
 # ── 事件渲染器 ──────────────────────────────────────────
 
 class TerminalRenderer:
-    """将 astream_events 中的自定义事件渲染到终端
-
-    事件类型与渲染规则：
-    ┌──────────────┬─────────────────────────────────────┐
-    │ agent_text   │ 直接打印文本（流式追加）              │
-    │ agent_tool   │ 打印 🛠️ 工具名 + 摘要输入            │
-    │ agent_result │ 打印 ✅ 成功 或 ❌ 失败 + 截断内容    │
-    │ agent_error  │ 打印 💥 错误详情                     │
-    └──────────────┴─────────────────────────────────────┘
-    """
+    """将 astream_events 中的自定义事件渲染到终端"""
 
     def __init__(self):
         self.tool_count = 0
+        self.model_usage: dict | None = None
+        self.duration_s: float = 0.0
 
     def handle_event(self, event: dict):
         kind = event.get("event")
@@ -64,6 +57,11 @@ class TerminalRenderer:
         elif name == "agent_result":
             is_error = data.get("is_error", False)
             content = data.get("content", "")[:200]
+            # 捕获实际模型信息和耗时
+            if data.get("model_usage"):
+                self.model_usage = data["model_usage"]
+            if data.get("duration_s"):
+                self.duration_s = data["duration_s"]
             if is_error:
                 console.print(f"  [red]❌ 失败:[/red] [dim]{content}[/dim]")
             else:
@@ -83,35 +81,63 @@ def cli():
     pass
 
 
+def _detect_project_root(start: Path) -> Path:
+    """从 start 目录向上查找项目根目录
+
+    检测信号（按优先级）：
+      1. pyproject.toml
+      2. .git
+      3. package.json
+    都找不到则回退到 start 本身。
+    """
+    markers = ("pyproject.toml", ".git", "package.json")
+    cur = start.resolve()
+    for parent in [cur, *cur.parents]:
+        for marker in markers:
+            if (parent / marker).exists():
+                return parent
+    return cur
+
+
 @cli.command()
 @click.argument("prompt")
 @click.option(
     "--project", "-p",
-    default=".",
+    default=None,
     type=click.Path(exists=True),
-    help="项目工作目录",
+    help="项目工作目录（默认自动探测最近的项目根：pyproject.toml / .git / package.json）",
 )
-def run(prompt: str, project: str):
+@click.option(
+    "--model", "-m",
+    default=None,
+    help="模型名称，如 glm-5.1（默认走全局 settings.json 配置）",
+)
+def run(prompt: str, project: str | None, model: str):
     """执行一个开发任务
 
     示例: harness run "创建一个 hello_world.py"
     """
-    project_dir = str(Path(project).resolve())
+    # 未指定 project 时自动探测项目根
+    if project is None:
+        project_dir = str(_detect_project_root(Path.cwd()))
+    else:
+        project_dir = str(Path(project).resolve())
 
     console.print(
         Panel(
-            f"[bold cyan]任务:[/] {prompt}\n[bold cyan]项目:[/] {project_dir}",
+            f"[bold cyan]任务:[/] {prompt}\n[bold cyan]项目:[/] {project_dir}"
+            + (f"\n[bold cyan]模型:[/] {model}" if model else ""),
             title="🐴 Harness Agent",
             border_style="cyan",
         )
     )
 
-    asyncio.run(_run_streaming(prompt, project_dir))
+    asyncio.run(_run_streaming(prompt, project_dir, model))
 
 
-async def _run_streaming(prompt: str, project_dir: str):
+async def _run_streaming(prompt: str, project_dir: str, model: str | None = None):
     """核心流式渲染循环"""
-    orchestrator = HarnessOrchestrator(project_dir=project_dir)
+    orchestrator = HarnessOrchestrator(project_dir=project_dir, model=model)
     renderer = TerminalRenderer()
 
     console.print("\n[dim]Agent 正在工作...[/dim]\n")
@@ -125,7 +151,52 @@ async def _run_streaming(prompt: str, project_dir: str):
         console.print(
             f"[dim]共执行了 {renderer.tool_count} 次工具调用[/dim]"
         )
+    # 显示实际模型
+    if renderer.model_usage:
+        for model_name, usage in renderer.model_usage.items():
+            cost = usage.get("costUSD", 0)
+            in_t = usage.get("inputTokens", 0)
+            out_t = usage.get("outputTokens", 0)
+            duration = renderer.duration_s
+            console.print(
+                f"[dim]模型: {model_name} | "
+                f"tokens: {in_t}in/{out_t}out | "
+                f"费用: ${cost:.4f} | "
+                f"耗时: {duration}s[/dim]"
+            )
     console.print("[bold green]✅ 任务完成[/bold green]\n")
+
+
+@cli.command()
+@click.option(
+    "--project", "-p",
+    default=None,
+    type=click.Path(exists=True),
+    help="项目工作目录（默认自动探测最近的项目根：pyproject.toml / .git / package.json）",
+)
+@click.option(
+    "--model", "-m",
+    default=None,
+    help="模型名称，如 glm-5.1（默认走全局 settings.json 配置）",
+)
+def chat(project: str | None, model: str | None):
+    """启动交互式聊天模式（多轮对话 REPL）
+
+    示例:
+        harness chat
+        harness chat -p ./my-app
+        harness chat -m claude-sonnet-4-6
+    """
+    from harness_agent.chat.repl import ChatCLI
+
+    # 未指定 project 时自动探测项目根
+    if project is None:
+        project_dir = str(_detect_project_root(Path.cwd()))
+    else:
+        project_dir = str(Path(project).resolve())
+
+    chat_cli = ChatCLI(project_dir=project_dir, model=model)
+    asyncio.run(chat_cli.run())
 
 
 @cli.command()
