@@ -116,6 +116,7 @@ class TuiApp:
 
         # ── 输入回调 ──
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
+        self._on_cancel: Callable[[], None] | None = None  # 取消回调
 
         # ── Spinner 定时器 ──
         self._spinner_task: asyncio.Task | None = None
@@ -231,6 +232,10 @@ class TuiApp:
         """设置用户输入回调"""
         self._on_submit = handler
 
+    def set_on_cancel(self, handler: Callable[[], None]) -> None:
+        """设置取消回调"""
+        self._on_cancel = handler
+
     def focus_input(self) -> None:
         """聚焦输入框"""
         if self._app and self._input_buffer:
@@ -288,8 +293,8 @@ class TuiApp:
             wrap_lines=True,
             # 右侧显示滚动条（仅视觉，鼠标拖拽需自定义实现）
             right_margins=[ScrollbarMargin(display_arrows=True)],
-            # 内容区占据剩余空间
-            height=Dimension(min=1),
+            # 内容区占据剩余空间（min=3 确保至少能看到几行，max=None 表示无上限）
+            height=Dimension(min=3, max=None),
         )
         self._content_window = content_window
 
@@ -388,6 +393,12 @@ class TuiApp:
             """
             self._mouse_enabled = not self._mouse_enabled
             self._invalidate()
+
+        @kb.add("escape")
+        def _cancel_request(event):
+            """ESC: 取消当前请求"""
+            if self._on_cancel:
+                self._on_cancel()
 
         return kb
 

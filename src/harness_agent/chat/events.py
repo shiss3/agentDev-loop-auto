@@ -25,6 +25,7 @@ class EventType(str, Enum):
     # ── 会话生命周期 ──
     TURN_START = "turn_start"        # 一轮对话开始（用户发送消息后）
     TURN_END = "turn_end"            # 一轮对话结束（Agent 完成回复）
+    CANCELLED = "cancelled"          # 用户取消了当前请求
 
     # ── 状态 ──
     THINKING = "thinking"            # Agent 正在思考（工具调用间隙）
@@ -152,3 +153,8 @@ def usage_event(
 
 def thinking_event(agent: str = "default") -> ChatEvent:
     return ChatEvent(type=EventType.THINKING, data={}, agent=agent)
+
+
+def cancelled_event(reason: str = "用户取消") -> ChatEvent:
+    """创建取消事件"""
+    return ChatEvent(type=EventType.CANCELLED, data={"reason": reason})

@@ -62,6 +62,7 @@ class ChatRenderer:
             EventType.THINKING: self._render_thinking,
             EventType.ERROR: self._render_error,
             EventType.USAGE: self._render_usage,
+            EventType.CANCELLED: self._render_cancelled,
         }.get(event.type)
 
         if handler:
@@ -148,6 +149,15 @@ class ChatRenderer:
         error = event.data.get("error", "未知错误")[:500]
         self.buf.append_error(error)
         self.tui.set_status_text(f"{self.tui.model_name} · 错误")
+        self.tui.focus_input()
+
+    def _render_cancelled(self, event: ChatEvent) -> None:
+        """取消：停止 Spinner → 追加取消提示"""
+        self.tui.stop_spinner()
+        reason = event.data.get("reason", "用户取消")
+        self.buf.append_plain(f"⚠️ 已取消: {reason}")
+        # 状态恢复为就绪，方便用户继续输入
+        self.tui.set_status_text(f"{self.tui.model_name} · 就绪")
         self.tui.focus_input()
 
     def _render_usage(self, event: ChatEvent) -> None:

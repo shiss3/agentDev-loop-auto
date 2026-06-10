@@ -9,10 +9,12 @@ Phase 2.5 (TUI 版):
 1. 管理 TuiApp / ChatRenderer / ChatSession 的生命周期
 2. 分发用户输入（消息 vs 斜杠命令）
 3. 处理退出信号
+4. 处理请求取消
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from harness_agent.chat.content_buffer import ContentBuffer
@@ -58,6 +60,8 @@ class ChatCLI:
 
         # 状态
         self._should_exit = False
+        # 当前消息处理的任务引用（用于取消）
+        self._message_task: asyncio.Task | None = None
 
     def _create_session(self) -> ChatSession:
         return ChatSession(
@@ -70,6 +74,8 @@ class ChatCLI:
         """启动 TUI 应用（阻塞直到退出）"""
         # 注册输入回调
         self.tui.set_on_submit(self._on_user_input)
+        # 注册取消回调
+        self.tui.set_on_cancel(self._cancel_current_request)
 
         # 启动 SDK 会话
         await self.session.start()
@@ -85,6 +91,14 @@ class ChatCLI:
         try:
             await self.tui.run()
         finally:
+            # 确保退出时取消任何正在进行的请求
+            if self._message_task and not self._message_task.done():
+                self._message_task.cancel()
+                try:
+                    await self._message_task
+                except asyncio.CancelledError:
+                    pass
+
             await self.session.close()
             self.renderer.render_goodbye(self.session.stats.to_dict())
 
@@ -118,9 +132,50 @@ class ChatCLI:
             )
 
     async def _handle_message(self, prompt: str) -> None:
-        """处理普通聊天消息 — 发送给 Agent"""
+        """处理普通聊天消息 — 发送给 Agent
+
+        使用独立的任务来处理，以便可以取消。
+        """
+        # 如果已有任务在运行，先取消它
+        if self._message_task and not self._message_task.done():
+            self._message_task.cancel()
+            try:
+                await self._message_task
+            except asyncio.CancelledError:
+                pass
+
+        # 创建新任务处理消息
+        self._message_task = asyncio.create_task(self._stream_events(prompt))
+
+        try:
+            await self._message_task
+        except asyncio.CancelledError:
+            # 任务被取消是正常行为
+            pass
+
+    async def _stream_events(self, prompt: str) -> None:
+        """流式处理事件
+
+        这是实际处理消息的方法，可以被取消。
+        """
         async for event in self.session.send(prompt):
+            # 检查任务是否被取消
+            if asyncio.current_task().cancelled():
+                break
             self.renderer.handle(event)
+
+    def _cancel_current_request(self) -> None:
+        """取消当前请求
+
+        由 TUI 的 ESC 键触发。
+        """
+        # 1. 先设置 session 的取消标志（在异步迭代中会检查）
+        if self.session.is_processing:
+            self.session.cancel()
+
+        # 2. 取消消息处理任务
+        if self._message_task and not self._message_task.done():
+            self._message_task.cancel()
 
     # ── 命令回调接口（供 commands.py 调用） ──
 
@@ -131,6 +186,14 @@ class ChatCLI:
 
     async def reset_session(self) -> None:
         """清空会话，重建 ChatSession"""
+        # 取消正在进行的任务
+        if self._message_task and not self._message_task.done():
+            self._message_task.cancel()
+            try:
+                await self._message_task
+            except asyncio.CancelledError:
+                pass
+
         await self.session.close()
         self.session = self._create_session()
         await self.session.start()

@@ -17,12 +17,13 @@
 
 绝不做的事：
 - ❌ print() / 终端输出（交给 Renderer）
-- ❌ 管理用户输入（交给 REPL）
+- ❌ 理用户输入（交给 REPL）
 - ❌ 设计上下文方案（交给 ContextProvider）
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import AsyncIterator
 
@@ -44,6 +45,7 @@ from harness_agent.chat.events import (
     turn_end_event,
     error_event,
     usage_event,
+    cancelled_event,
 )
 from harness_agent.context.provider import ContextProvider, DefaultContextProvider
 
@@ -61,6 +63,7 @@ class SessionStats:
         self.total_tool_calls: int = 0
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
+        self.cancelled_requests: int = 0  # 取消请求计数
 
     def to_dict(self) -> dict:
         return {
@@ -68,6 +71,7 @@ class SessionStats:
             "total_tool_calls": self.total_tool_calls,
             "total_input_tokens": self.total_input_tokens,
             "total_output_tokens": self.total_output_tokens,
+            "cancelled_requests": self.cancelled_requests,
         }
 
 
@@ -112,9 +116,32 @@ class ChatSession:
         # 实际使用的模型名称（从 SDK 返回中提取）
         self.actual_model: str | None = None
 
+        # 取消标志
+        self._cancelled: bool = False
+        # 当前正在处理请求的标志
+        self._processing_request: bool = False
+
     @property
     def is_active(self) -> bool:
         return self._is_active
+
+    @property
+    def is_cancelled(self) -> bool:
+        """检查是否已被取消"""
+        return self._cancelled
+
+    @property
+    def is_processing(self) -> bool:
+        """检查是否正在处理请求"""
+        return self._processing_request
+
+    def cancel(self) -> None:
+        """取消当前请求
+
+        设置取消标志，并在异步上下文中中断 SDK 请求。
+        """
+        self._cancelled = True
+        # 异步中断会在 send() 方法中处理
 
     def _build_options(self) -> ClaudeAgentOptions:
         """构建 SDK 配置，注入共享上下文"""
@@ -146,6 +173,13 @@ class ChatSession:
 
     async def close(self) -> None:
         """关闭会话 — 清理资源"""
+        # 如果正在处理请求，先中断
+        if self._processing_request and self._client:
+            try:
+                await self._client.interrupt()
+            except Exception:
+                pass
+
         if self._client:
             await self._client.__aexit__(None, None, None)
             self._client = None
@@ -173,12 +207,39 @@ class ChatSession:
             async for _ in self._client.receive_response():
                 pass
 
+    async def _recover_client_after_cancel(self) -> None:
+        """取消后恢复客户端状态
+
+        中断请求后，SDK 客户端可能处于不稳定状态，
+        需要断开重连以恢复。
+        """
+        if not self._client:
+            return
+
+        try:
+            # 先断开
+            await self._client.disconnect()
+            # 重新连接
+            await self._client.connect()
+        except Exception:
+            # 如果重连失败，尝试完全重建客户端
+            try:
+                await self._client.__aexit__(None, None, None)
+                options = self._build_options()
+                self._client = ClaudeSDKClient(options=options)
+                await self._client.__aenter__()
+            except Exception:
+                pass  # 静默处理，下次请求时会检查状态
+
     async def send(self, prompt: str) -> AsyncIterator[ChatEvent]:
         """发送一条消息，返回事件流
 
         这是 ChatSession 的核心方法。
         将用户输入发送给 SDK，将 SDK 返回的 Message
         逐一转换为 ChatEvent 并 yield。
+
+        支持取消：当用户按下 ESC 时，会设置 _cancelled 标志，
+        本方法会中断 SDK 请求并恢复客户端状态。
 
         Args:
             prompt: 用户输入的文本
@@ -190,6 +251,10 @@ class ChatSession:
             yield error_event("会话未启动，请先调用 start()")
             return
 
+        # 清除取消标志，开始新请求
+        self._cancelled = False
+        self._processing_request = True
+
         self.stats.turn_count += 1
         turn_number = self.stats.turn_count
         turn_tool_count = 0
@@ -200,10 +265,23 @@ class ChatSession:
         # ── TURN_START ──
         yield turn_start_event(turn_number, prompt)
 
+        was_cancelled = False
+
         try:
             await self._client.query(prompt)
 
             async for message in self._client.receive_response():
+                # 检查取消标志 — 立即中断
+                if self._cancelled:
+                    was_cancelled = True
+                    self.stats.cancelled_requests += 1
+                    # 真正中断 SDK 的响应流
+                    try:
+                        await self._client.interrupt()
+                    except Exception:
+                        pass
+                    yield cancelled_event("用户取消了请求")
+                    break
 
                 # ── AssistantMessage ──
                 if isinstance(message, AssistantMessage):
@@ -212,6 +290,9 @@ class ChatSession:
                         self.actual_model = message.model
 
                     for block in message.content:
+                        # 取消时不再处理后续 block
+                        if self._cancelled:
+                            break
 
                         if isinstance(block, TextBlock):
                             collected_texts.append(block.text)
@@ -274,27 +355,46 @@ class ChatSession:
                                 model_name=self.actual_model,
                             )
 
+        except asyncio.CancelledError:
+            # 异步任务被取消
+            was_cancelled = True
+            self.stats.cancelled_requests += 1
+            try:
+                await self._client.interrupt()
+            except Exception:
+                pass
+            yield cancelled_event("用户取消了请求")
+
         except Exception as e:
             yield error_event(f"SDK 异常: {e}")
             collected_texts.append(f"[错误] {e}")
 
-        # ── 更新统计 + 历史记录 ──
-        self.stats.total_tool_calls += turn_tool_count
-        self._all_collected_texts.extend(collected_texts)
-        self._all_tool_calls.extend(tool_calls)
+        finally:
+            self._processing_request = False
+
+            # 如果被取消，恢复客户端状态
+            if was_cancelled:
+                await self._recover_client_after_cancel()
+
+        # ── 更新统计 + 历史记录（取消时跳过） ──
+        if not was_cancelled:
+            self.stats.total_tool_calls += turn_tool_count
+            self._all_collected_texts.extend(collected_texts)
+            self._all_tool_calls.extend(tool_calls)
+
+            # ── 通知 ContextProvider 更新上下文 ──
+            response_summary = "\n".join(collected_texts)[:2000]
+            self.context_provider.on_turn_end(
+                prompt=prompt,
+                response_summary=response_summary,
+                tool_calls=tool_calls,
+            )
+
+            # ── 检测上下文变更，触发 Client 热重启 ──
+            if self.context_provider.has_context_changed():
+                await self._hot_restart_client()
+
         duration_ms = int((time.monotonic() - start_time) * 1000)
-
-        # ── 通知 ContextProvider 更新上下文 ──
-        response_summary = "\n".join(collected_texts)[:2000]
-        self.context_provider.on_turn_end(
-            prompt=prompt,
-            response_summary=response_summary,
-            tool_calls=tool_calls,
-        )
-
-        # ── 检测上下文变更，触发 Client 热重启 ──
-        if self.context_provider.has_context_changed():
-            await self._hot_restart_client()
 
         # ── TURN_END ──
         yield turn_end_event(
