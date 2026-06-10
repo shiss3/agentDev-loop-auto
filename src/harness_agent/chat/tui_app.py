@@ -390,12 +390,27 @@ class TuiApp:
 
         buffer.text = ""
 
+        # 用户输入后，立即强制滚动到末尾
+        # 确保在 Agent 输出之前，光标已经在正确位置
+        self.scroll_to_end()
+
         if self._on_submit:
             try:
                 loop = asyncio.get_running_loop()
                 loop.create_task(self._on_submit(text))
             except RuntimeError:
                 pass
+
+    def scroll_to_end(self) -> None:
+        """强制将虚拟光标滚动到内容末尾
+
+        在用户输入后立即调用，确保在 Agent 开始输出之前，
+        滚动位置已经在末尾，之后的内容会自动跟随。
+        """
+        # 先刷新 _line_count（确保基于最新的内容）
+        self._get_content_fragments()
+        self._cursor_line = max(0, self._line_count - 1)
+        self._invalidate()
 
     # ── 内部：渲染辅助 ──
 
