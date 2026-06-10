@@ -101,11 +101,11 @@ class ContentBuffer:
             self._notify()
 
     def append_user_input(self, text: str) -> None:
-        """追加用户输入行（You > 前缀 + 正文）"""
+        """追加用户输入行（灰色背景 + You > 前缀 + 正文）"""
         self._lines.append(
             FormattedText([
-                (_STYLE_USER_PREFIX, "You > "),
-                ("", text),
+                ("class:user-message bold", "You > "),
+                ("class:user-message", text),
             ])
         )
         self._notify()
