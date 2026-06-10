@@ -117,7 +117,63 @@ async def test_prompt_caching_support():
     assert len(msgs_1) > 0
 
 
-# ─── 测试 5：harness_agent 包自身可导入 ───
+# ─── 测试 5：ResultMessage 结构探测（模型名称） ───
+@pytest.mark.asyncio
+async def test_result_message_structure():
+    """探测 ResultMessage 的完整结构，找出模型名称字段
+
+    这个测试打印 ResultMessage 的所有属性和值，
+    帮助确定模型名称存储在哪个字段。
+    """
+    from claude_agent_sdk import query, ClaudeAgentOptions
+
+    async for msg in query(
+        prompt="回复 ok 两个字",
+        options=ClaudeAgentOptions(max_turns=1),
+    ):
+        msg_type = type(msg).__name__
+        print(f"\n[Message 类型] {msg_type}")
+
+        # 打印所有属性
+        if hasattr(msg, "__dict__"):
+            print(f"[属性] {msg.__dict__}")
+
+        # 如果是 ResultMessage，深入探测
+        if msg_type == "ResultMessage":
+            print("\n=== ResultMessage 详细探测 ===")
+
+            # 打印所有属性名
+            attrs = [a for a in dir(msg) if not a.startswith("_")]
+            print(f"[所有属性] {attrs}")
+
+            # 尝试获取模型相关信息
+            for attr in ["model", "model_name", "usage"]:
+                if hasattr(msg, attr):
+                    val = getattr(msg, attr)
+                    print(f"[{attr}] {val} (type: {type(val).__name__})")
+
+                    # 如果是 usage，继续深入
+                    if attr == "usage" and val:
+                        usage_attrs = [a for a in dir(val) if not a.startswith("_")]
+                        print(f"  [usage 属性] {usage_attrs}")
+                        for ua in usage_attrs:
+                            try:
+                                uv = getattr(val, ua)
+                                if not callable(uv):
+                                    print(f"    [{ua}] {uv}")
+                            except Exception:
+                                pass
+
+            # 尝试 model_dump
+            if hasattr(msg, "model_dump"):
+                try:
+                    dump = msg.model_dump()
+                    print(f"\n[model_dump] {dump}")
+                except Exception as e:
+                    print(f"\n[model_dump 失败] {e}")
+
+
+# ─── 测试 6：harness_agent 包自身可导入 ───
 def test_package_import():
     """验证 harness_agent 包可以正确导入"""
     from harness_agent import __version__

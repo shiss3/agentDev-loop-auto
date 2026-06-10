@@ -128,16 +128,26 @@ def usage_event(
     output_tokens: int = 0,
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
+    model_name: str | None = None,
 ) -> ChatEvent:
-    return ChatEvent(
-        type=EventType.USAGE,
-        data={
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "cache_read_tokens": cache_read_tokens,
-            "cache_creation_tokens": cache_creation_tokens,
-        },
-    )
+    """创建 usage 事件
+
+    Args:
+        input_tokens: 输入 token 数
+        output_tokens: 输出 token 数
+        cache_read_tokens: 缓存读取 token 数
+        cache_creation_tokens: 缓存创建 token 数
+        model_name: 实际使用的模型名称（从 SDK 返回中提取）
+    """
+    data: dict[str, Any] = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_creation_tokens": cache_creation_tokens,
+    }
+    if model_name:
+        data["model_name"] = model_name
+    return ChatEvent(type=EventType.USAGE, data=data)
 
 
 def thinking_event(agent: str = "default") -> ChatEvent:

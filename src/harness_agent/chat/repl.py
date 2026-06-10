@@ -74,6 +74,10 @@ class ChatCLI:
         # 启动 SDK 会话
         await self.session.start()
 
+        # 如果用户指定了模型，显示指定的模型名；否则显示 "default" 等待首次回复后更新
+        initial_model = self.model or "default"
+        self.tui.model_name = initial_model
+
         # 渲染欢迎信息
         from harness_agent import __version__
         self.renderer.render_welcome(self.project_dir, __version__)

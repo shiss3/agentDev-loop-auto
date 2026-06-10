@@ -98,7 +98,7 @@ class ChatSession:
         allowed_tools: list[str] | None = None,
     ) -> None:
         self.project_dir = project_dir
-        self.model = model
+        self.model = model  # 用户指定的模型（可能为 None，表示使用全局配置）
         self.max_turns = max_turns
         self.context_provider = context_provider or DefaultContextProvider()
         self.allowed_tools = allowed_tools or ["Read", "Write", "Edit", "Bash"]
@@ -108,6 +108,9 @@ class ChatSession:
         self._is_active = False
         self._all_collected_texts: list[str] = []
         self._all_tool_calls: list[dict] = []
+
+        # 实际使用的模型名称（从 SDK 返回中提取）
+        self.actual_model: str | None = None
 
     @property
     def is_active(self) -> bool:
@@ -204,6 +207,10 @@ class ChatSession:
 
                 # ── AssistantMessage ──
                 if isinstance(message, AssistantMessage):
+                    # 从 AssistantMessage 中提取实际使用的模型名称
+                    if hasattr(message, "model") and message.model:
+                        self.actual_model = message.model
+
                     for block in message.content:
 
                         if isinstance(block, TextBlock):
@@ -232,22 +239,39 @@ class ChatSession:
                         err_text = "\n".join(errors) if errors else "未知错误"
                         yield error_event(err_text[:500])
                     else:
+                        # 尝试从 model_usage 中提取模型名称（这是最准确的来源）
+                        # model_usage 是一个 dict: {'model_name': {...usage info...}}
+                        model_usage = getattr(message, "model_usage", None)
+                        if model_usage and isinstance(model_usage, dict):
+                            # 取第一个模型名（通常只有一个）
+                            model_names = list(model_usage.keys())
+                            if model_names:
+                                self.actual_model = model_names[0]
+
                         # 尝试提取 usage 信息
                         usage = getattr(message, "usage", None)
                         if usage:
-                            input_t = getattr(usage, "input_tokens", 0) or 0
-                            output_t = getattr(usage, "output_tokens", 0) or 0
-                            cache_r = getattr(usage, "cache_read_input_tokens", 0) or 0
-                            cache_c = (
-                                getattr(usage, "cache_creation_input_tokens", 0) or 0
-                            )
+                            # usage 可能是 dict 或对象
+                            if isinstance(usage, dict):
+                                input_t = usage.get("input_tokens", 0) or 0
+                                output_t = usage.get("output_tokens", 0) or 0
+                                cache_r = usage.get("cache_read_input_tokens", 0) or 0
+                                cache_c = usage.get("cache_creation_input_tokens", 0) or 0
+                            else:
+                                input_t = getattr(usage, "input_tokens", 0) or 0
+                                output_t = getattr(usage, "output_tokens", 0) or 0
+                                cache_r = getattr(usage, "cache_read_input_tokens", 0) or 0
+                                cache_c = getattr(usage, "cache_creation_input_tokens", 0) or 0
+
                             self.stats.total_input_tokens += input_t
                             self.stats.total_output_tokens += output_t
+
                             yield usage_event(
                                 input_tokens=input_t,
                                 output_tokens=output_t,
                                 cache_read_tokens=cache_r,
                                 cache_creation_tokens=cache_c,
+                                model_name=self.actual_model,
                             )
 
         except Exception as e:

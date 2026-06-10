@@ -151,9 +151,17 @@ class ChatRenderer:
         self.tui.focus_input()
 
     def _render_usage(self, event: ChatEvent) -> None:
-        """Token 用量：暂存统计，Turn End 时一起显示"""
+        """Token 用量：暂存统计，Turn End 时一起显示
+
+        同时提取实际模型名称并更新 TUI 状态栏。
+        """
         self._turn_input_tokens += event.data.get("input_tokens", 0)
         self._turn_output_tokens += event.data.get("output_tokens", 0)
+
+        # 如果有实际模型名称，更新 TUI 显示
+        model_name = event.data.get("model_name")
+        if model_name and model_name != self.tui.model_name:
+            self.tui.model_name = model_name
 
     # ── 辅助渲染（供斜杠命令等使用）──
 
