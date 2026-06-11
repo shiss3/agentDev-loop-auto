@@ -210,7 +210,8 @@ class ChatSession:
 
         # 会话恢复参数（enable_undo 模式下跳过）
         if self.enable_undo:
-            pass  # 不设置 session 相关参数
+            # 检查点模式：只设置 session_id，不设置恢复相关参数
+            opts.session_id = self.session_id
         elif self.resume_session_id:
             # 恢复指定会话
             opts.resume = self.resume_session_id
