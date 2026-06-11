@@ -162,7 +162,15 @@ class ChatSession:
         # 异步中断会在 send() 方法中处理
 
     def _build_options(self) -> ClaudeAgentOptions:
-        """构建 SDK 配置，注入共享上下文"""
+        """构建 SDK 配置，注入共享上下文
+
+        注意：当 system_prompt 使用 claude_code preset 时，
+        SDK 会调用 Claude Code CLI，自动获得 Claude Code 的所有默认行为：
+        - 默认工具集 (Read, Write, Edit, Bash 等)
+        - 默认 skills (/help, /review 等)
+        - 默认 hooks (如果有配置)
+        - 默认权限模式
+        """
         # 通过 ContextProvider 组装 system_prompt
         system_prompt = self.context_provider.build_system_prompt(
             base_prompt=_BASE_SYSTEM_PROMPT,
@@ -175,6 +183,10 @@ class ChatSession:
             allowed_tools=self.allowed_tools,
             max_turns=self.max_turns,
             permission_mode="acceptEdits",
+
+            # ── Claude Code 增强配置 ──
+            include_partial_messages=True,  # 流式输出时包含部分消息
+            enable_file_checkpointing=True,  # 开启文件修改检查点，支持回滚
         )
 
         if self.model:
