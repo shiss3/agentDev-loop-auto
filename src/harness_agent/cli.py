@@ -179,13 +179,27 @@ async def _run_streaming(prompt: str, project_dir: str, model: str | None = None
     default=None,
     help="模型名称，如 glm-5.1（默认走全局 settings.json 配置）",
 )
-def chat(project: str | None, model: str | None):
+@click.option(
+    "--resume", "-r",
+    default=None,
+    help="恢复指定的会话 ID",
+)
+@click.option(
+    "--continue", "-c",
+    "continue_conversation",
+    is_flag=True,
+    default=False,
+    help="恢复最近一次会话",
+)
+def chat(project: str | None, model: str | None, resume: str | None, continue_conversation: bool):
     """启动交互式聊天模式（多轮对话 REPL）
 
     示例:
         harness chat
         harness chat -p ./my-app
         harness chat -m claude-sonnet-4-6
+        harness chat --continue        # 恢复最近会话
+        harness chat --resume <session_id>  # 恢复指定会话
     """
     from harness_agent.chat.repl import ChatCLI
 
@@ -195,7 +209,12 @@ def chat(project: str | None, model: str | None):
     else:
         project_dir = str(Path(project).resolve())
 
-    chat_cli = ChatCLI(project_dir=project_dir, model=model)
+    chat_cli = ChatCLI(
+        project_dir=project_dir,
+        model=model,
+        resume_session_id=resume,
+        continue_conversation=continue_conversation,
+    )
     asyncio.run(chat_cli.run())
 
 

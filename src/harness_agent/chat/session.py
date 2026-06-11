@@ -7,6 +7,11 @@
 4. 维护对话统计（轮次 / Token / 工具调用数）
 5. 检测上下文变更，平滑重启底层 Client
 
+⚠️ 系统提示词配置：
+   通过 ContextProvider.build_system_prompt() 返回的值决定使用的系统提示词：
+   - 字符串: 自定义系统提示词
+   - {"type": "preset", "preset": "claude_code"}: 使用 Claude Code CLI 完整提示词
+
 ⚠️ 过渡态说明：
    ChatSession 是 Phase 2 的单 Agent 封装，Phase 3 中
    多轮对话管理权将交还给 LangGraph StateGraph + Checkpointer。
@@ -25,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from typing import AsyncIterator
 
 from claude_agent_sdk import (
@@ -34,6 +40,7 @@ from claude_agent_sdk import (
     ResultMessage,
     TextBlock,
     ToolUseBlock,
+    SessionStore,
 )
 
 from harness_agent.chat.events import (
@@ -97,9 +104,12 @@ class ChatSession:
         self,
         project_dir: str = ".",
         model: str | None = None,
-        max_turns: int = 30,
+        max_turns: int | None = None,
         context_provider: ContextProvider | None = None,
         allowed_tools: list[str] | None = None,
+        session_store: SessionStore | None = None,
+        resume_session_id: str | None = None,
+        continue_conversation: bool = False,
     ) -> None:
         self.project_dir = project_dir
         self.model = model  # 用户指定的模型（可能为 None，表示使用全局配置）
@@ -107,11 +117,19 @@ class ChatSession:
         self.context_provider = context_provider or DefaultContextProvider()
         self.allowed_tools = allowed_tools or ["Read", "Write", "Edit", "Bash"]
 
+        # 会话恢复相关参数
+        self.session_store = session_store
+        self.resume_session_id = resume_session_id
+        self.continue_conversation = continue_conversation
+
         self._client: ClaudeSDKClient | None = None
         self.stats = SessionStats()
         self._is_active = False
         self._all_collected_texts: list[str] = []
         self._all_tool_calls: list[dict] = []
+
+        # 会话 ID（用于恢复和持久化）
+        self.session_id: str = resume_session_id or str(uuid.uuid4())
 
         # 实际使用的模型名称（从 SDK 返回中提取）
         self.actual_model: str | None = None
@@ -161,6 +179,20 @@ class ChatSession:
 
         if self.model:
             opts.model = self.model
+
+        # 会话恢复参数
+        if self.session_store:
+            opts.session_store = self.session_store
+
+        if self.resume_session_id:
+            # 恢复指定会话
+            opts.resume = self.resume_session_id
+        elif self.continue_conversation:
+            # 恢复最近会话
+            opts.continue_conversation = True
+        else:
+            # 新会话，使用自己的 session_id
+            opts.session_id = self.session_id
 
         return opts
 

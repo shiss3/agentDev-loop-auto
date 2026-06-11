@@ -1,4 +1,10 @@
-"""Agent 基类 — 纯函数，全类型事件发射，无 IO 副作用"""
+"""Agent 基类 — 纯函数，全类型事件发射，无 IO 副作用
+
+⚠️ 系统提示词配置：
+   目前默认使用自定义的简单系统提示词。
+   如需使用 Claude Code CLI 的完整系统提示词，可在 ContextProvider 中配置：
+   {"type": "preset", "preset": "claude_code"}
+"""
 
 from claude_agent_sdk import (
     query,
@@ -15,6 +21,7 @@ from langchain_core.callbacks import adispatch_custom_event
 from harness_agent.core.state import HarnessState
 
 
+# 基础系统提示词（当不使用 Claude Code preset 时使用）
 _BASE_SYSTEM_PROMPT = """你是 Harness Agent 系统中的通用开发助手。
 你可以读写文件、执行命令来完成用户的开发任务。
 请直接动手完成任务，不要只给建议。

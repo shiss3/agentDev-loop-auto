@@ -27,11 +27,24 @@
      4. 将历史摘要作为首条消息灌入新 Client
    对用户完全透明，不中断聊天体验。
    ─────────────────────────────────────────
+
+关于 Claude Code 系统提示词：
+   ─────────────────────────────────────────
+   默认使用 Claude Code CLI 的完整系统提示词预设：
+   {"type": "preset", "preset": "claude_code"}
+
+   这使 Agent 获得与 Claude Code CLI 完全一致的能力。
+   ─────────────────────────────────────────
 """
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable, Union
+
+# system_prompt 支持的类型：
+# - str: 自定义系统提示词文本
+# - dict: Claude Code preset 配置 {"type": "preset", "preset": "claude_code", ...}
+SystemPromptType = Union[str, dict]
 
 
 @runtime_checkable
@@ -42,20 +55,21 @@ class ContextProvider(Protocol):
     使用 Protocol 而非 ABC，允许鸭子类型。
     """
 
-    def build_system_prompt(self, base_prompt: str, project_dir: str) -> str:
-        """将共享上下文注入 system_prompt
+    def build_system_prompt(self, base_prompt: str, project_dir: str) -> SystemPromptType:
+        """返回 system_prompt 配置
 
         Args:
-            base_prompt:  BaseAgent 原始 system_prompt
+            base_prompt:  BaseAgent 原始 system_prompt（使用 preset 时忽略）
             project_dir:  当前项目目录
 
         Returns:
-            组装后的完整 system_prompt，包含：
-            - 原始 base_prompt
-            - 全局上下文（项目结构、技术栈等）
-            - 领域上下文（前端/后端/接口）
-            - 缓存的经验 (.skills)
-            - 其他用户定义的上下文
+            system_prompt 配置，支持两种格式：
+
+            1. Claude Code preset（推荐）：
+               {"type": "preset", "preset": "claude_code"}
+
+            2. 自定义字符串：
+               "你是一个开发助手..."
         """
         ...
 
@@ -98,13 +112,15 @@ class ContextProvider(Protocol):
 
 
 class DefaultContextProvider:
-    """默认上下文提供者 — 透传原始 prompt，不注入任何上下文
+    """默认上下文提供者 — 使用 Claude Code CLI 完整系统提示词
 
-    在用户提供具体实现之前作为占位符。
+    返回 Claude Code preset，获得与 Claude Code CLI 完全一致的能力。
+    不追加任何自定义内容。
     """
 
-    def build_system_prompt(self, base_prompt: str, project_dir: str) -> str:
-        return base_prompt
+    def build_system_prompt(self, base_prompt: str, project_dir: str) -> SystemPromptType:
+        """返回 Claude Code CLI 的完整系统提示词"""
+        return {"type": "preset", "preset": "claude_code"}
 
     def on_turn_end(
         self,
@@ -112,10 +128,10 @@ class DefaultContextProvider:
         response_summary: str,
         tool_calls: list[dict],
     ) -> None:
-        pass  # 默认不做任何事
+        pass
 
     def has_context_changed(self) -> bool:
-        return False  # 默认上下文永远不变
+        return False
 
     def get_history_summary(
         self,
@@ -123,7 +139,7 @@ class DefaultContextProvider:
         tool_calls: list[dict],
         turn_count: int,
     ) -> str:
-        return ""  # 默认无历史摘要
+        return ""
 
     def get_context_summary(self) -> str:
-        return "[未配置共享上下文]"
+        return "[使用 Claude Code 系统提示词]"

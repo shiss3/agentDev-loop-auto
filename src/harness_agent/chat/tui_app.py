@@ -27,7 +27,6 @@ from prompt_toolkit.formatted_text import FormattedText, StyleAndTextTuples
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import BufferControl, Dimension, FormattedTextControl, HSplit, Layout, Window
-from prompt_toolkit.layout.margins import ScrollbarMargin
 from prompt_toolkit.styles import Style
 
 from harness_agent.chat.content_buffer import ContentBuffer
@@ -44,10 +43,6 @@ _TUI_STYLE = Style.from_dict(
         "status.input-prefix": "bold",
         # 用户输入样式
         "user-message": "bg:#2d2d2d #cccccc",
-        # 滚动条样式
-        "scrollbar.background": "bg:#1a1a1a",
-        "scrollbar.button": "bg:#444444",
-        "scrollbar.arrow": "#888888",
     }
 )
 
@@ -291,8 +286,6 @@ class TuiApp:
         content_window = Window(
             content=content_ctrl,
             wrap_lines=True,
-            # 右侧显示滚动条（仅视觉，鼠标拖拽需自定义实现）
-            right_margins=[ScrollbarMargin(display_arrows=True)],
             # 内容区占据剩余空间（min=3 确保至少能看到几行，max=None 表示无上限）
             height=Dimension(min=3, max=None),
         )

@@ -15,7 +15,7 @@ class ChatConfig:
         show_timing:  是否显示耗时
     """
 
-    max_turns: int = 30
+    max_turns: int | None = None  # None 表示无限制，由上下文长度自然限制
     history_file: str | None = None
     show_usage: bool = True
     show_timing: bool = True
