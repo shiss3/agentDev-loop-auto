@@ -58,13 +58,23 @@ class ChatCLI:
         session_store: FileSessionStore | None = None,
         resume_session_id: str | None = None,
         continue_conversation: bool = False,
+        enable_undo: bool = False,  # 开启检查点模式（禁用会话恢复）
     ) -> None:
         self.project_dir = str(Path(project_dir).resolve())
         self.model = model
         self.context_provider = context_provider or DefaultContextProvider()
 
-        # 会话存储
-        self.session_store = session_store or create_session_store()
+        # 会话模式
+        # - enable_undo=True: 检查点模式（支持 /undo，禁用会话恢复）
+        # - enable_undo=False (默认): 会话恢复模式
+        self.enable_undo = enable_undo
+
+        # 检查点模式下不使用 session_store
+        if enable_undo:
+            self.session_store = None
+        else:
+            self.session_store = session_store or create_session_store()
+
         self.resume_session_id = resume_session_id
         self.continue_conversation = continue_conversation
 
@@ -91,25 +101,28 @@ class ChatCLI:
             session_store=self.session_store,
             resume_session_id=self.resume_session_id,
             continue_conversation=self.continue_conversation,
+            enable_undo=self.enable_undo,
         )
 
     async def run(self) -> None:
         """启动 TUI 应用（阻塞直到退出）"""
-        # 如果没有指定恢复的会话，显示会话选择界面
-        if not self.resume_session_id and not self.continue_conversation:
-            selected_session = await self._show_session_selector()
-            if selected_session is None:
-                # 用户选择退出
-                return
-            elif selected_session == "__new__":
-                # 用户选择新会话
-                pass
-            else:
-                # 用户选择恢复历史会话
-                self.resume_session_id = selected_session
-                # 重新创建会话以使用新的 session_id
-                await self.session.close()
-                self.session = self._create_session()
+        # 检查点模式下不显示会话选择界面
+        if not self.enable_undo:
+            # 如果没有指定恢复的会话，显示会话选择界面
+            if not self.resume_session_id and not self.continue_conversation:
+                selected_session = await self._show_session_selector()
+                if selected_session is None:
+                    # 用户选择退出
+                    return
+                elif selected_session == "__new__":
+                    # 用户选择新会话
+                    pass
+                else:
+                    # 用户选择恢复历史会话
+                    self.resume_session_id = selected_session
+                    # 重新创建会话以使用新的 session_id
+                    await self.session.close()
+                    self.session = self._create_session()
 
         # 注册输入回调
         self.tui.set_on_submit(self._on_user_input)

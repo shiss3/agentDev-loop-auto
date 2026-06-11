@@ -191,17 +191,31 @@ async def _run_streaming(prompt: str, project_dir: str, model: str | None = None
     default=False,
     help="恢复最近一次会话",
 )
-def chat(project: str | None, model: str | None, resume: str | None, continue_conversation: bool):
+@click.option(
+    "--undo",
+    is_flag=True,
+    default=False,
+    help="开启检查点模式（支持 /undo 回滚，但禁用会话恢复功能）",
+)
+def chat(project: str | None, model: str | None, resume: str | None, continue_conversation: bool, undo: bool):
     """启动交互式聊天模式（多轮对话 REPL）
 
     示例:
-        harness chat
-        harness chat -p ./my-app
-        harness chat -m claude-sonnet-4-6
-        harness chat --continue        # 恢复最近会话
-        harness chat --resume <session_id>  # 恢复指定会话
+        harness chat                       # 新会话（显示历史选择）
+        harness chat -p ./my-app          # 指定项目
+        harness chat -m claude-sonnet-4-6 # 指定模型
+        harness chat --continue           # 恢复最近会话
+        harness chat --resume <session_id> # 恢复指定会话
+        harness chat --undo               # 检查点模式（支持 /undo）
+
+    注意：--undo 和 --continue/--resume 互斥
     """
     from harness_agent.chat.repl import ChatCLI
+
+    # 检查互斥
+    if undo and (continue_conversation or resume):
+        click.echo("错误：--undo 不能与 --continue 或 --resume 同时使用", err=True)
+        return
 
     # 未指定 project 时自动探测项目根
     if project is None:
@@ -212,8 +226,9 @@ def chat(project: str | None, model: str | None, resume: str | None, continue_co
     chat_cli = ChatCLI(
         project_dir=project_dir,
         model=model,
-        resume_session_id=resume,
-        continue_conversation=continue_conversation,
+        resume_session_id=resume if not undo else None,
+        continue_conversation=continue_conversation if not undo else False,
+        enable_undo=undo,
     )
     asyncio.run(chat_cli.run())
 

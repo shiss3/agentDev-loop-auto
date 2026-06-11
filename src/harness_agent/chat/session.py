@@ -110,6 +110,7 @@ class ChatSession:
         session_store: SessionStore | None = None,
         resume_session_id: str | None = None,
         continue_conversation: bool = False,
+        enable_undo: bool = False,  # 开启文件检查点模式（禁用会话恢复）
     ) -> None:
         self.project_dir = project_dir
         self.model = model  # 用户指定的模型（可能为 None，表示使用全局配置）
@@ -117,10 +118,13 @@ class ChatSession:
         self.context_provider = context_provider or DefaultContextProvider()
         self.allowed_tools = allowed_tools or ["Read", "Write", "Edit", "Bash"]
 
-        # 会话恢复相关参数
-        self.session_store = session_store
-        self.resume_session_id = resume_session_id
-        self.continue_conversation = continue_conversation
+        # 会话模式选择
+        # - enable_undo=True: 开启检查点模式（支持 /undo，但禁用会话恢复）
+        # - enable_undo=False (默认): 会话恢复模式（支持 /continue，但无检查点）
+        self.enable_undo = enable_undo
+        self.session_store = None if enable_undo else session_store
+        self.resume_session_id = None if enable_undo else resume_session_id
+        self.continue_conversation = False if enable_undo else continue_conversation
 
         self._client: ClaudeSDKClient | None = None
         self.stats = SessionStats()
@@ -129,7 +133,7 @@ class ChatSession:
         self._all_tool_calls: list[dict] = []
 
         # 会话 ID（用于恢复和持久化）
-        self.session_id: str = resume_session_id or str(uuid.uuid4())
+        self.session_id: str = resume_session_id or str(uuid.uuid4()) if not enable_undo else str(uuid.uuid4())
 
         # 实际使用的模型名称（从 SDK 返回中提取）
         self.actual_model: str | None = None
@@ -170,6 +174,9 @@ class ChatSession:
         - 默认 skills (/help, /review 等)
         - 默认 hooks (如果有配置)
         - 默认权限模式
+
+        注意：session_store 和 enable_file_checkpointing 不能同时使用，
+        因为检查点是本地存储，与远程会话记录会冲突。
         """
         # 通过 ContextProvider 组装 system_prompt
         system_prompt = self.context_provider.build_system_prompt(
@@ -186,17 +193,25 @@ class ChatSession:
 
             # ── Claude Code 增强配置 ──
             include_partial_messages=True,  # 流式输出时包含部分消息
-            enable_file_checkpointing=True,  # 开启文件修改检查点，支持回滚
         )
+
+        # 注意：session_store 和 enable_file_checkpointing 不能同时使用
+        # 如果启用了 enable_undo，跳过 session_store
+        if self.enable_undo:
+            # 检查点模式：开启文件检查点，禁用会话恢复
+            opts.enable_file_checkpointing = True
+        else:
+            # 会话恢复模式：使用 session_store
+            if self.session_store:
+                opts.session_store = self.session_store
 
         if self.model:
             opts.model = self.model
 
-        # 会话恢复参数
-        if self.session_store:
-            opts.session_store = self.session_store
-
-        if self.resume_session_id:
+        # 会话恢复参数（enable_undo 模式下跳过）
+        if self.enable_undo:
+            pass  # 不设置 session 相关参数
+        elif self.resume_session_id:
             # 恢复指定会话
             opts.resume = self.resume_session_id
         elif self.continue_conversation:
