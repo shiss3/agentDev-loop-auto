@@ -252,12 +252,14 @@ class ChatCLI:
             project_key = project_key_for_directory(self.project_dir)
             # 获取历史会话列表
             summaries = await self.session_store.list_session_summaries(project_key)
+            logger.debug(f"Found {len(summaries)} sessions for project_key={project_key}")
         except Exception as e:
             logger.warning(f"Failed to list sessions: {e}")
             summaries = []
 
         # 如果没有历史会话，直接进入新会话
         if not summaries:
+            logger.debug("No sessions found, starting new session")
             return "__new__"
 
         # 有历史会话，显示选择界面
@@ -283,8 +285,9 @@ class ChatCLI:
             mtime = summary.get("mtime", 0)
             data = summary.get("data", {})
 
-            # 提取标题
-            title = data.get("summary_hint", "未命名会话")
+            # 提取标题（兼容多种字段名）
+            # 优先级：ai_title > summary_hint > first_prompt
+            title = data.get("ai_title") or data.get("summary_hint") or data.get("first_prompt", "未命名会话")
             if len(title) > 30:
                 title = title[:30] + "..."
 
@@ -397,7 +400,7 @@ class ChatCLI:
             return result
 
         except Exception as e:
-            logger.warning(f"Session selector error: {e}, falling back to simple input")
+            logger.error(f"Session selector error: {e}", exc_info=True)
 
             # 降级到简单的输入方式
             print("\n  📋 最近对话\n")

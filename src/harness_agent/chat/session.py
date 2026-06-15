@@ -98,6 +98,11 @@ class ChatSession:
             renderer.handle(event)
 
         await session.close()
+
+    ⚠️ session_id 说明：
+       SDK 的 session_id 只在客户端初始化时设置一次。
+       多轮对话时，SDK 会自动维护会话状态，不需要重复设置 session_id。
+       如果在重建客户端时重复使用相同的 session_id，会导致 "Session ID already in use" 错误。
     """
 
     def __init__(
@@ -133,7 +138,10 @@ class ChatSession:
         self._all_tool_calls: list[dict] = []
 
         # 会话 ID（用于恢复和持久化）
+        # 注意：session_id 只在 start() 时使用一次，后续重建客户端时需要生成新的 session_id
         self.session_id: str = resume_session_id or str(uuid.uuid4()) if not enable_undo else str(uuid.uuid4())
+        # 标记是否已经初始化过客户端（用于判断是否需要设置 session_id）
+        self._client_initialized: bool = False
 
         # 实际使用的模型名称（从 SDK 返回中提取）
         self.actual_model: str | None = None
@@ -165,8 +173,13 @@ class ChatSession:
         self._cancelled = True
         # 异步中断会在 send() 方法中处理
 
-    def _build_options(self) -> ClaudeAgentOptions:
+    def _build_options(self, for_rebuild: bool = False) -> ClaudeAgentOptions:
         """构建 SDK 配置，注入共享上下文
+
+        Args:
+            for_rebuild: 是否用于重建客户端（取消后恢复或上下文变更热重启）
+                        如果为 True，不设置 session_id，让 SDK 自动管理
+                        如果为 False，按正常逻辑设置 session_id
 
         注意：当 system_prompt 使用 claude_code preset 时，
         SDK 会调用 Claude Code CLI，自动获得 Claude Code 的所有默认行为：
@@ -177,6 +190,15 @@ class ChatSession:
 
         注意：session_store 和 enable_file_checkpointing 不能同时使用，
         因为检查点是本地存储，与远程会话记录会冲突。
+
+        ⚠️ session_id 重复使用问题修复：
+           SDK 的 session_id 只在客户端初始化时生效。
+           如果在重建客户端时使用相同的 session_id，SDK 子进程可能检测到
+           "Session ID already in use" 错误。
+
+           解决方案：
+           - 第一次初始化客户端时设置 session_id
+           - 重建客户端时不设置 session_id，让 SDK 自动管理会话延续
         """
         # 通过 ContextProvider 组装 system_prompt
         system_prompt = self.context_provider.build_system_prompt(
@@ -208,10 +230,16 @@ class ChatSession:
         if self.model:
             opts.model = self.model
 
-        # 会话恢复参数（enable_undo 模式下跳过）
-        if self.enable_undo:
-            # 检查点模式：只设置 session_id，不设置恢复相关参数
-            opts.session_id = self.session_id
+        # ── session_id 设置逻辑（修复重复使用问题）──
+        # 重建客户端时不设置 session_id，避免 "Session ID already in use" 错误
+        if for_rebuild:
+            # 重建时让 SDK 自动管理会话延续，不设置 session_id
+            # 这样可以避免旧的 SDK 子进程检测到 session_id 冲突
+            pass  # 不设置任何 session 相关参数
+        elif self.enable_undo:
+            # 检查点模式：只在第一轮设置 session_id
+            if not self._client_initialized:
+                opts.session_id = self.session_id
         elif self.resume_session_id:
             # 恢复指定会话
             opts.resume = self.resume_session_id
@@ -219,8 +247,9 @@ class ChatSession:
             # 恢复最近会话
             opts.continue_conversation = True
         else:
-            # 新会话，使用自己的 session_id
-            opts.session_id = self.session_id
+            # 新会话模式：只在第一轮设置 session_id
+            if not self._client_initialized:
+                opts.session_id = self.session_id
 
         return opts
 
@@ -230,6 +259,7 @@ class ChatSession:
         self._client = ClaudeSDKClient(options=options)
         await self._client.__aenter__()
         self._is_active = True
+        self._client_initialized = True  # 标记客户端已初始化
 
     async def close(self) -> None:
         """关闭会话 — 清理资源"""
@@ -244,9 +274,13 @@ class ChatSession:
             await self._client.__aexit__(None, None, None)
             self._client = None
         self._is_active = False
+        self._client_initialized = False  # 重置初始化标志
 
     async def _hot_restart_client(self) -> None:
-        """平滑重启底层 Client — 应用最新上下文"""
+        """平滑重启底层 Client — 应用最新上下文
+
+        ⚠️ 修复：使用 for_rebuild=True 参数，避免 session_id 重复使用错误。
+        """
         history_summary = self.context_provider.get_history_summary(
             collected_texts=self._all_collected_texts,
             tool_calls=self._all_tool_calls,
@@ -256,7 +290,8 @@ class ChatSession:
         if self._client:
             await self._client.__aexit__(None, None, None)
 
-        options = self._build_options()
+        # 使用 for_rebuild=True，不设置 session_id，让 SDK 自动管理会话延续
+        options = self._build_options(for_rebuild=True)
         self._client = ClaudeSDKClient(options=options)
         await self._client.__aenter__()
 
@@ -272,6 +307,8 @@ class ChatSession:
 
         中断请求后，SDK 客户端可能处于不稳定状态，
         需要断开重连以恢复。
+
+        ⚠️ 修复：使用 for_rebuild=True 参数，避免 session_id 重复使用错误。
         """
         if not self._client:
             return
@@ -285,7 +322,8 @@ class ChatSession:
             # 如果重连失败，尝试完全重建客户端
             try:
                 await self._client.__aexit__(None, None, None)
-                options = self._build_options()
+                # 使用 for_rebuild=True，不设置 session_id
+                options = self._build_options(for_rebuild=True)
                 self._client = ClaudeSDKClient(options=options)
                 await self._client.__aenter__()
             except Exception:
