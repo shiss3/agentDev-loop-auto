@@ -8,6 +8,8 @@ Phase 2.5 策略：流式阶段纯文本追加，Turn End 后暂不做 Markdown 
 
 from __future__ import annotations
 
+import time
+
 from harness_agent.chat.events import ChatEvent, EventType
 from harness_agent.chat.content_buffer import ContentBuffer
 from harness_agent.chat.tui_app import TuiApp
@@ -21,6 +23,16 @@ _TOOL_ICONS = {
     "Bash": "⚡",
     "Grep": "🔍",
     "Glob": "📂",
+}
+
+# 重试原因 → 中文标签
+_RETRY_REASON_LABELS = {
+    "retry_attempt": "重试中",
+    "retry_wait": "等待重连",
+    "connection_failed": "连接失败",
+    "rate_limit": "速率限制",
+    "timeout": "请求超时",
+    "error": "请求错误",
 }
 
 
@@ -49,6 +61,9 @@ class ChatRenderer:
         self._turn_output_tokens: int = 0
         self._turn_start_time: float = 0.0
 
+        # ── 连接/重试监控 ──
+        self._last_retry_count: int = 0  # 上次渲染的 retry 计数
+
     # ── 公共入口 ──
 
     def handle(self, event: ChatEvent) -> None:
@@ -63,6 +78,9 @@ class ChatRenderer:
             EventType.ERROR: self._render_error,
             EventType.USAGE: self._render_usage,
             EventType.CANCELLED: self._render_cancelled,
+            EventType.RETRY: self._render_retry,
+            EventType.RATE_LIMIT: self._render_rate_limit,
+            EventType.STREAM_ERROR: self._render_stream_error,
         }.get(event.type)
 
         if handler:
@@ -72,8 +90,6 @@ class ChatRenderer:
 
     def _render_turn_start(self, event: ChatEvent) -> None:
         """Turn 开始：追加用户输入 + 启动 Spinner"""
-        import time
-
         self.turn_tool_count = 0
         self._turn_input_tokens = 0
         self._turn_output_tokens = 0
@@ -191,3 +207,61 @@ class ChatRenderer:
     def render_command_result(self, text: str) -> None:
         """渲染斜杠命令结果"""
         self.buf.append_plain(text)
+
+    # ── 连接/重试监控渲染 ──
+
+    def _render_retry(self, event: ChatEvent) -> None:
+        """模型重试：追加重试提示
+
+        当 CLI 检测到连接失败并重试时触发（如网络超时、API 错误）。
+        实时显示重试次数，让用户知道当前正在进行重试。
+        """
+        attempt = event.data.get("attempt", 1)
+        reason = event.data.get("reason", "")
+        max_attempts = event.data.get("max_attempts")
+
+        # 首次重试时停止 spinner 并提示
+        if attempt == 1:
+            self.tui.stop_spinner()
+
+        # 构建原因标签
+        reason_label = _RETRY_REASON_LABELS.get(reason, reason or "重试中")
+
+        # 构建提示文本
+        if max_attempts:
+            hint = f"🔄 {reason_label}...（第 {attempt}/{max_attempts} 次）"
+        else:
+            hint = f"🔄 {reason_label}...（第 {attempt} 次）"
+
+        self.buf.append_retry(f"{hint}")
+        # 更新 spinner 显示重试状态
+        self.tui.start_spinner(f"{reason_label} ({attempt})...")
+
+    def _render_rate_limit(self, event: ChatEvent) -> None:
+        """速率限制：追加限制提示
+
+        当 CLI 报告速率限制状态变化时触发。
+        用户可据此决定是否等待或减少请求频率。
+        """
+        status = event.data.get("status", "")
+        message = event.data.get("message", "")
+
+        if status == "rejected":
+            self.buf.append_warning(message or "⚠️ API 请求被拒绝（速率限制）")
+        elif status == "allowed_warning":
+            self.buf.append_warning(message or "⚠️ API 速率接近限制")
+        # "allowed" 状态通常不需要提示
+
+    def _render_stream_error(self, event: ChatEvent) -> None:
+        """流错误：追加错误提示
+
+        当 Anthropic API 流中出现错误事件时触发。
+        通常是连接或认证相关的错误。
+        """
+        error = event.data.get("error", "未知流错误")[:300]
+        stream_type = event.data.get("stream_event_type", "")
+        hint = f"⚠️ 流错误"
+        if stream_type:
+            hint += f" [{stream_type}]"
+        hint += f": {error}"
+        self.buf.append_warning(hint)

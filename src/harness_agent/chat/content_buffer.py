@@ -40,6 +40,8 @@ _STYLE_TOOL_OK = "ansigreen"
 _STYLE_TOOL_FAIL = "ansired"
 _STYLE_SPINNER = "ansicyan dim"
 _STYLE_ERROR = "ansired bold"
+_STYLE_RETRY = "ansiyellow dim"    # 重试/等待（黄色）
+_STYLE_WARNING = "ansiyellow bold"  # 警告（黄色加粗）
 
 
 def _markup_to_fragments(markup: str) -> StyleAndTextTuples:
@@ -168,6 +170,22 @@ class ContentBuffer:
         """追加命令结果等辅助文本（无格式，带缩进）"""
         if text:
             self._lines.append(FormattedText([("dim", f"  {text}")]))
+            self._notify()
+
+    def append_retry(self, text: str) -> None:
+        """追加重试/等待提示（黄色dim，缩进两格）"""
+        if text:
+            self._lines.append(
+                FormattedText([(_STYLE_RETRY, f"  {text}")])
+            )
+            self._notify()
+
+    def append_warning(self, text: str) -> None:
+        """追加警告信息（黄色加粗）"""
+        if text:
+            self._lines.append(
+                FormattedText([(_STYLE_WARNING, f"  {text}")])
+            )
             self._notify()
 
     # ── Spinner 管理 ──

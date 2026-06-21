@@ -34,6 +34,11 @@ class EventType(str, Enum):
     # ── 统计 ──
     USAGE = "usage"                  # Token 用量统计
 
+    # ── 连接 / 重试监控（SDK 模型连接相关）──
+    RETRY = "retry"                  # 模型请求重试中（连接失败/API 错误）
+    RATE_LIMIT = "rate_limit"        # 速率限制状态变化（CLI 发出 RateLimitEvent）
+    STREAM_ERROR = "stream_error"    # 流式事件中的错误（Anthropic API stream 错误）
+
 
 @dataclass
 class ChatEvent:
@@ -158,3 +163,73 @@ def thinking_event(agent: str = "default") -> ChatEvent:
 def cancelled_event(reason: str = "用户取消") -> ChatEvent:
     """创建取消事件"""
     return ChatEvent(type=EventType.CANCELLED, data={"reason": reason})
+
+
+def retry_event(
+    attempt: int,
+    reason: str,
+    max_attempts: int | None = None,
+) -> ChatEvent:
+    """创建重试事件
+
+    Args:
+        attempt: 当前重试次数（从 1 开始）
+        reason: 重试原因（如 "连接超时"、"API 错误"、"rate limit"）
+        max_attempts: 最大重试次数（可选，CLI 告知）
+    """
+    data: dict[str, Any] = {
+        "attempt": attempt,
+        "reason": reason,
+    }
+    if max_attempts is not None:
+        data["max_attempts"] = max_attempts
+    return ChatEvent(type=EventType.RETRY, data=data)
+
+
+def rate_limit_event(
+    status: str,
+    rate_limit_type: str | None = None,
+    resets_at: int | None = None,
+    utilization: float | None = None,
+    message: str = "",
+) -> ChatEvent:
+    """创建速率限制事件
+
+    Args:
+        status: 限制状态 ("allowed", "allowed_warning", "rejected")
+        rate_limit_type: 限制类型 ("five_hour", "seven_day", "overage" 等)
+        resets_at: 重置时间戳
+        utilization: 使用率 0.0-1.0
+        message: 人类可读提示
+    """
+    return ChatEvent(
+        type=EventType.RATE_LIMIT,
+        data={
+            "status": status,
+            "rate_limit_type": rate_limit_type,
+            "resets_at": resets_at,
+            "utilization": utilization,
+            "message": message,
+        },
+    )
+
+
+def stream_error_event(
+    error: str,
+    stream_event_type: str | None = None,
+) -> ChatEvent:
+    """创建流错误事件
+
+    当 CLI 发出的 stream_event 中包含 error 相关信息时触发。
+
+    Args:
+        error: 错误描述
+        stream_event_type: stream_event 中的 event 字段值
+    """
+    return ChatEvent(
+        type=EventType.STREAM_ERROR,
+        data={
+            "error": error,
+            "stream_event_type": stream_event_type,
+        },
+    )

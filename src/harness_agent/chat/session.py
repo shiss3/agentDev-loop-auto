@@ -29,8 +29,13 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
+import logging
+import re
+import threading
 import time
 import uuid
+from collections.abc import Callable
 from typing import AsyncIterator
 
 from claude_agent_sdk import (
@@ -41,6 +46,8 @@ from claude_agent_sdk import (
     TextBlock,
     ToolUseBlock,
     SessionStore,
+    RateLimitEvent,
+    StreamEvent,
 )
 
 from harness_agent.chat.events import (
@@ -53,6 +60,9 @@ from harness_agent.chat.events import (
     error_event,
     usage_event,
     cancelled_event,
+    retry_event,
+    rate_limit_event,
+    stream_error_event,
 )
 from harness_agent.context.provider import ContextProvider, DefaultContextProvider
 
@@ -60,6 +70,8 @@ from harness_agent.context.provider import ContextProvider, DefaultContextProvid
 _BASE_SYSTEM_PROMPT = """你是 Harness Agent 系统中的通用开发助手。
 你可以读写文件、执行命令来完成用户的开发任务。
 请直接动手完成任务，不要只给建议。"""
+
+_logger = logging.getLogger(__name__)
 
 
 class SessionStats:
@@ -71,6 +83,11 @@ class SessionStats:
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
         self.cancelled_requests: int = 0  # 取消请求计数
+        # ── 连接/重试监控 ──
+        self.retry_count: int = 0          # 本会话累计重试次数
+        self.rate_limit_hits: int = 0     # 进入 "rejected" 状态的次数
+        self.last_retry_reason: str = ""  # 最近一次重试原因
+        self.last_rate_limit_status: str = ""  # 最近一次 rate limit 状态
 
     def to_dict(self) -> dict:
         return {
@@ -79,6 +96,10 @@ class SessionStats:
             "total_input_tokens": self.total_input_tokens,
             "total_output_tokens": self.total_output_tokens,
             "cancelled_requests": self.cancelled_requests,
+            "retry_count": self.retry_count,
+            "rate_limit_hits": self.rate_limit_hits,
+            "last_retry_reason": self.last_retry_reason,
+            "last_rate_limit_status": self.last_rate_limit_status,
         }
 
 
@@ -151,6 +172,71 @@ class ChatSession:
         # 当前正在处理请求的标志
         self._processing_request: bool = False
 
+        # ── 连接/重试监控 ──
+        self._retry_count: int = 0          # 当前请求的重试计数
+        self._current_retry_reason: str = ""  # 当前重试原因
+        self._retry_lock = threading.Lock()  # 保护 retry 计数的线程锁
+        # stderr 回调（由 _handle_stderr_line 设置，SDK 会调用它）
+        self._stderr_callback: Callable[[str], None] | None = None
+
+    # ── CLI retry 日志检测模式（类属性）──
+    # Anthropic CLI 会在连接失败时打印类似 "Retrying... (attempt 2/5)" 的日志
+    _RETRY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+        # "Retrying... (attempt 2/5)" 或 "Retrying request (2/5)"
+        (re.compile(r"retrying.*?\((\d+)/(\d+)\)", re.I), "retry_attempt"),
+        # "Retrying in 5 seconds..."
+        (re.compile(r"retrying in (\d+) second", re.I), "retry_wait"),
+        # "Connection failed, retrying..."
+        (re.compile(r"connection failed", re.I), "connection_failed"),
+        # "Request failed with status 429, retrying..."
+        (re.compile(r"(?:status |error )?429.*retry", re.I), "rate_limit"),
+        # "Request timeout, retrying..."
+        (re.compile(r"timeout.*retry", re.I), "timeout"),
+        # "Error.*retrying" (通用重试)
+        (re.compile(r"error.*retrying", re.I), "error"),
+    ]
+
+    def _handle_stderr_line(self, line: str) -> None:
+        """处理 CLI stderr 行，检测 retry 信息
+
+        当 SDK 从 Claude Code CLI 子进程的 stderr 读取到内容时调用。
+        我们从这些行中解析重试状态并记录到统计中。
+
+        注意：这是同步回调，在 SDK 的 I/O 线程中执行，不能 yield 事件。
+        事件会在 send() 循环中通过检测 _retry_count 来处理。
+        """
+        for pattern, reason in self._RETRY_PATTERNS:
+            match = pattern.search(line)
+            if match:
+                # 提取 attempt 数（如果提供）
+                attempt: int = 1
+                max_attempts: int | None = None
+                if len(match.groups()) >= 1 and match.group(1):
+                    g1 = match.group(1)
+                    if g1 and g1.isdigit():
+                        attempt = int(g1)
+                if len(match.groups()) >= 2 and match.group(2):
+                    g2 = match.group(2)
+                    if g2 and g2.isdigit():
+                        max_attempts = int(g2)
+
+                # 使用线程锁保护共享状态
+                with self._retry_lock:
+                    self._retry_count = attempt
+                    self._current_retry_reason = reason
+                    # 更新会话统计（取最大值）
+                    if attempt > self.stats.retry_count:
+                        self.stats.retry_count = attempt
+                    self.stats.last_retry_reason = reason
+
+                _logger.debug(
+                    "Retry detected: attempt=%s, reason=%s, max=%s",
+                    attempt,
+                    reason,
+                    max_attempts,
+                )
+                break
+
     @property
     def is_active(self) -> bool:
         return self._is_active
@@ -215,6 +301,7 @@ class ChatSession:
 
             # ── Claude Code 增强配置 ──
             include_partial_messages=True,  # 流式输出时包含部分消息
+            stderr=self._handle_stderr_line,  # 捕获 CLI stderr（包含 retry 日志）
         )
 
         # 注意：session_store 和 enable_file_checkpointing 不能同时使用
@@ -365,10 +452,23 @@ class ChatSession:
 
         was_cancelled = False
 
+        # ── 重试监控：每个请求开始时重置计数器 ──
+        self._retry_count = 0
+        self._current_retry_reason = ""
+        last_emitted_retry_count = 0  # 用于检测 retry 计数变化
+
         try:
             await self._client.query(prompt)
 
             async for message in self._client.receive_response():
+                # ── 检查 retry 计数变化（由 stderr 回调更新）──
+                if self._retry_count > last_emitted_retry_count:
+                    yield retry_event(
+                        attempt=self._retry_count,
+                        reason=self._current_retry_reason,
+                    )
+                    last_emitted_retry_count = self._retry_count
+
                 # 检查取消标志 — 立即中断
                 if self._cancelled:
                     was_cancelled = True
@@ -380,6 +480,53 @@ class ChatSession:
                         pass
                     yield cancelled_event("用户取消了请求")
                     break
+
+                # ── RateLimitEvent ──
+                if isinstance(message, RateLimitEvent):
+                    rli = message.rate_limit_info
+                    status = rli.status
+                    self.stats.last_rate_limit_status = status
+
+                    if status == "rejected":
+                        self.stats.rate_limit_hits += 1
+
+                    # 构建人类可读消息
+                    msg = ""
+                    if status == "rejected":
+                        msg = "⚠️ API 请求被拒绝（速率限制）"
+                        if rli.resets_at:
+                            reset_time = datetime.datetime.fromtimestamp(rli.resets_at)
+                            msg += f"，将在 {reset_time.strftime('%H:%M:%S')} 重置"
+                    elif status == "allowed_warning":
+                        util = rli.utilization
+                        msg = f"⚠️ API 速率接近限制（已使用 {int((util or 0) * 100)}%）"
+                    elif rli.rate_limit_type:
+                        msg = f"ℹ️ 速率限制类型: {rli.rate_limit_type}"
+
+                    yield rate_limit_event(
+                        status=status,
+                        rate_limit_type=rli.rate_limit_type,
+                        resets_at=rli.resets_at,
+                        utilization=rli.utilization,
+                        message=msg,
+                    )
+                    continue
+
+                # ── StreamEvent ──
+                if isinstance(message, StreamEvent):
+                    event_data = message.event or {}
+                    event_type = event_data.get("type", "") if isinstance(event_data, dict) else ""
+
+                    # 检测 stream 错误（如 "error" 类型的 event）
+                    if isinstance(event_data, dict):
+                        # Anthropic API 流式事件中的错误标记
+                        if event_data.get("type") == "error" or event_data.get("error"):
+                            err_msg = event_data.get("error", str(event_data))
+                            yield stream_error_event(
+                                error=str(err_msg)[:300],
+                                stream_event_type=event_type,
+                            )
+                    continue
 
                 # ── AssistantMessage ──
                 if isinstance(message, AssistantMessage):
