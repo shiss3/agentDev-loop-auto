@@ -64,6 +64,7 @@ from harness_agent.chat.events import (
     rate_limit_event,
     stream_error_event,
 )
+from harness_agent.chat.translator import MessageTranslator
 from harness_agent.context.provider import ContextProvider, DefaultContextProvider
 
 
@@ -166,6 +167,9 @@ class ChatSession:
 
         # 实际使用的模型名称（从 SDK 返回中提取）
         self.actual_model: str | None = None
+
+        # 无状态消息转换器（SDK Message → ChatEvent）
+        self._translator = MessageTranslator()
 
         # 取消标志
         self._cancelled: bool = False
@@ -452,22 +456,26 @@ class ChatSession:
 
         was_cancelled = False
 
-        # ── 重试监控：每个请求开始时重置计数器 ──
-        self._retry_count = 0
-        self._current_retry_reason = ""
+        # ── 重试监控：每个请求开始时重置计数器（加锁，stderr 线程会并发写）──
+        with self._retry_lock:
+            self._retry_count = 0
+            self._current_retry_reason = ""
         last_emitted_retry_count = 0  # 用于检测 retry 计数变化
 
         try:
             await self._client.query(prompt)
 
             async for message in self._client.receive_response():
-                # ── 检查 retry 计数变化（由 stderr 回调更新）──
-                if self._retry_count > last_emitted_retry_count:
+                # ── 检查 retry 计数变化（由 stderr 回调跨线程更新，需加锁读取）──
+                with self._retry_lock:
+                    retry_count = self._retry_count
+                    retry_reason = self._current_retry_reason
+                if retry_count > last_emitted_retry_count:
                     yield retry_event(
-                        attempt=self._retry_count,
-                        reason=self._current_retry_reason,
+                        attempt=retry_count,
+                        reason=retry_reason,
                     )
-                    last_emitted_retry_count = self._retry_count
+                    last_emitted_retry_count = retry_count
 
                 # 检查取消标志 — 立即中断
                 if self._cancelled:
@@ -481,124 +489,33 @@ class ChatSession:
                     yield cancelled_event("用户取消了请求")
                     break
 
-                # ── RateLimitEvent ──
-                if isinstance(message, RateLimitEvent):
-                    rli = message.rate_limit_info
-                    status = rli.status
-                    self.stats.last_rate_limit_status = status
+                # ── 转换 SDK 消息为 ChatEvent（无状态转换器）──
+                result = self._translator.translate(message, self.actual_model)
 
-                    if status == "rejected":
+                # 更新模型名（AssistantMessage / ResultMessage 携带）
+                if result.model_name:
+                    self.actual_model = result.model_name
+
+                # 速率限制统计
+                if result.rate_limit_status is not None:
+                    self.stats.last_rate_limit_status = result.rate_limit_status
+                    if result.rate_limit_rejected:
                         self.stats.rate_limit_hits += 1
 
-                    # 构建人类可读消息
-                    msg = ""
-                    if status == "rejected":
-                        msg = "⚠️ API 请求被拒绝（速率限制）"
-                        if rli.resets_at:
-                            reset_time = datetime.datetime.fromtimestamp(rli.resets_at)
-                            msg += f"，将在 {reset_time.strftime('%H:%M:%S')} 重置"
-                    elif status == "allowed_warning":
-                        util = rli.utilization
-                        msg = f"⚠️ API 速率接近限制（已使用 {int((util or 0) * 100)}%）"
-                    elif rli.rate_limit_type:
-                        msg = f"ℹ️ 速率限制类型: {rli.rate_limit_type}"
+                # token 统计
+                self.stats.total_input_tokens += result.input_tokens
+                self.stats.total_output_tokens += result.output_tokens
 
-                    yield rate_limit_event(
-                        status=status,
-                        rate_limit_type=rli.rate_limit_type,
-                        resets_at=rli.resets_at,
-                        utilization=rli.utilization,
-                        message=msg,
-                    )
-                    continue
+                # 累计文本 / 工具调用（用于 turn 结束后的统计与上下文摘要）
+                turn_tool_count += result.tool_count
+                collected_texts.extend(result.texts)
+                tool_calls.extend(result.tool_calls)
 
-                # ── StreamEvent ──
-                if isinstance(message, StreamEvent):
-                    event_data = message.event or {}
-                    event_type = event_data.get("type", "") if isinstance(event_data, dict) else ""
-
-                    # 检测 stream 错误（如 "error" 类型的 event）
-                    if isinstance(event_data, dict):
-                        # Anthropic API 流式事件中的错误标记
-                        if event_data.get("type") == "error" or event_data.get("error"):
-                            err_msg = event_data.get("error", str(event_data))
-                            yield stream_error_event(
-                                error=str(err_msg)[:300],
-                                stream_event_type=event_type,
-                            )
-                    continue
-
-                # ── AssistantMessage ──
-                if isinstance(message, AssistantMessage):
-                    # 从 AssistantMessage 中提取实际使用的模型名称
-                    if hasattr(message, "model") and message.model:
-                        self.actual_model = message.model
-
-                    for block in message.content:
-                        # 取消时不再处理后续 block
-                        if self._cancelled:
-                            break
-
-                        if isinstance(block, TextBlock):
-                            collected_texts.append(block.text)
-                            yield text_event(block.text)
-
-                        elif isinstance(block, ToolUseBlock):
-                            turn_tool_count += 1
-                            input_summary = _summarize_tool_input(block.input)
-                            tool_info = {
-                                "tool_name": block.name,
-                                "tool_id": block.id,
-                                "tool_input": input_summary,
-                            }
-                            tool_calls.append(tool_info)
-                            yield tool_use_event(
-                                tool_name=block.name,
-                                tool_id=block.id,
-                                tool_input=input_summary,
-                            )
-
-                # ── ResultMessage ──
-                elif isinstance(message, ResultMessage):
-                    if getattr(message, "is_error", False):
-                        errors = getattr(message, "errors", [])
-                        err_text = "\n".join(errors) if errors else "未知错误"
-                        yield error_event(err_text[:500])
-                    else:
-                        # 尝试从 model_usage 中提取模型名称（这是最准确的来源）
-                        # model_usage 是一个 dict: {'model_name': {...usage info...}}
-                        model_usage = getattr(message, "model_usage", None)
-                        if model_usage and isinstance(model_usage, dict):
-                            # 取第一个模型名（通常只有一个）
-                            model_names = list(model_usage.keys())
-                            if model_names:
-                                self.actual_model = model_names[0]
-
-                        # 尝试提取 usage 信息
-                        usage = getattr(message, "usage", None)
-                        if usage:
-                            # usage 可能是 dict 或对象
-                            if isinstance(usage, dict):
-                                input_t = usage.get("input_tokens", 0) or 0
-                                output_t = usage.get("output_tokens", 0) or 0
-                                cache_r = usage.get("cache_read_input_tokens", 0) or 0
-                                cache_c = usage.get("cache_creation_input_tokens", 0) or 0
-                            else:
-                                input_t = getattr(usage, "input_tokens", 0) or 0
-                                output_t = getattr(usage, "output_tokens", 0) or 0
-                                cache_r = getattr(usage, "cache_read_input_tokens", 0) or 0
-                                cache_c = getattr(usage, "cache_creation_input_tokens", 0) or 0
-
-                            self.stats.total_input_tokens += input_t
-                            self.stats.total_output_tokens += output_t
-
-                            yield usage_event(
-                                input_tokens=input_t,
-                                output_tokens=output_t,
-                                cache_read_tokens=cache_r,
-                                cache_creation_tokens=cache_c,
-                                model_name=self.actual_model,
-                            )
+                # 逐个 yield 事件（取消时停止后续事件）
+                for ev in result.events:
+                    if self._cancelled:
+                        break
+                    yield ev
 
         except asyncio.CancelledError:
             # 异步任务被取消
@@ -647,16 +564,3 @@ class ChatSession:
             tool_count=turn_tool_count,
             duration_ms=duration_ms,
         )
-
-
-def _summarize_tool_input(tool_input: dict) -> str:
-    """工具输入摘要化（复用 Phase 1 逻辑）"""
-    if not isinstance(tool_input, dict):
-        return str(tool_input)[:100]
-    if "command" in tool_input:
-        return tool_input["command"][:100]
-    if "file_path" in tool_input:
-        return tool_input["file_path"]
-    if "content" in tool_input:
-        return f"[{len(tool_input['content'])} chars]"
-    return str(tool_input)[:100]

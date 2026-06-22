@@ -21,7 +21,6 @@ from typing import Awaitable, Callable
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.data_structures import Point
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import FormattedText, StyleAndTextTuples
 from prompt_toolkit.history import FileHistory, InMemoryHistory
@@ -30,6 +29,7 @@ from prompt_toolkit.layout import BufferControl, Dimension, FormattedTextControl
 from prompt_toolkit.styles import Style
 
 from harness_agent.chat.content_buffer import ContentBuffer
+from harness_agent.chat.scroll_controller import ScrollController, _ScrollableFTControl
 
 
 # ── 样式定义 ──
@@ -51,29 +51,6 @@ _SPINNER_INTERVAL = 0.08
 
 # 输入历史文件路径
 _DEFAULT_HISTORY_PATH = str(Path.home() / ".harness" / "chat_history")
-
-
-class _ScrollableFTControl(FormattedTextControl):
-    """支持鼠标滚轮 _scroll_down/_scroll_up 调用 move_cursor_* 的 FormattedTextControl
-
-    prompt_toolkit Window._scroll_down/_scroll_up（containers.py:2559/2572）
-    会调 content.move_cursor_down()/move_cursor_up()。FormattedTextControl
-    默认不实现这两个方法 → 鼠标滚轮事件无效。本子类把它们路由到外部回调，
-    使外部可以通过修改"虚拟光标行号"驱动滚动。
-    """
-
-    def __init__(self, *args, on_cursor_down=None, on_cursor_up=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._on_cursor_down = on_cursor_down
-        self._on_cursor_up = on_cursor_up
-
-    def move_cursor_down(self) -> None:
-        if self._on_cursor_down:
-            self._on_cursor_down()
-
-    def move_cursor_up(self) -> None:
-        if self._on_cursor_up:
-            self._on_cursor_up()
 
 
 class TuiApp:
@@ -103,9 +80,6 @@ class TuiApp:
         self.model_name = model_name
         self._history_file = history_file or _DEFAULT_HISTORY_PATH
 
-        # ── 内容变更回调 → invalidate ──
-        self.content_buffer.set_on_change(self._on_content_change)
-
         # ── 状态栏 ──
         self._status_text: str = f"{model_name} · 就绪"
 
@@ -121,14 +95,19 @@ class TuiApp:
         self._input_buffer: Buffer | None = None
         self._content_window: Window | None = None
 
-        # ── 滚动状态 ──
+        # ── 滚动控制器 ──
         # 用"虚拟光标行号"驱动 vertical_scroll：
         #   prompt_toolkit 的 Window._scroll 每帧会根据 ui_content.cursor_position.y
         #   重写 vertical_scroll；所以我们通过 get_cursor_position 提供这个 y，
         #   _scroll 就会自动把目标行带入可视区域。
-        # 跟随模式判定：_cursor_line >= _line_count - 1
-        self._cursor_line: int = 0
-        self._line_count: int = 1
+        # 跟随模式判定见 ScrollController.is_following()
+        self._scroll = ScrollController(
+            get_fragments=self.content_buffer.get_formatted_text,
+            invalidate=self._invalidate,
+        )
+
+        # ── 内容变更回调 → invalidate（需在 _scroll 创建后注册）──
+        self.content_buffer.set_on_change(self._scroll.on_content_change)
 
         # ── 鼠标捕获开关（F2 切换） ──
         # mouse_support=True 会让终端把鼠标事件转发给应用，导致无法用左键拖拽复制。
@@ -277,11 +256,11 @@ class TuiApp:
 
         # 内容区
         content_ctrl = _ScrollableFTControl(
-            text=self._get_content_fragments,
+            text=self._scroll.get_content_fragments,
             focusable=False,
-            get_cursor_position=self._get_content_cursor_position,
-            on_cursor_down=self._cursor_down_one,
-            on_cursor_up=self._cursor_up_one,
+            get_cursor_position=self._scroll.get_cursor_position,
+            on_cursor_down=self._scroll.cursor_down_one,
+            on_cursor_up=self._scroll.cursor_up_one,
         )
         content_window = Window(
             content=content_ctrl,
@@ -354,26 +333,22 @@ class TuiApp:
         @kb.add("pageup")
         def _page_up(event):
             """PageUp: 向上翻 20 行（暂停自动跟随）"""
-            self._cursor_line = max(0, self._cursor_line - 20)
-            self._invalidate()
+            self._scroll.page_up()
 
         @kb.add("pagedown")
         def _page_down(event):
             """PageDown: 向下翻 20 行（到达末尾即恢复自动跟随）"""
-            self._cursor_line = min(self._line_count - 1, self._cursor_line + 20)
-            self._invalidate()
+            self._scroll.page_down()
 
         @kb.add("home")
         def _to_home(event):
             """Home: 跳到内容顶部"""
-            self._cursor_line = 0
-            self._invalidate()
+            self._scroll.to_home()
 
         @kb.add("end")
         def _to_end(event):
             """End: 跳到内容末尾，恢复自动跟随"""
-            self._cursor_line = max(0, self._line_count - 1)
-            self._invalidate()
+            self._scroll.to_end()
 
         @kb.add("f2")
         def _toggle_mouse(event):
@@ -405,7 +380,7 @@ class TuiApp:
 
         # 用户输入后，立即强制滚动到末尾
         # 确保在 Agent 输出之前，光标已经在正确位置
-        self.scroll_to_end()
+        self._scroll.scroll_to_end()
 
         if self._on_submit:
             try:
@@ -413,17 +388,6 @@ class TuiApp:
                 loop.create_task(self._on_submit(text))
             except RuntimeError:
                 pass
-
-    def scroll_to_end(self) -> None:
-        """强制将虚拟光标滚动到内容末尾
-
-        在用户输入后立即调用，确保在 Agent 开始输出之前，
-        滚动位置已经在末尾，之后的内容会自动跟随。
-        """
-        # 先刷新 _line_count（确保基于最新的内容）
-        self._get_content_fragments()
-        self._cursor_line = max(0, self._line_count - 1)
-        self._invalidate()
 
     # ── 内部：渲染辅助 ──
 
@@ -442,59 +406,6 @@ class TuiApp:
             ("class:statusbar.model", f" {self._status_text}"),
             ("class:statusbar.info", mode_hint),
         ])
-
-    def _on_content_change(self) -> None:
-        """ContentBuffer 变更回调 → 跟随模式下把虚拟光标钉在末尾，触发重绘
-
-        ⚠ 关键：必须在刷新 _line_count **之前** 判断 _is_following，否则首次内容追加
-        会把 line_count 从 1 跳到 N，cursor=0 < N-1 → 永远脱离跟随。
-
-        ⚠ 不能用 10**9 这种哨兵值 —— 那样 _is_following 永远为 True，
-        PageUp 即便修改了 _cursor_line（如 10^9 - 20），下次 spinner tick / status 更新
-        触发的 _on_content_change 会立刻把它钉回末尾，视觉上"完全无法滚动"。
-        """
-        # 1. 用 **旧** _line_count 判断当前是否处于跟随状态
-        was_following = self._is_following()
-
-        # 2. 刷新 _line_count（取一次最新 fragments）
-        self._get_content_fragments()
-
-        # 3. 跟随状态下，把虚拟光标钉在 **新** 末尾行（真实行号，非哨兵）
-        if was_following:
-            self._cursor_line = max(0, self._line_count - 1)
-
-        self._invalidate()
-
-    # ── 内部：内容滚动管理 ──
-
-    def _get_content_fragments(self) -> StyleAndTextTuples:
-        """内容区文本回调：取 fragments 同时统计总行数（用于光标 clamp）"""
-        fragments = self.content_buffer.get_formatted_text()
-        # fragment 元组结构是 (style, text) 或 (style, text, handler)
-        text = "".join(item[1] for item in fragments)
-        self._line_count = max(1, text.count("\n") + 1)
-        return fragments
-
-    def _get_content_cursor_position(self) -> Point:
-        """提供给 FormattedTextControl 的虚拟光标位置
-
-        prompt_toolkit Window._scroll 会根据这个 y 值反算 vertical_scroll，
-        把目标行带入可视区域 → 我们以此控制滚动位置。
-        """
-        y = max(0, min(self._cursor_line, self._line_count - 1))
-        return Point(x=0, y=y)
-
-    def _is_following(self) -> bool:
-        """虚拟光标是否在内容末尾（即处于自动跟随状态）"""
-        return self._cursor_line >= self._line_count - 1
-
-    def _cursor_down_one(self) -> None:
-        """鼠标滚轮向下 → 虚拟光标下移一行"""
-        self._cursor_line = min(self._line_count - 1, self._cursor_line + 1)
-
-    def _cursor_up_one(self) -> None:
-        """鼠标滚轮向上 → 虚拟光标上移一行"""
-        self._cursor_line = max(0, self._cursor_line - 1)
 
     def _invalidate(self) -> None:
         """触发 TUI 重绘"""

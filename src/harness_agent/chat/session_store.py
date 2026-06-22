@@ -76,12 +76,11 @@ class FileSessionStore(SessionStore):
             key: 会话键（project_key/session_id）
             entries: 会话条目列表
         """
-        session_id = key.get("session_id")
-        project_key = key.get("project_key")
-
-        if not session_id or not project_key:
+        keys = self._require_keys(key)
+        if keys is None:
             logger.warning(f"Ignoring entry with incomplete key: {key}")
             return
+        session_id, project_key = keys
 
         # 转换为 Composite Key
         composite_key = f"{project_key}/{session_id}"
@@ -116,11 +115,10 @@ class FileSessionStore(SessionStore):
         Returns:
             会话条目列表，如果会话不存在返回 None
         """
-        session_id = key.get("session_id")
-        project_key = key.get("project_key")
-
-        if not session_id or not project_key:
+        keys = self._require_keys(key)
+        if keys is None:
             return None
+        session_id, project_key = keys
 
         # 转换为 Composite Key
         composite_key = f"{project_key}/{session_id}"
@@ -150,11 +148,10 @@ class FileSessionStore(SessionStore):
 
     async def delete(self, key: SessionKey) -> None:
         """删除会话（可选实现）"""
-        session_id = key.get("session_id")
-        project_key = key.get("project_key")
-
-        if not session_id or not project_key:
+        keys = self._require_keys(key)
+        if keys is None:
             return
+        session_id, project_key = keys
 
         composite_key = f"{project_key}/{session_id}"
 
@@ -221,7 +218,7 @@ class FileSessionStore(SessionStore):
                 continue
 
             # 从文件加载
-            summary_path = self.base_dir / project_key / entry["session_id"] / ".summary.json"
+            summary_path = self._get_summary_path(entry["session_id"], project_key)
             if summary_path.exists():
                 with open(summary_path, encoding="utf-8") as f:
                     summary = json.loads(f.read())
@@ -287,14 +284,13 @@ class FileSessionStore(SessionStore):
 
     def rename_session(self, key: SessionKey, new_title: str) -> None:
         """重命名会话（面向 CLI 命令使用）"""
-        session_id = key.get("session_id")
-        project_key = key.get("project_key")
-
-        if not session_id or not project_key:
+        keys = self._require_keys(key)
+        if keys is None:
             return
+        session_id, project_key = keys
 
         # 更新摘要文件
-        summary_path = self.base_dir / project_key / session_id / ".summary.json"
+        summary_path = self._get_summary_path(session_id, project_key)
         if summary_path.exists():
             with open(summary_path, "r+", encoding="utf-8") as f:
                 summary = json.loads(f.read())
@@ -348,6 +344,19 @@ class FileSessionStore(SessionStore):
         """获取会话转录文件路径"""
         return self._get_session_dir(session_id, project_key) / ".transcript.jsonl"
 
+    def _get_summary_path(self, session_id: str, project_key: str) -> Path:
+        """获取会话摘要文件路径"""
+        return self._get_session_dir(session_id, project_key) / ".summary.json"
+
+    @staticmethod
+    def _require_keys(key: SessionKey) -> tuple[str, str] | None:
+        """校验会话键完整性，返回 (session_id, project_key) 或 None"""
+        session_id = key.get("session_id")
+        project_key = key.get("project_key")
+        if not session_id or not project_key:
+            return None
+        return session_id, project_key
+
     def _read_transcript(self, path: Path) -> list[str]:
         """读取转录文件"""
         try:
@@ -395,7 +404,7 @@ class FileSessionStore(SessionStore):
                 prev_summary = self._summary_cache[composite_key]
             else:
                 # 从文件重新加载，确保数据一致
-                summary_path = self.base_dir / project_key / session_id / ".summary.json"
+                summary_path = self._get_summary_path(session_id, project_key)
                 if summary_path.exists():
                     with open(summary_path, encoding="utf-8") as f:
                         prev_summary = SessionSummaryEntry(**json.loads(f.read()))
@@ -412,7 +421,7 @@ class FileSessionStore(SessionStore):
             new_summary["mtime"] = int(time.time() * 1000)
 
             # 写入文件
-            summary_path = self.base_dir / project_key / session_id / ".summary.json"
+            summary_path = self._get_summary_path(session_id, project_key)
             summary_path.parent.mkdir(parents=True, exist_ok=True)
             with open(summary_path, "w", encoding="utf-8") as f:
                 f.write(json.dumps(new_summary))
