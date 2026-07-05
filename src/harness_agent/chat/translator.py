@@ -63,6 +63,8 @@ class TranslationResult:
     # 速率限制状态（仅 RateLimitEvent 时非 None）
     rate_limit_status: str | None = None
     rate_limit_rejected: bool = False
+    # 成本（美元，仅 ResultMessage.total_cost_usd 携带时非零）
+    total_cost_usd: float = 0.0
 
 
 def summarize_tool_input(tool_input: dict) -> str:
@@ -178,6 +180,9 @@ class MessageTranslator:
 
     def _translate_result(self, message: ResultMessage, model_name: str) -> TranslationResult:
         result = TranslationResult()
+
+        # 成本提取（ResultMessage.total_cost_usd）
+        result.total_cost_usd = float(getattr(message, "total_cost_usd", 0.0) or 0.0)
 
         if getattr(message, "is_error", False):
             errors = getattr(message, "errors", [])
