@@ -1,23 +1,31 @@
 # Harness Agent — 项目阶段总结与 Phase 2 编排计划
 
-> **版本**: v4.0（SDK 能力对齐版） | **日期**: 2026-06-21 | **架构代号**: Star-Ray (星射线)
+> **架构代号**: Star-Ray (星射线)
 > **当前阶段**: Phase 1 已完成，准备进入 Phase 2
-> **v3.0 修订要点**: 对齐 `claude-agent-sdk` v0.2.93 原生能力，修正 LangGraph 单一 State / Send / reducer 误用，补全反向瀑布流连线与收口节点，重定义压缩/温启动机制，增加依赖 DAG 与复杂度快车道。
-> **v4.0 增量**（见 §4.6/4.7）: 基于实测 SDK 能力的二轮优化——`allowed_tools` 硬约束脑手解耦、`output_format` 结构化输出免解析、`rewind_files`/`fork_session` 干净重试、预算观测、L2 双路线决策、`can_use_tool` 护栏、thread_id/session_id 概念厘清，并修正 `get_context_usage` API 误用。新增机制→SDK API 映射对照表。
+>
+> **权威设计文档**：Phase 2 架构以 [`docs/架构师 agent.md`](./架构师%20agent.md) 为准，本文档为编排计划对齐。
+>
+> **相关文档**：
+> - [`架构师 agent.md`](./架构师%20agent.md) — **Phase 2 L0 Router 权威设计**
+> - [`memory_system_design.md`](./memory_system_design.md) — 星型记忆拓扑 + GCH 设计（Phase 3+ 复用）
+> - [`星射线 agent 编排.md`](./星射线%20agent%20编排.md) — 顶层愿景文档
+> - [`critical_review.md`](./critical_review.md) — Red Team 评审备忘
 
 ---
 
 ## 1. 项目概述
 
-**Harness Agent** 是一个基于 `claude-agent-sdk` 和 `LangGraph` 的智能开发编排系统，采用**三层分形放射状 (3-Tier Fractal Radial)** 星射线架构，解决以下核心痛点：
+**Harness Agent** 是一个基于 `claude-agent-sdk` 的智能开发编排系统，采用**L0 极薄 Router** 星射线架构，解决以下核心痛点：
 
 | # | 痛点 | 星射线解决方案 | 目标阶段 |
 |---|------|---------------|---------|
-| 1 | 上下文爆炸 | 单向瀑布流 + 反向摘要 + SDK 原生压缩 | Phase 2 |
-| 2 | 状态管理混乱 | LangGraph Checkpointer + SDK session 续接 | Phase 2 |
-| 3 | 能力浪费 | 脑手解耦：主脑规划 + 子Agent执行 | Phase 2 |
-| 4 | 缺少代码审查 | Hooks（PreToolUse）自动拦截 | Phase 3 |
-| 5 | 经验无法沉淀 | 挂起机制 + .skills 知识库 | Phase 4 |
+| 1 | 单领域 vs 多领域需求缺乏路由 | L0 Router：一次 LLM 调用判定，Fast Lane 自执行 / Full 模式派发 claude code 子进程 | Phase 2 |
+| 2 | 跨领域并行执行工作区污染 | git worktree 物理隔离，每个领域独立工作区 | Phase 2 |
+| 3 | 多领域并发编排与收口 | asyncio.gather 并行拉起 CLI 子进程，merge 回主分支 | Phase 2 |
+| 4 | 状态管理混乱 | SDK session 续接 + 极简元信息（不维护状态机） | Phase 2 |
+| 5 | 缺少代码审查 | Hooks（PreToolUse）自动拦截 | Phase 3 |
+| 6 | 上下文爆炸 / 跨域记忆 | GCH 全局上下文中枢（星型记忆拓扑） | Phase 3+ |
+| 7 | 经验无法沉淀 | 挂起机制 + .skills 知识库 | Phase 4 |
 
 ---
 
@@ -30,18 +38,18 @@
 │                                                                             │
 │  Phase 1 ✅         Phase 2 🎯          Phase 3           Phase 4          │
 │  ─────────         ─────────           ─────────         ─────────         │
-│  单 Agent MVP      星射线编排           Hooks + 沙箱      经验沉淀           │
-│                    (三层分形架构)        代码质量保障      (.skills)          │
+│  单 Agent MVP      L0 Router            Hooks + 沙箱      经验沉淀          │
+│                    (Fast Lane + Full)    代码质量保障      (.skills)         │
 │                                                                             │
 │  ▼                 ▼                    ▼                ▼                  │
 │                                                                             │
-│  SDK 连通          👑 Architect         PreToolUse Hook   SkillsAgent       │
-│  LangGraph 直线    🛡️ Main Agents       代码审查拦截      错误捕获 → 生成     │
-│  CLI 流式渲染      ⚔️ Sub Agents        Sandbox 沙箱      .md 文件           │
-│  Chat REPL         动态衍生(子图嵌套)    MCP Tools         知识库检索         │
-│  TUI 全屏界面      记忆瀑布流(双向连线)  自动验证          注入 Agent         │
-│                    SDK session 续接                                          │
-│                    依赖 DAG + 快车道                                          │
+│  SDK 连通          👑 L0 Router         PreToolUse Hook   SkillsAgent       │
+│  流式渲染          LLM 路由判定         代码审查拦截      错误捕获 → 生成     │
+│  CLI 流式渲染      Fast Lane 自执行      Sandbox 沙箱      .md 文件           │
+│  Chat REPL         Full 模式 CLI 子进程  GCH 上下文中枢    知识库检索         │
+│  TUI 全屏界面      git worktree 隔离     自建 L1/L2        注入 Agent        │
+│                    动态权限硬约束         分层验收器                          │
+│                    merge 收口                                                │
 │                                                                             │
 │  Phase 5 (前端)    Phase 6 (优化)                                            │
 │  ─────────────    ─────────────                                              │
@@ -60,7 +68,6 @@
 | 功能模块 | 状态 | 说明 |
 |---------|------|------|
 | **SDK 连通** | ✅ | `claude-agent-sdk` 集成完成，支持 `query()` 和 `ClaudeSDKClient` |
-| **LangGraph 编排** | ✅ | 极简直线图 `START → default_agent → END` |
 | **CLI 单次执行** | ✅ | `harness run "任务"` 支持流式渲染 |
 | **Chat REPL** | ✅ | `harness chat` 多轮对话，支持历史会话恢复 |
 | **TUI 全屏界面** | ✅ | 基于 `prompt_toolkit` 的全屏终端应用 |
@@ -72,16 +79,19 @@
 
 ### 3.2 关键现状约束（Phase 2 设计的事实前提）
 
-> ⚠️ 来自 `base_agent.py` 的现状，直接决定 Phase 2 哪些机制可行：
+> ⚠️ 来自 Phase 1 代码的现状，直接决定 Phase 2 哪些机制可行：
 
-1. **真正的对话历史在 SDK 内部，不在 LangGraph 的 `state["messages"]`。**
-   现有 `BaseAgent.__call__` 只从 state 取 `task` / `project_dir`，调用 `query()`；SDK 自己跑 ReAct 循环，`state["messages"]` 仅用于**归档最终结果**，不会回喂给模型。
-   → **推论**：任何"压缩 `state["messages"]`"的机制对真实 token 占用无效。压缩/续命必须作用于 **SDK 真实 session**。
+1. **真正的对话历史在 SDK 内部。** SDK 自己跑 ReAct 循环，外部无法直接操作其上下文。
+   → **推论**：压缩/续命必须作用于 **SDK 真实 session**。
 
-2. **流式渲染走 `adispatch_custom_event`（`on_custom_event`），不是 LangChain model 事件。**
-   → **推论**：Phase 2 不能监听 `on_chat_model_stream` / `on_tool_start`，必须沿用 custom event。
+2. **流式渲染走 `adispatch_custom_event`**，不是 LangChain model 事件。
+   → **推论**：Phase 2 沿用 custom event。
 
 3. **`query()` 是一次性调用**，无跨调用记忆；持久会话需改用 `ClaudeSDKClient` 或 `resume`/`session_id`。
+
+4. **Phase 1 的 ChatSession（纯 SDK，不经过 LangGraph）是实际跑多轮对话的路径**，证明了纯 SDK 路线完全可行。
+
+5. **路由判定必须走独立 stateless `query()`，不进常驻 session 历史。** 避免路由 JSON 污染后续 Fast Lane 执行流、避免 text 重复进入 session（详见 [`架构师 agent.md §3`](./架构师%20agent.md)）。
 
 ### 3.3 SDK 原生能力盘点（v0.2.93，必须优先复用）
 
@@ -89,1034 +99,650 @@
 
 | 能力 | SDK 入口 | 在星射线中的用途 |
 |------|---------|-----------------|
-| **原生 Subagent** | `ClaudeAgentOptions.agents: dict[str, AgentDefinition]` | 主智能体把领域子任务委托给 SDK 内置 subagent，免去自建执行循环 |
-| **Session 续接** | `resume` / `session_id` / `continue_conversation` | 子Agent"温启动"的真正实现：恢复 SDK 侧真实对话历史 |
-| **Session Fork** | `fork_session` / `ForkSessionResult` | 从某个检查点分叉出并行尝试，互不污染 |
-| **上下文用量** | `ContextUsageResponse` / `ContextUsageCategory` | 用 SDK 真实 token 计数驱动压缩决策，替代手动 `count_tokens` |
-| **原生压缩** | `PreCompactHookInput` / `fold_session_summary` | 在 SDK 即将压缩时介入，注入"核心经验记忆" |
-| **预算控制** | `task_budget` / `max_budget_usd` / `TaskBudget` | 子Agent成本硬上限，超额即停 |
-| **文件检查点** | `enable_file_checkpointing` | 子Agent改文件可回滚，为 Phase 3 验收/打回铺路 |
-| **Session Store** | `session_store` / `SessionStore` | 子Agent会话持久化与列举（挂起池的存储底座） |
-| **Subagent 钩子** | `SubagentStartHookInput` / `SubagentStopHookInput` | 监听 subagent 生命周期，发射事件给 renderer |
+| **独立 stateless query** | `query(prompt, options)` | 路由判定调用（不进常驻 session），Full 模式暂不直接使用（派发 CLI 子进程） |
+| **Session 续接** | `resume` / `session_id` / `continue_conversation` | L0 Router 常驻 session 续接对话历史 |
+| **上下文用量** | `ContextUsageResponse` / `ContextUsageCategory` | 用 SDK 真实 token 计数，Phase 3+ 驱动压缩决策 |
+| **原生压缩** | `PreCompactHookInput` / `fold_session_summary` | Phase 3+ 在 SDK 即将压缩时介入 |
+| **预算控制** | `task_budget` / `max_budget_usd` / `TaskBudget` | Fast Lane 执行成本上限（Phase 2 P2 可选） |
+| **动态权限** | `can_use_tool` 回调 → `PermissionResult` | **Phase 2 P0**：按 lane 拦截业务写（Fast 放行 / Full 拒绝），硬约束核心机制 |
+| **Session Store** | `session_store` / `SessionStore` | Phase 3+ 挂起池的存储底座 |
+| **原生 Subagent** | `ClaudeAgentOptions.agents: dict[str, AgentDefinition]` | Phase 3+ 自建 L1/L2 时复用 |
+| **文件检查点** | `enable_file_checkpointing` | Phase 3+ |
+| **Session Fork** | `fork_session` / `ForkSessionResult` | Phase 3+ |
+| **Subagent 钩子** | `SubagentStartHookInput` / `SubagentStopHookInput` | Phase 3+ |
 
-**设计原则更新**：星射线的"三层"是**编排语义层**（谁规划、谁执行、谁验收），而**执行与上下文管理尽量下沉到 SDK 原生能力**。LangGraph 负责"图拓扑 + 路由 + 跨 agent 状态聚合"，SDK 负责"单个 agent 的 ReAct 循环 + 会话 + 压缩"。两层职责不重叠。
-
+**设计原则**：Phase 2 L0 Router 聚焦核心路由与执行派发——充分利用 `query()`（独立 stateless 调用）和 `can_use_tool`（动态权限硬约束）。SDK 的 Subagent/续接/压缩等能力将在 Phase 3+ 自建 L1/L2 层级时发挥完整作用。
 
 ---
 
-## 4. Phase 2 目标：星射线编排系统
+## 4. Phase 2 目标：L0 Router 编排系统
 
-### 4.1 核心架构：三层分形放射状拓扑（子图嵌套版）
-
-> **v3.0 关键修正**：LangGraph **一张图只有一个 state schema**。三层不同 State 不能塞进同一张扁平图。正确落地是 **subgraph 嵌套**——这恰恰是"分形"的本义：
+### 4.1 核心架构：L0 极薄 Router + Fast Lane / Full 模式
 
 ```
-主图 (ArchitectGraph, state=OrchestratorState)
-│
-├── node: architect            # L0 规划 + 拆解 + 依赖DAG
-├── node: main_agent_subgraph  # ← 这是一张【编译好的子图】，作为单个节点
-│       │
-│       内部子图 (MainAgentGraph, state=MainAgentState)
-│       ├── node: design            # 领域架构设计
-│       ├── node: schedule          # 子任务排期 + 生成执行提示词
-│       ├── node: sub_agent_subgraph # ← 又是一张子图（再分形）
-│       │       │
-│       │       内部子图 (SubAgentGraph, state=SubAgentState)
-│       │       ├── node: execute   # 调用 SDK 执行（编码/测试）
-│       │       ├── node: verify    # 确定性检查 + 可选LLM评审
-│       │       └── node: summarize # 生成精炼摘要（反向瀑布流起点）
-│       │
-│       └── node: aggregate         # 聚合子Agent摘要 → 上报
-│
-└── node: finalize             # L0 收口：汇总所有领域 → 给用户统一答复
+CLI 会话开始
+  │
+  ▼
+L0Router 初始化（常驻 session，全工具集 + can_use_tool 硬约束）
+  │
+  ▼ 用户输入到达
+  │
+  _route(text)  ← 一次 LLM 调用，output_format 判定
+  │
+  ├── lane == "fast"（单领域）
+  │     │
+  │     ├→ _current_lane = "fast"
+  │     ├→ 当前 session 直接执行（带写权限）
+  │     └→ 流式返回，改完即止
+  │
+  └── lane == "full"（多领域）
+        │
+        ├→ _current_lane = "full"   ← 硬约束生效：L0 调业务写工具会被拒
+        ├→ 每个 task → git worktree add
+        ├→ asyncio.gather(claude -p 子进程 × N)   ← 各 worktree 为 cwd
+        │     └─ claude code 内部自管 subagent，L0 不干预
+        ├→ 各 worktree merge 回主分支
+        └→ 收口汇总给用户
 ```
 
-```
-                              ┌──────────────────────────────────────┐
-                              │           👑 核心节点                  │
-                              │      Architect Agent (入口架构师 L0)   │
-                              │  • 单一入口，接收用户宏观需求            │
-                              │  • 全局项目目录视野                     │
-                              │  • 任务拆解 + 依赖 DAG 构建             │
-                              │  • 复杂度判定（快车道 / 全编排）         │
-                              │  • 为主智能体编写专属提示词              │
-                              │  • ❌ 绝对不写代码，不调用底层API        │
-                              └───────────────────┬──────────────────┘
-                          按依赖DAG拓扑分批 Send (非无脑全并行)
-                              ┌───────────────────┼───────────────────┐
-                              ▼                   ▼                   ▼
-              ┌─────────────────────┐ ┌─────────────────────┐ ┌─────────────────────┐
-              │  🛡️ 主智能体子图 A   │ │  🛡️ 主智能体子图 B   │ │  🛡️ 主智能体子图 C   │
-              │  domain=frontend    │ │  domain=backend     │ │  domain=database    │
-              │  (同一参数化类)      │ │  (同一参数化类)      │ │  (同一参数化类)      │
-              │  • 领域架构/契约     │ │  • 领域架构/契约     │ │  • 领域架构/契约     │
-              │  • 子Agent工厂       │ │  • 子Agent工厂       │ │  • 子Agent工厂       │
-              │  • 验收(确定性优先)  │ │  • 验收(确定性优先)  │ │  • 验收(确定性优先)  │
-              │  • ❌ 不写代码       │ │  • ❌ 不写代码       │ │  • ❌ 不写代码       │
-              └──────────┬──────────┘ └──────────┬──────────┘ └──────────┬──────────┘
-                         │ Send(按子任务并行)     │                       │
-              ┌──────────┼──────────┐ ┌──────────┼──────────┐ ┌──────────┼──────────┐
-              ▼          ▼          ▼ ▼          ▼          ▼ ▼          ▼          ▼
-         ┌────────┐ ┌────────┐ ┌────────┐ ...（⚔️ Sub/Test Agent：SDK 执行单元）
-         │⚔️ Sub  │ │⚔️ Sub  │ │⚔️ Test │
-         │ execute│ │ execute│ │ verify │
-         └───┬────┘ └───┬────┘ └───┬────┘
-             │ 精炼摘要(reducer 聚合，非覆盖)
-             ▼
-   aggregate(L1) ──上报──> finalize(L0) ──> 统一答复给用户
-```
+> ⚠ 路由判定(`_route`)异常时降级 Fast Lane(见 `架构师 agent.md §5`),不阻断用户；worktree 分支名带 uuid 短 id,防同领域重复执行冲突。
 
-### 4.2 三层节点职责
+### 4.2 组件职责
 
-| 层级 | 节点类型 | 生命周期 | 核心职责 | 限制 |
-|-----|---------|---------|---------|------|
-| **L0** | 👑 Architect | 贯穿整个会话 | 入口路由、任务拆解、**依赖 DAG 构建**、**复杂度判定（快车道/全编排）**、全局视野维护、为主智能体写专属提示词、**收口汇总给用户** | ❌ 不写代码，不调用底层API |
-| **L1** | 🛡️ Main Agent（参数化，按 `domain` 实例化） | 随 Session 存在 | 领域架构设计、接口契约、子任务排期、子Agent工厂、写执行提示词、**验收（确定性检查优先 + LLM 评审兜底）**、聚合上报 | ❌ 不写代码，不改文件 |
-| **L2** | ⚔️ Sub/Test Agent（SDK 执行单元） | 动态衍生，完成后挂起，超预算/超阈值销毁 | 编码、文件读写、测试验证、生成精炼摘要 | ✅ 纯执行，无规划权 |
+| 组件 | 职责 | 限制 |
+|-----|------|------|
+| **L0 Router** (`core/architect.py`) | 路由判定（一次 LLM 调用判定单/多领域）、Fast Lane 自执行（带写权限）、Full 模式派发 claude code CLI 子进程、worktree 管理、merge 收口 | Full 模式下禁业务写入（`can_use_tool` 硬约束）；放行 Bash（git 运维必需） |
+| **claude code CLI**（Full 模式） | 每个领域一个独立子进程，在各自 git worktree 下执行。内部自管 subagent 机制 | L0 不干预其执行细节，只下发 prompt + 收结果 |
+| **常驻 session**（L0） | 与 CLI 会话同生命周期，持有 `ClaudeSDKClient`。Fast Lane 的执行历史自然沉淀于此 | 路由判定走独立 stateless `query()`，不污染 session 历史 |
 
-> **v3.0 修正**：删除 `frontend_main.py / backend_main.py / database_main.py` 三个硬编码文件。`MainAgent` 是 `domain` 参数化的**单一类**，领域通过**配置注册表**（`domains.yaml` 或 dict）声明。新增领域 = 加一行配置，**编排层代码零修改**——这才兑现"极致简洁"的卖点。
+### 4.3 核心机制
 
-### 4.3 核心机制（修正版）
-
-#### 4.3.1 动态衍生与依赖感知路由（Dynamic Spawning + DAG）
-
-> **v3.0 修正三处**：① 路由函数**直接返回 `list[Send]`**，不经 `state["sends"]` 中转；② `add_conditional_edges` 用 Send 时**不需要 mapping dict**；③ 按**依赖 DAG 拓扑分批**发射，而非无脑全并行（前端依赖后端契约、后端依赖DB schema）。
+#### 4.3.1 路由判定：独立 stateless LLM 调用
 
 ```python
-from langgraph.types import Send
-
-def route_to_main_agents(state: OrchestratorState) -> list[Send]:
-    """L0 → L1 路由：按依赖 DAG 的当前可执行批次发射。
-
-    只发射"依赖已满足"的领域任务；下游领域等上游契约就绪后，
-    在后续 super-step 由 aggregate 回流再次触发。
-    """
-    ready = state["dag"].ready_batch(done=state["completed_domains"])
-    return [
-        Send("main_agent_subgraph", {
-            "agent_id": f"main_{t.domain}_{t.id[:8]}",
-            "domain": t.domain,
-            "global_snapshot": state["global_snapshot"],   # 只读快照
-            "task": t,
-            "main_prompt": state["main_agent_prompts"][t.domain],
-        })
-        for t in ready
-    ]
-
-# 注意：节点函数本身只返回 state 增量；Send 由这个独立路由函数产出
-graph.add_conditional_edges("architect", route_to_main_agents)
+ROUTER_DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "lane": {"type": "string", "enum": ["fast", "full"]},
+        "reason": {"type": "string"},
+        "tasks": {
+            "type": "array",
+            "items": {"type": "object", "properties": {
+                "domain": {"type": "string"},
+                "prompt": {"type": "string"},
+                "intended_files": {"type": "array", "items": {"type": "string"}},
+            }, "required": ["domain", "prompt"]},
+        },
+    },
+    "required": ["lane", "reason", "tasks"],
+}
 ```
 
-> **复杂度快车道**：`architect` 先判定复杂度。单领域小改动 → 直接退化为 Phase 1 单 Agent（`Send("fast_lane", ...)`），跳过三层开销。只有跨领域/大型需求才走完整编排。
+路由判定用 `output_format` 输出结构化 `{lane, reason, tasks[]}`，**不进常驻 session 历史**——避免路由 JSON 污染后续执行流、避免 text 重复出现。详见 [`架构师 agent.md §3`](./架构师%20agent.md)。
 
-#### 4.3.2 并行写 State 必须有 Reducer（关键修正）
+#### 4.3.2 Fast Lane：L0 当前 session 直执行
 
-> **v3.0 必修**：多个 `main_agent` / `sub_agent` 在同一 super-step 并行写同一字段（如 `execution_summaries`、`completed_domains`），若 channel 无 reducer，LangGraph 抛 `InvalidUpdateError` 或互相覆盖。**所有被并行写入的字段都要声明 reducer**。
+单领域需求：L0 在常驻 session 直接执行，全工具已开（写权限放行）。text **首次**进入常驻 session，无重复、无路由 JSON 残留。自然完成对话。
+
+#### 4.3.3 Full 模式：claude code CLI 子进程 + worktree
+
+多领域需求：
+1. 拆出各领域独立 prompt（自包含：需求 + 边界 + 验收）
+2. 每个领域创建独立 git worktree（分支名 `l0-{domain}-{uuid6}` 防冲突）
+3. `asyncio.gather` 并发拉起 `claude -p` 子进程，各自 worktree 为 cwd
+4. 子进程内部用 claude code 的 subagent 机制，L0 不干预
+5. 各 worktree merge 回主分支，冲突标记需人工介入
+6. 清理 worktree（无论成功/异常均清理防残留）
+
+#### 4.3.4 动态权限硬约束（can_use_tool）
+
+L0 session 配全工具集，但 `can_use_tool` 准入回调按当前 lane 拒绝越界工具：
 
 ```python
-import operator
-from typing import Annotated, TypedDict
+BUSINESS_WRITE_TOOLS = {"Write", "Edit", "NotebookEdit"}
 
-class OrchestratorState(TypedDict):
-    user_request: str
-    project_dir: str
-    global_snapshot: GlobalSnapshot
-
-    dag: TaskDAG
-    decomposed_tasks: list[TaskSpec]
-    main_agent_prompts: dict[str, str]
-
-    # ↓↓↓ 并行写入字段：必须带 reducer ↓↓↓
-    domain_reports: Annotated[list[DomainReport], operator.add]   # L1 聚合回流
-    completed_domains: Annotated[list[str], operator.add]
-    routing_history: Annotated[list[RoutingRecord], operator.add]
-
-    final_answer: str   # 由 finalize 单点写，无需 reducer
+async def _lane_guard(self, input, ctx) -> PermissionResult:
+    """fast 全放行；full/None 禁业务写，放行 Bash（git 运维必需）"""
+    if self._current_lane != "fast" and input.tool_name in BUSINESS_WRITE_TOOLS:
+        return PermissionResult(behavior="deny", message="...")
+    return PermissionResult(behavior="allow")
 ```
 
-#### 4.3.3 记忆瀑布流：向下只读快照 + 向上摘要（双向都要连进图）
+**状态残留兜底**：入口 `handle_user_input` 将 `_current_lane` 重置为 `None`；回调对 `None` 按最严（等同 full）处理。
 
-> **v3.0 修正**：原计划 `report_to_architect` 是孤儿方法，图里没有反向连线。新增 `aggregate`（L1 收口）与 `finalize`（L0 收口）节点，把反向瀑布流真正连成边。
+#### 4.3.5 路由降级
 
-```
-① 向下（派发只读快照）       ② 向上（精炼摘要回流，reducer 聚合）
-Architect ──global_snapshot──▶ Main      Sub ──summary──▶ aggregate(L1)
-Main      ──domain_snapshot──▶ Sub       aggregate ──domain_report──▶ finalize(L0)
-                                          finalize ──final_answer──▶ 用户
-```
-
-- **向下**：`GlobalSnapshot` / `DomainSnapshot` 是**不可变 dataclass**（`frozen=True`），子层只读，无权改主脑记忆。
-- **向上**：子Agent**只回传摘要**（改了哪些文件、新增哪些接口、关键决策），冗长执行日志在 SDK session 内自生自灭，不进主脑 state。
-
-#### 4.3.4 子Agent"温启动"——基于 SDK 真实 Session（重定义）
-
-> **v3.0 重定义**：原计划"温启动携带鉴权逻辑记忆"在 `query()` 模型下**做不到**（query 一次性、无记忆）。真正可行的是借助 SDK 的 **session 续接**。
-
-```python
-from dataclasses import dataclass
-from claude_agent_sdk import ClaudeAgentOptions, TaskBudget, ResultMessage, query
-
-@dataclass
-class RunResult:
-    session_id: str | None
-    last_user_msg_id: str | None      # OPT-3：rewind_files 锚点
-    total_cost_usd: float             # OPT-4：真实成本
-
-class SubAgentRunner:
-    """子Agent执行器：维持真实可续接的 session。L2 是唯一可写层。"""
-
-    def _opts(self, snapshot, task, resume: str | None = None) -> ClaudeAgentOptions:
-        return ClaudeAgentOptions(
-            system_prompt=None if resume else build_sub_prompt(snapshot, task),
-            resume=resume,                                  # 温启动时恢复历史
-            cwd=snapshot.project_dir,
-            allowed_tools=SUB_AGENT_TOOLS,                  # OPT-1：唯一有写权
-            permission_mode="acceptEdits",
-            task_budget=TaskBudget(total=task.budget_tokens),  # OPT-4：预算硬上限
-            max_budget_usd=task.budget_usd,                 # OPT-4：美元上限
-            enable_file_checkpointing=True,                 # OPT-3：可回滚
-            session_store=self.store,                       # 持久化，供挂起
-        )
-
-    async def cold_start(self, task: TaskSpec, snapshot: DomainSnapshot) -> RunResult:
-        return await self._run(self._opts(snapshot, task), task.description)
-
-    async def warm_start(self, session_id: str, new_task: TaskSpec,
-                         snapshot: DomainSnapshot) -> RunResult:
-        """温启动 = resume SDK 真实会话，模型真正'记得'上次写的代码"""
-        return await self._run(self._opts(snapshot, new_task, resume=session_id),
-                              new_task.description)
-
-    async def _run(self, opts, prompt) -> RunResult:
-        sid = last_uid = None; cost = 0.0
-        async for msg in query(prompt=prompt, options=opts):
-            sid = capture_session_id(msg) or sid
-            last_uid = capture_user_msg_id(msg) or last_uid
-            if isinstance(msg, ResultMessage):
-                cost = msg.total_cost_usd or 0.0            # OPT-4：真实成本
-            # 内部 adispatch_custom_event 发射事件（略）
-        return RunResult(sid, last_uid, cost)
-```
-
-> **挂起池**不再用 LangGraph Checkpointer 当 KV 存任意对象（那是误用，Checkpointer 按 thread 存整图快照）。改用 SDK `session_store` + 一张轻量 SQLite 表记录 `{sub_agent_id → session_id, domain, status, last_active}`。
-
-#### 4.3.5 上下文压缩——SDK 原生自动压缩为主，编排层兜底（重定义 v4.0）
-
-> **v3.0 重定义 + v4.0 修正**：压缩 `state["messages"]` 无效（它不回喂模型）。改用 SDK 真实用量 + 原生压缩钩子。
-> **v4.0 修正两处 API 误用**：① `get_context_usage()` 是 **`ClaudeSDKClient` 的实例方法**，不是自由函数——要监控用量必须持有**长连接 client**（`query()` 一次性调用拿不到）；② `ContextUsageResponse` 的字段是 **`percentage` / `totalTokens` / `maxTokens`**，没有 `.ratio`。
-> **关键认知**：SDK **本身已内置自动压缩**（`ContextUsageResponse.isAutoCompactEnabled` + `autoCompactThreshold`）。所以编排层不必重造压缩，主策略是"**信任 SDK 自动压缩 + PreCompact 钩子注入领域记忆防丢**"，KILL 重建仅作为**最后兜底**。
-
-```python
-# 方案 A（首选）：信任 SDK 自动压缩；用 PreCompact 钩子在压缩前注入"核心经验"，防止关键领域上下文被压没
-async def on_pre_compact(inp: PreCompactHookInput, tool_use_id, ctx: HookContext):
-    # inp["trigger"] == "auto" | "manual"；inp["custom_instructions"] 可携带压缩指令
-    # 可在此把领域契约/关键决策作为 custom_instructions 注入，引导压缩保留要点
-    return {"hookSpecificOutput": {"hookEventName": "PreCompact",
-                                   "additionalContext": domain_memory_digest()}}
-
-options = ClaudeAgentOptions(hooks={"PreCompact": [HookMatcher(hooks=[on_pre_compact])]})
-
-# 方案 B（编排层兜底，仅 L2 用 ClaudeSDKClient 长连接时可用）：真实用量驱动 KILL 重建
-async def assess(client: ClaudeSDKClient) -> str:
-    usage = await client.get_context_usage()       # 实例方法
-    if usage["percentage"] > 90 and not usage["isAutoCompactEnabled"]:
-        return "kill_and_respawn"                   # 摘要交接 → 新 session 冷启动
-    return "continue"
-```
-
-> 文档措辞同步修正："**零幻觉**" → "**降低幻觉**"；废弃"60% 阈值压缩"提法，改为"**SDK 原生自动压缩 + PreCompact 注入领域记忆；编排层仅在禁用自动压缩或 `percentage` 逼近上限时 KILL 重建兜底**"。
-
-#### 4.3.6 验收：确定性信号优先，LLM 评审兜底
-
-> **v3.0 修正**：原计划验收全靠 LLM 读 diff 打勾，幻觉风险高、成本高。改为分层验收，并为 Phase 3 Hooks 预留接口。
-
-```
-子Agent 完成 ──▶ ① 确定性检查（机器可判定，零LLM成本）
-                    • 测试命令是否通过（pytest / npm test）
-                    • lint / 类型检查（ruff / mypy / tsc）
-                    • 契约 schema 校验（接口定义比对）
-                  ├─ 全绿 ──▶ 直接通过，不调 LLM
-                  └─ 有红/无法机器判定 ──▶ ② LLM 评审（兜底）
-                                            按 acceptance_criteria 评审 diff
-```
-
-#### 4.3.7 测试回环的重试上限（防 recursion_limit 撞墙）
-
-> **v3.0 必修**：`verify --fail--> execute` 无上限会顶到 LangGraph `recursion_limit` 抛错。
-
-```python
-class SubAgentState(TypedDict):
-    ...
-    retry_count: int      # 每次打回 +1
-
-def route_after_verify(state: SubAgentState) -> str:
-    if state["verify_passed"]:
-        return "summarize"
-    if state["retry_count"] >= 3:
-        return "escalate"   # 升级给 L1 主智能体：换方案 / 重设计 / 上报人类
-    return "execute"        # 打回重写
-```
+路由判定使用独立 `query()` 顶层 API（不经过 BaseAgentSession），异常（schema 不符/网络/解析失败）默认降级 Fast Lane 执行，不阻断用户。Fast 是安全兜底；确为多领域时用户重新发送即可重新判定。不搞交互式选择菜单。
 
 ### 4.4 Phase 2 不做的事（明确排除）
 
 | 排除项 | 原因 |
 |-------|------|
-| ❌ Hooks 代码审查拦截（PreToolUse 完整审查） | Phase 3（但 OPT-6 的 `can_use_tool` 危险护栏 Phase 2 先上） |
-| ❌ Sandbox 沙箱隔离 | Phase 3（SDK 已有 `sandbox` 字段，届时启用） |
+| ❌ 自建 L1（Main Agent）和 L2（Sub Agent）层 | Full 模式直接交给 claude code 的 subagent 机制，不自建。移至 Phase 3+ |
+| ❌ GCH 全局上下文中枢（SQLite 存储 + MCP 工具表面） | Phase 2 先跑通 Router 骨架；单领域需求不需要。移至 Phase 3 |
+| ❌ 分层验收器（确定性检查 + LLM 兜底） | 子进程内部自验证。移至 Phase 3+ |
+| ❌ 依赖 DAG 调度 / TaskScheduler | Full 模式各领域 worktree 物理隔离，无跨需求依赖。Phase 3+ 需要时再加 |
+| ❌ 挂起池 / 温启动（SDK session 管理） | 先冷启动跑通。移至 Phase 3 |
+| ❌ Hooks 代码审查拦截 | Phase 3 |
+| ❌ Sandbox 沙箱隔离 | Phase 3 |
 | ❌ Skills 经验沉淀 | Phase 4 |
 | ❌ Web/Flutter 前端 | Phase 5 |
-| ❌ 主Agent写代码 | 违反"脑手解耦"——由 OPT-1 `allowed_tools` 工具层硬约束 |
-| ❌ 静态领域硬编码文件 | 改为参数化 + 配置注册表 |
-| ❌ 自建 subagent 执行循环 | 复用 SDK 原生 `agents` / `query`（见 OPT-5 路线决策） |
-| ❌ 压缩 LangGraph `state["messages"]` | 无效（不回喂模型），改用 SDK 原生自动压缩 + 用量监控 |
-| ❌ 手动 `count_tokens` 估算窗口 | 不准，改用 `get_context_usage().percentage` |
+| ❌ 脑手解耦完整形态（L0 只读） | Fast Lane 要 L0 自执行，必须带写权限。Phase 3 Full 模式可收紧 |
+| ❌ GlobalDAG / 跨需求依赖合并 | Fast 同步执行、Full 各领域独立 worktree，无跨需求依赖 |
+| ❌ 长轮询 / _completed_queue | Full 用 `asyncio.gather` 同步等子进程完成，不需要 |
+| ❌ 同域收敛 / merge 冲突自动解决 | worktree 物理隔离已足够。冲突标记需人工介入 |
+| ❌ 上下文压缩 / 用量监控兜底 | Fast Lane 短任务暂不触发。Phase 3+ 观察后再加 |
+| ❌ 手动 `count_tokens` 估算窗口 | 不准，改用 SDK `get_context_usage()`（Phase 3+ 观察后再加） |
 
-### 4.5 优先级排期表（含 v4.0 OPT 项）
-
-> **v3.0 新增 / v4.0 扩充**：把基建难点与 §4.6 的 OPT 项统一排进 P0/P1/P2，确保主干 L0→L1→L2→收口 先跑通，SDK 增量优化按收益插入。
+### 4.5 优先级排期表
 
 | 机制 | 优先级 | 来源 | 说明 |
 |------|-------|------|------|
-| L0→L1→L2 主干 + 收口 + 流式 | **P0 必做** | v3.0 | 没有它整个架构不成立 |
-| 依赖 DAG 分批路由 | **P0 必做** | v3.0 | 否则下游基于不存在的契约编码 |
-| reducer 并行聚合 | **P0 必做** | v3.0 | 否则并行即崩 |
-| **`allowed_tools` 硬约束脑手解耦** | **P0 必做** | OPT-1 | 改一行配置即生效，收益极高、成本极低，应随主干一起做 |
-| **`output_format` 结构化输出** | **P0 必做** | OPT-2 | 消除拆解/验收解析的高频 bug，Step 2 直接用 |
-| **thread_id / session_id 概念厘清** | **P0 必做** | OPT-7 | 不厘清挂起池与会话恢复会写错，属设计前提 |
-| 重试上限 + 复杂度快车道 | **P1 重要** | v3.0 | 健壮性与成本 |
-| 确定性验收 | **P1 重要** | v3.0 | 降幻觉、降成本 |
-| **L2 双路线决策（A 包 B）** | **P1 重要** | OPT-5 | 决定 Step 4 实现形态，需在编码前定调 |
-| **预算纳入 TaskSpec + 成本观测** | **P1 重要** | OPT-4 | `task_budget` + `total_cost_usd`，防失控、可观测 |
-| 挂起/温启动（session 续接） | **P2 可后置** | v3.0 | 先冷启动跑通，再加续命 |
-| SDK 原生自动压缩 + 用量监控兜底 | **P2 可后置** | v3.0/§4.3.5 | 短任务暂不触发 |
-| **`rewind_files`/`fork_session` 干净重试** | **P2 可后置** | OPT-3 | 依赖 `enable_file_checkpointing`，重试质量优化 |
-| **`can_use_tool` 危险护栏** | **P2 可后置** | OPT-6 | 预演 Phase 3，主干稳定后再加 |
-| **Architect 1M 上下文 beta** | **P3 按需** | OPT-8 | 仅大仓库且成本可接受时开 |
+| **L0 Router 核心骨架**（路由判定 + Fast Lane + Full 模式） | **P0 必做** | 架构师.md | 没有它整个架构不成立 |
+| **LLM 路由判定 + `output_format`** | **P0 必做** | 架构师.md §3 | 一次调用输出 `{lane, reason, tasks[]}`，免文本解析 |
+| **动态权限硬约束（`can_use_tool`）** | **P0 必做** | 架构师.md §4 | Full 模式禁业务写，Fast 放行；None 按最严兜底 |
+| **Fast Lane 当前 session 直执行** | **P0 必做** | 架构师.md §5 | 复用常驻 session，全工具放行 |
+| **Full 模式 CLI 子进程并发（`asyncio.gather`）** | **P0 必做** | 架构师.md §6 | 多领域场景的并发执行 |
+| **git worktree 隔离** | **P0 必做** | 架构师.md §6.3 | 子进程之间互不污染 |
+| **worktree merge 收口 + 清理** | **P0 必做** | 架构师.md §6.3 | 成功/异常均清理防残留 |
+| **路由降级（异常→Fast Lane）** | **P0 必做** | 架构师.md §5/决策10 | 路由判定失败不阻断用户 |
+| **worktree 分支名唯一标识** | **P0 必做** | 架构师.md §6.1/决策11 | `l0-{domain}-{uuid6}` 防同领域重复执行冲突 |
+| **Bash 逃逸路径风险接受** | **P1 认知** | 架构师.md §4.2 | worktree 隔离兜底 Phase 2 接受；Phase 3 加 Bash 前缀白名单 |
+| **Fast Lane 执行预算控制** | **P2 可后置** | — | `task_budget`/`max_budget_usd` 防失控 |
+| **上下文压缩 / PreCompact** | **Phase 3+** | 后置 | Fast Lane 短任务暂不触发 |
+| **GCH 全局上下文中枢** | **Phase 3+** | 后置 | 出现真实跨域契约协调需求再加 |
+| **自建 L1/L2 / 分层验收 / 依赖 DAG** | **Phase 3+** | 后置 | 三层分形架构的完整主体 |
+| **挂起池 / 温启动** | **Phase 3+** | 后置 | 需要跨会话记忆续接时再加 |
+| **merge 冲突自动解决** | **Phase 3+** | 后置 | worktree merge 频繁冲突时再加 |
+| **1M 上下文 beta** | **Phase 3+** | 后置 | 仅大仓库且成本可接受时开 |
 
-> **排期解读**：OPT-1/2/7 提到 **P0**——它们不是"锦上添花"，而是改动极小却直接决定正确性/健壮性的设计前提，应与主干同批落地。OPT-4/5 提到 **P1**，因为会影响 Step 4 的实现形态。OPT-3/6/8 仍可后置。
-
-### 4.6 第二轮审视：基于 SDK 真实能力的增量优化（v4.0 新增）
-
-> 这一轮在 v3.0 架构基础上，挖掘 SDK 既有能力能让计划"更省、更稳、更准"的地方。每条都标注**收益**与**落地 API**。
-
-#### OPT-1 用 `allowed_tools` 在工具层"硬"约束脑手解耦（强烈建议）
-
-> v3.0 靠 system_prompt 写"❌ 不写代码"来约束 L0/L1，这是**软约束**，模型仍可能违规。
-> **优化**：L0/L1 的 `allowed_tools` 只给**只读工具**（`Read`/`Glob`/`Grep`），物理上拿不到 `Write`/`Edit`/`Bash`；写工具只发给 L2。约束从"提示词层"提升到"能力层"，无法被绕过。
-
-```python
-ARCHITECT_TOOLS = ["Read", "Glob", "Grep"]              # L0：只读全局
-MAIN_AGENT_TOOLS = ["Read", "Glob", "Grep"]             # L1：只读领域
-SUB_AGENT_TOOLS  = ["Read", "Write", "Edit", "Bash"]    # L2：唯一有写权
-```
-
-**收益**：脑手解耦从"君子协定"变"制度保证"，验收项 #2 可机器验证。
-
-#### OPT-2 用 `output_format` + `structured_output` 替代文本解析（强烈建议）
-
-> v3.0 的 `_plan()` 让模型输出 JSON 再 `parse_plan()` 手解析，脆弱（模型可能夹带 markdown 围栏/解释）。
-> **优化**：设 `options.output_format` 声明 schema，结果直接落在 `ResultMessage.structured_output`，免解析、强类型。
-
-```python
-options = ClaudeAgentOptions(output_format={"type": "json_schema", "schema": ARCHITECT_PLAN_SCHEMA})
-# 消费：
-async for msg in query(prompt=..., options=options):
-    if isinstance(msg, ResultMessage) and msg.structured_output:
-        plan = msg.structured_output      # 已是结构化 dict，无需 parse
-```
-
-**收益**：消除 Architect 拆解 / 验收结果解析的一类高频 bug，适用于所有"要结构化结果"的节点。
-
-#### OPT-3 验收失败重试前，用 `rewind_files()` / `fork_session()` 清理污染（建议）
-
-> v3.0 的 `route_after_verify` 失败直接回 `execute`，但**失败的半成品代码和被污染的 session 历史还在**，重试是在脏地基上继续。
-> **优化**：失败回退时，先 `client.rewind_files(user_message_id)` 把文件回滚到本次尝试前（需 `enable_file_checkpointing=True`），或用 `fork_session(up_to_message_id=...)` 从干净检查点分叉重来。
-
-**收益**：重试基于干净状态，显著提升 3 次内修复成功率；避免错误代码层层叠加。
-
-#### OPT-4 预算纳入 TaskSpec，超额走 escalate（建议）
-
-> v3.0 提了 `task_budget` 但没和"重试/升级"联动。
-> **优化**：把 `max_budget_usd` / `TaskBudget(total=...)` 写进每个子任务，SDK 超预算自动停；编排层从 `ResultMessage.total_cost_usd` 读真实花费，累计进领域报告。预算耗尽视同一次失败，计入 `retry_count`，触发 escalate。
-
-**收益**：成本可控且可观测，反向瀑布流报告里能给用户真实 `$` 花费。
-
-#### OPT-5 L2 执行单元的两种实现路线——需明确决策（重要）
-
-> v3.0 把 L2 实现为"LangGraph 子图节点里调 `query()`"。但 SDK 还有**原生 `agents` 子 agent**路线。两者是真实的架构取舍，必须明确选一条：
-
-| 路线 | 做法 | 优点 | 缺点 |
-|------|------|------|------|
-| **A. LangGraph 子图 + `query()`**（v3.0 现选） | execute/verify/retry 都是 LangGraph 节点 | 编排层**完全掌控**重试/验收/分支；事件流统一 | 自己管 session/并发 |
-| **B. SDK 原生 `agents`** | L1 把任务委托给 `AgentDefinition`，CLI 调度 | 上下文**天然隔离**；`SubagentStart/Stop` 钩子；省去自管 | 重试/验收逻辑被关进 CLI，LangGraph 失去细粒度控制 |
-
-> **建议**：**主干用 A**（保留 LangGraph 对 verify→retry→escalate 闭环的控制，这是星射线的核心价值）；但 **L2 内部的"一次执行"可设 `agents` 让 CLI 自行拆解微任务**，即"A 包 B"。同时无论哪条，都注册 `SubagentStart/SubagentStop` 钩子发射层级事件给 renderer。
-
-#### OPT-6 `can_use_tool` 回调：Phase 2 就能加的轻量准入（可选，提前预演 Phase 3）
-
-> Phase 3 才做 PreToolUse 代码审查，但 SDK 的 `can_use_tool` 回调是**编程式**的、零成本，Phase 2 可先用它做一道**危险操作护栏**（如拦截 `rm -rf` / 写出领域目录外的路径），为 Phase 3 平滑铺路。
-
-```python
-async def guard(tool_name, tool_input, ctx) -> PermissionResult:
-    if tool_name == "Bash" and is_destructive(tool_input.get("command","")):
-        return {"behavior": "deny", "message": "危险命令被护栏拦截", "interrupt": False}
-    if tool_name in ("Write","Edit") and escapes_domain(tool_input, ctx):
-        return {"behavior": "deny", "message": "越界写入被拦截", "interrupt": False}
-    return {"behavior": "allow", "updated_input": None, "updated_permissions": None}
-```
-
-#### OPT-7 两套"会话/线程"概念必须分清（修正歧义）
-
-> 文档里 `thread_id`（LangGraph 图检查点）和 SDK `session_id`（CLI 侧对话）混用易致 bug：
-> - **LangGraph `thread_id`**：整图状态的检查点键，`harness chat --resume` 恢复**编排进度**用这个。
-> - **SDK `session_id`**：单个 L2 子 agent 的 CLI 会话，温启动续命用这个。
-> 一个 `harness chat` 会话 = 1 个 LangGraph `thread_id` + N 个 SDK `session_id`（每个挂起子 agent 一个）。挂起池表里两者都要存。
-
-#### OPT-8 Architect 全局视野可选开 1M 上下文（可选）
-
-> L0 需要"全局项目目录视野"，大仓库快照可能很大。`betas=["context-1m-2025-08-07"]` 可让 Architect 用 1M 窗口，减少为压缩而做的激进裁剪。仅 L0 按需开启（成本更高），L2 执行单元无需。
-
-### 4.7 机制 → SDK API 映射对照表（v4.0 新增）
+### 4.6 机制 → SDK API 映射对照表
 
 | 星射线机制 | 落地 SDK 能力 | 具体 API / 字段 | 对应 Step |
 |-----------|--------------|----------------|----------|
-| L0/L1 脑手解耦（硬约束） | 工具白名单 | `allowed_tools`（只读集） | Step 2/3 |
-| L0 任务拆解（免解析） | 结构化输出 | `output_format` → `ResultMessage.structured_output` | Step 2 |
-| L0 全局视野 | 长上下文 beta | `betas=["context-1m-2025-08-07"]` | Step 2 |
-| L1 委派 L2 | 原生子 agent（可选 B 路线） | `agents={...: AgentDefinition}` | Step 3/4 |
-| L2 一次性执行 | 无状态调用 | `query(prompt, options)` | Step 4 |
-| L2 温启动续命 | 会话续接 | `resume` / `ClaudeSDKClient` / `continue_conversation` | Step 5 |
-| L2 干净重试 | 文件回滚 / 会话分叉 | `enable_file_checkpointing`+`rewind_files()` / `fork_session()` | Step 4 |
-| 成本硬上限 + 观测 | 预算 | `max_budget_usd` / `task_budget` / `ResultMessage.total_cost_usd` | Step 4 |
-| 上下文管理 | 原生自动压缩 + 钩子 | `isAutoCompactEnabled` / `PreCompact` hook | Step 6 |
-| 用量监控（兜底） | 上下文用量 | `ClaudeSDKClient.get_context_usage()`→`percentage` | Step 6 |
-| 挂起池存储 | 会话存储 + 管理 | `session_store` / `list_sessions` / `tag_session` | Step 5 |
-| 子 agent 生命周期事件 | 子 agent 钩子 | `SubagentStart` / `SubagentStop` hook | Step 4/9 |
-| 危险操作护栏（预演 P3） | 工具准入回调 | `can_use_tool` → `PermissionResult` | Step 4 |
-| 自定义领域工具 | 进程内 MCP | `@tool` / `create_sdk_mcp_server` | 按需 |
-| 流式渲染 | 内容块 → 自定义事件 | `AssistantMessage.content` blocks + `adispatch_custom_event` | Step 9 |
-| 会话恢复（编排进度） | LangGraph 检查点 | `thread_id` + `AsyncSqliteSaver` | Step 8/9 |
+| 路由判定（独立 stateless） | 独立 `query()` + `output_format`（不经过 BaseAgentSession） | `output_format` → `ResultMessage.structured_output` | Step 2 |
+| Fast Lane 自执行 | 常驻 `ClaudeSDKClient.query()` | `ClaudeSDKClient` + `allowed_tools` 全开 | Step 3 |
+| Full 模式派发 | `asyncio.create_subprocess_exec` | `claude -p ...` CLI 调用 | Step 4 |
+| 动态权限硬约束 | 工具准入回调 | `can_use_tool` → `PermissionResult` | Step 2 |
+| 流式渲染 | 内容块 → 自定义事件 | `AssistantMessage.content` blocks + `adispatch_custom_event` | Step 6 |
 | 异常兜底 | SDK 异常 | `CLINotFoundError` / `CLIConnectionError` 等 | 全局 |
-
-> 详细 API 语义见 `.claude/CLAUDE.md`（SDK v0.2.93 能力速查）。
 
 ---
 
 ## 5. Phase 2 详细计划
 
-### 5.1 模块变更清单（修正版）
+> **关键变更**：Phase 2 实施范围从「三层分形架构全栈」缩减为 **「L0 极薄 Router」**。以下模块**不再属于 Phase 2**，已移至后置清单：
+> - ~~`core/main_agent.py`~~、~~`core/sub_agent.py`~~（不自建 L1/L2，Full 模式用 claude code CLI）
+> - ~~`core/gch/`~~、~~`core/verify.py`~~、~~`core/pool.py`~~、~~`core/guard.py`~~、~~`core/domains.yaml`~~、~~`core/schemas.py`~~（Phase 3+）
+> - ~~`core/dag.py`~~ / ~~`TaskScheduler`~~（Full 模式无跨需求依赖）
+>
+> Phase 2 模块清单见下。
 
-| 模块 | 变更类型 | 说明 |
-|------|---------|------|
-| `core/state.py` | **重构** | 三层 State（带 reducer）：`OrchestratorState` / `MainAgentState` / `SubAgentState`；快照 dataclass `frozen=True` |
-| `core/dag.py` | **新增** | `TaskDAG`：依赖图，`ready_batch()` 返回可执行批次 |
-| `core/architect.py` | **新增** | L0：拆解 + DAG + 复杂度判定 + 收口 |
-| `core/main_agent.py` | **新增** | L1：**单一参数化类**（按 `domain` 实例化），构建为子图 |
-| `core/sub_agent.py` | **新增** | L2：`SubAgentRunner`（cold/warm start，SDK session） |
-| `core/domains.yaml` | **新增** | 领域注册表（替代三个硬编码文件）：每领域含 `tools`（OPT-1 工具集）、确定性验收命令（如 `pytest`/`tsc`）、默认预算 |
-| `core/pool.py` | **新增** | 挂起池：`{sub_agent_id → session_id}` + SDK `session_store`；区分 thread_id/session_id（OPT-7） |
-| `core/context/snapshot.py` | **新增** | `GlobalSnapshot` / `DomainSnapshot`（frozen dataclass） |
-| `core/context/summary.py` | **新增** | 反向摘要提炼器 |
-| `core/verify.py` | **新增** | 分层验收：确定性检查 + LLM 兜底 |
-| `core/schemas.py` | **新增** | `output_format` 结构化输出 schema（OPT-2）：`ARCHITECT_PLAN_SCHEMA` 等 |
-| `core/guard.py` | **新增（P2）** | `can_use_tool` 危险操作护栏（OPT-6，预演 Phase 3） |
-| `core/orchestrator.py` | **重构** | 子图嵌套：主图 + MainAgent 子图 + SubAgent 子图 |
-| `chat/repl.py` | **修改** | ChatCLI 入口不变，底层切星射线；保留 `--continue/--resume` 映射到 thread_id |
-| `chat/session.py` | **保留过渡** | 不立即退役；快车道仍复用其单 Agent 路径，待主干稳定再评估 |
+### 5.1 模块变更清单
+
+> **修正**：基于 ADR-13（抽公共底座 + 双会话组合）更新模块清单，明确每个文件的改造量级。经代码审计发现 `chat/session.py` 需要大改而非微调，新增 `core/base_session.py` 底座文件。
+
+| 文件路径 | 变更类型 | 改造量 | 说明 |
+|---------|---------|:-----:|------|
+| `core/base_session.py` | **新增** | 中 | **公共会话底座** — 从 `ChatSession` 抽离纯会话管理能力：SDK client 生命周期、自动重试/stderr 监控、取消信号处理、`can_use_tool` 权限回调挂载、session_store 持久化与续接。不含路由/命令/渲染逻辑。L0Router 内部常驻执行会话 + 路由临时会话均基于此接口 |
+| `core/architect.py` | **新增** | 全新 | **L0 Router** — 路由判定（独立 `query()` + `output_format`，不经过 BaseAgentSession）+ Fast Lane 自执行 + Full 模式派发 + worktree 管理和收口。核心逻辑约 260 行。持有常驻 `BaseAgentSession`（Fast Lane 积累对话历史）；路由临时会话用独立 `query()` 顶层 API，用完即弃 |
+| `core/worktree.py` | **新增** | 小 | git worktree 工具函数：`create_worktree()`、`merge_worktree()`、`remove_worktree()`。分支名 `l0-{domain}-{uuid6}` 防冲突 |
+| `core/utils.py` | **新增** | 小 | 辅助函数：`_build_message()` — 统一封装消息格式对接 REPL 渲染事件，全项目复用 |
+| `core/cli_utils.py` | **新增** | 小 | CLI 子进程工具函数：`_extract_result_text()`、`_extract_usage()` — 从 claude code headless 输出解析结果，与 Step 0 Spike 输出严格对齐，配套单测 |
+| `chat/session.py` | **大改（瘦身）** | **大** | 继承 `BaseAgentSession`，仅保留 REPL 命令处理、渲染事件派发、斜杠命令逻辑。**Fast Lane 不复用完整 ChatSession**，L0Router 直接操作底座实例 |
+| `chat/repl.py` | **中改（入口切换）** | 中 | 增加模式开关（单 Agent / L0 Router），默认走 L0 模式。斜杠命令 `/fast`、`/full` 强制指定车道跳过自动判定；`/clear` 清空常驻会话历史；`/undo` 仅 Fast Lane 生效 |
+| `core/__init__.py` | **修改** | 小 | 导出 `L0Router`、`BaseAgentSession` |
+| `pyproject.toml` | **修改** | 小 | 移除 `langgraph` 和 `langchain-core` 依赖（如未移除）；`uuid` 为 Python 标准库无需额外依赖 |
+| `core/orchestrator.py` | **保留（无关联）** | 0 | Phase 1 遗留，`L0Router` 不经过，单 Agent 模式下仍可使用。Phase 2 结束后评估是否删除 |
+| `core/state.py` | **已废弃，待删除** | 0 | Phase 2 收尾时清理。Phase 1 状态机逻辑已下线，仅留 docstring |
+| ~~`core/main_agent.py`~~ | **后置 Phase 3+** | — | 不自建 L1 |
+| ~~`core/sub_agent.py`~~ | **后置 Phase 3+** | — | 不自建 L2 |
+| ~~`core/gch/`~~ | **后置 Phase 3+** | — | GCH 全局上下文中枢 |
+| ~~`core/verify.py`~~ | **后置 Phase 3+** | — | 分层验收器 |
+| ~~`core/pool.py`~~ | **后置 Phase 3+** | — | 挂起池 |
+| ~~`core/guard.py`~~ | **后置 Phase 3+** | — | 危险工具护栏 |
+| ~~`core/domains.yaml`~~ | **后置 Phase 3+** | — | 领域注册表（Router 的 `tasks` 从 LLM 输出动态获得） |
+| ~~`core/schemas.py`~~ | **后置 Phase 3+** | — | 结构化 schema（纳入 `architect.py` 或后置） |
+| ~~`core/dag.py`~~ | **后置 Phase 3+** | — | 依赖 DAG（无需跨需求依赖） |
+
+#### 5.1.1 辅助函数归属
+
+| 函数 | 文件 | 用途 |
+|------|------|------|
+| `_build_message()` | `core/utils.py` | 统一封装消息格式，对接 REPL 渲染事件，全项目复用 |
+| `_extract_result_text()` / `_extract_usage()` / `_extract_cost()` | `core/cli_utils.py` | 从 claude code headless 输出解析结果文本 + token 用量 + 费用，与 Step 0 Spike 输出严格对齐，配套单测 |
+
+#### 5.1.2 Session 持久化规则
+
+| 会话类型 | 持久化策略 | 会话恢复支持 |
+|---------|-----------|------------|
+| **常驻执行会话**（Fast Lane） | 复用底座 `session_store` 能力，支持 `/continue` 续接 | ✅ 与单 Agent 体验一致 |
+| **路由临时会话**（`_route()`） | 不持久化，用完即弃 | ❌ 无状态，每次新建 |
+| **Full 模式子进程**（`_spawn_cli()`） | 一次性执行，不持久会话 | ❌ 执行完回收资源 |
+
+#### 5.1.3 斜杠命令兼容性表
+
+| 命令 | 兼容性 | 处理规则 |
+|------|-------|---------|
+| `/undo` | **仅 Fast Lane 生效** | Full 模式下禁用，提示「多领域模式不支持 undo，请人工处理」 |
+| `/clear` | 全模式生效 | 清空常驻执行会话历史，重置 `_current_lane` 为 `None` |
+| `/context` | 全模式生效 | 展示常驻会话的上下文用量 |
+| `/fast` | **新增** | 强制当前输入走 Fast Lane，绕过自动判定 |
+| `/full` | **新增** | 强制当前输入走 Full 模式，绕过自动判定 |
+| `/help`、`/exit`、`/stats`、`/model` | 全模式生效 | 行为不变 |
+
+> **P0: SLASH_PRE_INTERCEPT** — 所有 `/` 开头的命令在 `handle_user_input` 入口处前置拦截（`text.startswith('/')` 检查），不经过 `_route()` LLM 路由判定。
+> 原因：斜杠命令语义与领域路由无关，走路由判定是无效的 LLM token 消耗。前置拦截直接委托常驻 session 处理，零开销。|
+
+#### 5.1.4 `spawn_claude_code` 工具取舍
+
+**结论：Phase 2 直接移除，不加入工具集。**
+
+理由：Full 模式直接通过 `asyncio.create_subprocess_exec` 拉起 CLI 子进程，不走 SDK 的 `spawn_claude_code` 工具。后者是会话内派生，和我们「worktree 物理隔离、进程级隔离」的设计目标不符，可控性更差。Phase 3 如需会话内轻量派生再加回来。
+
+#### 5.1.5 测试方案修正
+
+| 测试项 | 修正后方案 | 备注 |
+|-------|----------|------|
+| Full 模式子进程 | Mock `asyncio.create_subprocess_exec`，模拟不同返回码和输出 | 不依赖真实 claude 命令，单测可稳定复现 |
+| worktree 隔离 | 用临时目录初始化空 git 仓库，跑完整创建-合并-清理流程 | CI 配置 git user 信息即可，无权限问题 |
+| 动态权限硬约束 | 先通过 Spike 核实 SDK 回调签名，再用 Mock SDK 验证回调逻辑 | 不依赖真实模型调用 |
+| CLI 子进程契约 | 加一个标记为 `@pytest.mark.skip_ci` 的集成测试，本地手动验证 | CI 不执行，避免依赖外部环境 |
 
 ### 5.2 任务分解
 
-#### Step 1: 定义三层 State + 快照 + DAG（~3h）
+> 执行顺序调整。新增 **Step 0 CLI Spike** 消灭 Full 模式最大不确定性；**Step 1 抽 BaseAgentSession 底座**最大化复用现有代码。所有 Step 的代码示例与 [`docs/架构师 agent.md`](./架构师%20agent.md) 不一致时以架构师 agent.md 为准。
+
+#### Step 0: Claude CLI 契约 Spike（~0.5 天）
+
+> **前置必做**。在写 `_spawn_cli` 之前先消灭最大不确定性。验证项全部有结论再写业务代码。
+
+| 验证项 | 验证目的 | 输出标准 |
+|-------|---------|---------|
+| **命令行参数名核实** | 确认 flag 真实名称 | 明确 `-p`/`--prompt`、`--allowed-tools`/`--allowedTools`、`--output-format`、`--cwd` 的正确写法 |
+| **stream-json 输出结构** | 确定结果解析逻辑 | 抓取完整输出样例，定位最终结果文本、token 用量、退出状态的字段路径 |
+| **退出码规则** | 异常判断依据 | 正常完成 = 0，错误 = 非 0，确认超时/中断场景的退出码 |
+| **cwd 下配置加载行为** | 确认隔离有效性 | 子进程是否会读取 worktree 下的 `.claude/` 配置？是否会继承全局配置？会不会污染主项目 |
+| **工具限制生效性** | 确认权限围栏有效 | `--allowed-tools` 是否真的能禁用 Write/Bash 等工具 |
+
+**Spike 输出物：**
+- 文档附录新增「Claude Code CLI Headless 契约表」，标注版本号
+- 确定 `_extract_result_text()`、`_extract_usage()` 的实现逻辑（写入 `core/cli_utils.py`）
+- 输出可直接运行的最小验证命令，后续集成测试复用
+
+#### Step 1: 抽 BaseAgentSession 底座 + 改造 ChatSession（~1 天）
+
+> **重要**：这是 ADR-13（抽底座 C 方案）的落地。从 `chat/session.py` 的 570 行代码中抽离纯会话管理能力，L0Router 组合两类会话实例。
 
 ```python
-import operator
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Annotated, TypedDict
-from langchain_core.messages import BaseMessage, add_messages
+# core/base_session.py — 公共会话底座
 
-# ── 只读快照：frozen，子层无权改主脑记忆 ──
-@dataclass(frozen=True)
-class GlobalSnapshot:
-    project_dir: str
-    project_structure: dict
-    tech_stack: tuple[str, ...]        # tuple 而非 list，强化不可变
+class BaseAgentSession:
+    """纯执行底座，不涉及路由/命令/渲染逻辑。
 
-@dataclass(frozen=True)
-class DomainSnapshot:
-    domain: str
-    project_dir: str
-    architecture_design: str
-    interface_contracts: tuple[Contract, ...]
-
-# ── L0 ──
-class OrchestratorState(TypedDict):
-    user_request: str
-    project_dir: str
-    global_snapshot: GlobalSnapshot
-    dag: TaskDAG
-    decomposed_tasks: list[TaskSpec]
-    main_agent_prompts: dict[str, str]
-    complexity: str                                  # fast_lane | full
-    # 并行写：带 reducer
-    domain_reports: Annotated[list[DomainReport], operator.add]
-    completed_domains: Annotated[list[str], operator.add]
-    routing_history: Annotated[list[RoutingRecord], operator.add]
-    final_answer: str                                # finalize 单点写
-
-# ── L1 ──
-class MainAgentState(TypedDict):
-    agent_id: str
-    domain: str
-    global_snapshot: GlobalSnapshot                  # 继承只读
-    main_prompt: str
-    architecture_design: str
-    interface_contracts: list[Contract]
-    scheduled_tasks: list[TaskSpec]
-    sub_agent_prompts: dict[str, str]
-    acceptance_criteria: str
-    # 并行写：带 reducer
-    sub_summaries: Annotated[list[str], operator.add]
-    completed_tasks: Annotated[list[TaskRecord], operator.add]
-
-# ── L2 ──
-class SubAgentState(TypedDict):
-    agent_id: str
-    parent_main_agent: str
-    agent_type: str                                  # coding | test
-    domain_snapshot: DomainSnapshot                  # 继承只读
-    current_task: TaskSpec
-    sub_prompt: str
-    session_id: str | None                           # SDK 真实会话，用于温启动
-    last_msg_id: str | None                          # OPT-3：rewind_files 回滚锚点
-    cost_usd: Annotated[float, operator.add]         # OPT-4：真实成本累计（重试也累加）
-    messages: Annotated[list[BaseMessage], add_messages]  # 仅归档
-    verify_passed: bool
-    retry_count: int                                 # 防回环
-    status: str                                      # active|suspended|completed|killed|escalated
-    created_at: datetime
-    last_active_at: datetime
-```
-
-#### Step 2: 入口架构师 + 复杂度判定 + DAG（~5h）
-
-> **v3.0 优化**：拆解与"生成 main_agent prompt"**合并为一次结构化输出**（一个 JSON 同时给任务、领域、依赖、边界、验收），把 L0 的 LLM 往返从 `1 + N` 压到 `1`。
-> **v4.0 增强（OPT-1/OPT-2）**：① L0 用**只读 `allowed_tools`**（`Read`/`Glob`/`Grep`），工具层物理保证"不写代码"；② 用 **`output_format` + `ResultMessage.structured_output`** 拿结构化结果，**废弃脆弱的文本 `parse_plan()`**。
-
-```python
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
-
-ARCHITECT_TOOLS = ["Read", "Glob", "Grep"]          # OPT-1：L0 只读，拿不到 Write/Edit/Bash
-
-# OPT-2：声明结构化输出 schema，免解析
-ARCHITECT_PLAN_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "complexity": {"enum": ["fast_lane", "full"]},
-        "tasks": {"type": "array", "items": {"type": "object", "properties": {
-            "id": {"type": "string"}, "domain": {"type": "string"},
-            "description": {"type": "string"}, "priority": {"type": "integer"},
-            "depends_on": {"type": "array", "items": {"type": "string"}}}}},
-        "prompts": {"type": "object"},               # {domain: "含①需求②边界③验收的Markdown"}
-    },
-    "required": ["complexity", "tasks", "prompts"],
-}
-
-
-class ArchitectAgent:
-    """L0 入口架构师。❌ 不写代码——由 ARCHITECT_TOOLS 只读集硬约束。"""
-
-    def __init__(self, model: str | None = None):
-        self.model = model
-        self.scanner = GlobalVisionScanner()
-
-    async def __call__(self, state: OrchestratorState) -> dict:
-        """注意：只返回 state 增量（dict）。Send 由独立路由函数产出。"""
-        if not state.get("global_snapshot"):
-            structure = await self.scanner.scan(state["project_dir"])
-            tech = await self.scanner.detect_tech_stack()
-            snapshot = GlobalSnapshot(state["project_dir"], structure, tuple(tech))
-        else:
-            snapshot = state["global_snapshot"]
-
-        # 一次结构化调用：拆解 + 依赖 + 每领域提示词（含边界/验收）
-        plan = await self._plan(state["user_request"], snapshot)
-
-        return {
-            "global_snapshot": snapshot,
-            "decomposed_tasks": plan["tasks"],
-            "dag": TaskDAG.from_tasks(plan["tasks"]),  # 依赖图
-            "main_agent_prompts": plan["prompts"],     # {domain: prompt}
-            "complexity": plan["complexity"],          # fast_lane | full
-        }
-
-    async def _plan(self, user_request, snapshot) -> dict:
-        """OPT-1+OPT-2：只读工具 + 结构化输出，返回已校验的 dict（无需手解析）"""
-        opts = ClaudeAgentOptions(
-            allowed_tools=ARCHITECT_TOOLS,             # 只读，物理禁止写代码
-            cwd=snapshot.project_dir,
-            model=self.model,
-            max_turns=1,
-            output_format={"type": "json_schema", "schema": ARCHITECT_PLAN_SCHEMA},
-        )
-        prompt = f"""分析需求并按 schema 输出任务分解：
-## 需求
-{user_request}
-## 项目结构
-{format_structure(snapshot.project_structure)}
-## 技术栈
-{snapshot.tech_stack}
-
-要求：
-- complexity: "fast_lane"(单领域小改) | "full"(跨领域/大型)
-- tasks: 每项含 id/domain/description/priority/depends_on
-- prompts: {{domain: "含①任务需求 ②边界要求 ③验收标准 的Markdown"}}"""
-        async for msg in query(prompt=prompt, options=opts):
-            if isinstance(msg, ResultMessage) and msg.structured_output:
-                return msg.structured_output           # 已是结构化 dict
-        raise RuntimeError("Architect 未返回结构化结果")
-
-    async def finalize(self, state: OrchestratorState) -> dict:
-        """收口节点：汇总所有 domain_reports → 给用户统一答复（同样只读）"""
-        opts = ClaudeAgentOptions(allowed_tools=ARCHITECT_TOOLS, model=self.model, max_turns=1)
-        answer_parts = []
-        async for msg in query(prompt=f"""将各领域完成情况汇总为给用户的最终答复：
-{format_reports(state["domain_reports"])}
-输出：总体完成情况 + 各领域要点 + 遗留事项 + 累计成本""", options=opts):
-            answer_parts.append(extract_text(msg))
-        return {"final_answer": "".join(answer_parts)}
-
-
-# ── 路由函数：直接返回 list[Send]，按 DAG 分批；支持快车道 ──
-def route_from_architect(state: OrchestratorState):
-    if state["complexity"] == "fast_lane":
-        return Send("fast_lane", {"task": state["decomposed_tasks"][0],
-                                  "snapshot": state["global_snapshot"]})
-    ready = state["dag"].ready_batch(done=state["completed_domains"])
-    if not ready:
-        return "finalize"          # 全部领域完成 → 收口
-    return [Send("main_agent_subgraph", {
-        "agent_id": f"main_{t.domain}_{t.id[:8]}",
-        "domain": t.domain,
-        "global_snapshot": state["global_snapshot"],
-        "main_prompt": state["main_agent_prompts"][t.domain],
-        "scheduled_tasks": [t],
-    }) for t in ready]
-```
-
-#### Step 3: 主智能体子图（参数化，~7h）
-
-> **v3.0 优化**：① 单一参数化类，领域来自配置；② 构建为**独立编译子图**作为主图节点；③ 验收走 `core/verify.py` 分层逻辑。
-> **v4.0 增强（OPT-1）**：L1 同样用**只读 `allowed_tools`**，工具层保证"不写代码不改文件"；`design`/`_gen_sub_prompts` 用一次性 `query()`（无需长连接 client）。
-
-```python
-from claude_agent_sdk import ClaudeAgentOptions, query
-
-MAIN_AGENT_TOOLS = ["Read", "Glob", "Grep"]         # OPT-1：L1 只读领域，无写权
-
-class MainAgent:
-    """L1 领域主理人。❌ 不写代码——由 MAIN_AGENT_TOOLS 只读集硬约束。按 domain 参数化。"""
-
-    def __init__(self, domain: str, model: str | None = None):
-        self.domain = domain
-        self.model = model
-
-    def _ro_opts(self, cwd: str) -> ClaudeAgentOptions:
-        return ClaudeAgentOptions(allowed_tools=MAIN_AGENT_TOOLS, cwd=cwd,
-                                  model=self.model, max_turns=1)
-
-    async def design(self, state: MainAgentState) -> dict:
-        if state.get("architecture_design"):
-            return {}
-        parts = []
-        async for msg in query(prompt=f"""你是{self.domain}领域架构师。
-## 全局信息
-{state['global_snapshot']}
-## 任务
-{format_tasks(state['scheduled_tasks'])}
-只输出设计文档（模块划分/接口契约/数据流/选型），不要写代码。""",
-                               options=self._ro_opts(state['global_snapshot'].project_dir)):
-            parts.append(extract_text(msg))
-        return {"architecture_design": "".join(parts)}
-
-    async def schedule(self, state: MainAgentState) -> dict:
-        """排期 + 一次性为所有子任务生成执行提示词"""
-        prompts = await self._gen_sub_prompts(state)   # 合并为一次调用
-        return {"sub_agent_prompts": prompts}
-
-    async def aggregate(self, state: MainAgentState) -> dict:
-        """L1 收口：聚合子Agent摘要 → 生成领域报告（反向瀑布流）"""
-        report = DomainReport(domain=self.domain,
-                              summaries=state["sub_summaries"],
-                              completed=len(state["completed_tasks"]))
-        return {"domain_reports": [report],            # reducer 聚合回 L0
-                "completed_domains": [self.domain]}
-
-
-def route_to_sub_agents(state: MainAgentState):
-    """L1 → L2：按子任务并行 Send"""
-    return [Send("sub_agent_subgraph", {
-        "agent_id": f"sub_{state['domain']}_{t.id[:8]}",
-        "parent_main_agent": state["agent_id"],
-        "agent_type": "coding",
-        "domain_snapshot": _domain_snapshot(state),
-        "current_task": t,
-        "sub_prompt": state["sub_agent_prompts"][t.id],
-        "retry_count": 0,
-    }) for t in state["scheduled_tasks"]]
-
-
-def build_main_agent_subgraph(domain: str, client) -> CompiledGraph:
-    agent = MainAgent(domain, client)
-    g = StateGraph(MainAgentState)
-    g.add_node("design", agent.design)
-    g.add_node("schedule", agent.schedule)
-    g.add_node("sub_agent_subgraph", build_sub_agent_subgraph(client))  # 嵌套子图
-    g.add_node("aggregate", agent.aggregate)
-    g.set_entry_point("design")
-    g.add_edge("design", "schedule")
-    g.add_conditional_edges("schedule", route_to_sub_agents)
-    g.add_edge("sub_agent_subgraph", "aggregate")
-    g.add_edge("aggregate", END)
-    return g.compile()
-```
-
-#### Step 4: 子智能体子图（SDK 执行 + 验收 + 摘要，~5h）
-
-> **v3.0 修正**：① 节点是普通 async 函数返回 state 增量（不要用 generator yield，事件靠 `adispatch_custom_event` 发）；② 流式沿用 **custom event**；③ 验收分层；④ 重试上限。
-> **v4.0 增强**：① **L2 是唯一持有写工具的层**（OPT-1）；② 失败重试前 **`rewind_files()` 回滚污染**（OPT-3）；③ 子任务带**预算**，从 `ResultMessage.total_cost_usd` 累计真实成本（OPT-4）。
-
-```python
-SUB_AGENT_TOOLS = ["Read", "Write", "Edit", "Bash"]   # OPT-1：唯一有写权的层
-
-class SubAgentNodes:
-    """L2 执行单元。✅ 纯执行（唯一可写）。"""
-
-    def __init__(self, client: ClaudeSDKClient):
-        self.client = client                    # 长连接，供 rewind_files/get_context_usage
-        self.runner = SubAgentRunner(client)
-        self.verifier = LayeredVerifier()       # core/verify.py
-
-    async def execute(self, state: SubAgentState) -> dict:
-        # OPT-3：若是重试（retry_count>0），先回滚上次失败留下的文件污染
-        if state["retry_count"] > 0 and state.get("last_msg_id"):
-            await self.client.rewind_files(state["last_msg_id"])  # 需 enable_file_checkpointing
-
-        # 冷启动或温启动（session 续接）
-        if state.get("session_id"):
-            result = await self.runner.warm_start(
-                state["session_id"], state["current_task"])
-        else:
-            result = await self.runner.cold_start(
-                state["current_task"], state["domain_snapshot"])
-        # execute 内部已通过 adispatch_custom_event 发射 agent_text/agent_tool 事件
-        return {"session_id": result.session_id, "status": "active",
-                "last_msg_id": result.last_user_msg_id,        # OPT-3：记回滚锚点
-                "cost_usd": result.total_cost_usd}             # OPT-4：真实成本（reducer 累加）
-
-    async def verify(self, state: SubAgentState) -> dict:
-        # 先确定性检查，红了或无法判定再上 LLM
-        result = await self.verifier.run(
-            domain=state["domain_snapshot"].domain,
-            task=state["current_task"],
-            criteria=state["sub_prompt"],
-            project_dir=state["domain_snapshot"].project_dir,
-        )
-        return {"verify_passed": result.passed,
-                "retry_count": state["retry_count"] + (0 if result.passed else 1)}
-
-    async def summarize(self, state: SubAgentState) -> dict:
-        summary = await self._gen_summary(state)   # 修改文件/新增接口/关键决策
-        return {"sub_summaries": [summary],        # reducer 聚合回 L1
-                "completed_tasks": [TaskRecord(...)],
-                "status": "completed"}
-
-    async def escalate(self, state: SubAgentState) -> dict:
-        return {"status": "escalated",
-                "sub_summaries": [f"[升级] {state['current_task'].id} "
-                                  f"重试{state['retry_count']}次未过，需主智能体介入"]}
-
-
-def route_after_verify(state: SubAgentState) -> str:
-    if state["verify_passed"]:
-        return "summarize"
-    if state["retry_count"] >= 3:
-        return "escalate"
-    return "execute"
-
-
-def build_sub_agent_subgraph(client) -> CompiledGraph:
-    nodes = SubAgentNodes(client)
-    g = StateGraph(SubAgentState)
-    g.add_node("execute", nodes.execute)
-    g.add_node("verify", nodes.verify)
-    g.add_node("summarize", nodes.summarize)
-    g.add_node("escalate", nodes.escalate)
-    g.set_entry_point("execute")
-    g.add_edge("execute", "verify")
-    g.add_conditional_edges("verify", route_after_verify)
-    g.add_edge("summarize", END)
-    g.add_edge("escalate", END)
-    return g.compile()
-```
-
-#### Step 5: 挂起池 + SDK Session 续接（~3h，P2 可后置）
-
-```python
-class AgentPool:
-    """挂起池：记录 sub_agent → SDK session_id，挂起/温启动/销毁。
-
-    ⚠️ 不再用 LangGraph Checkpointer 当 KV 存任意对象（误用）。
-    存储底座 = SDK session_store + 轻量 SQLite 索引表。
+    能力清单：
+    - SDK client 生命周期管理 (start/close)
+    - 自动重试、异常兜底、stderr 监控
+    - 取消信号处理、检查点机制
+    - session_store 持久化与续接 (resume/continue)
+    - can_use_tool 权限回调挂载
+    - 上下文用量查询 (get_context_usage)
     """
 
-    def __init__(self, session_store: SessionStore, db_path: str):
-        self.store = session_store
-        self.db = sqlite3.connect(db_path)   # 表: (sub_agent_id, session_id, domain, status, last_active)
+    def __init__(
+        self,
+        project_dir: str,
+        model: str | None = None,
+        system_prompt: str = "",
+        allowed_tools: list[str] | None = None,
+        session_store: SessionStore | None = None,
+        can_use_tool: Callable | None = None,
+        enable_checkpointing: bool = False,
+        max_turns: int | None = None,
+        resume_session_id: str | None = None,
+        continue_conversation: bool = False,
+    ) -> None: ...
 
-    async def suspend(self, sub_agent_id: str, session_id: str, domain: str):
-        # SDK 已持久化会话本体到 session_store；此处只记索引
-        self.db.execute("INSERT OR REPLACE INTO pool VALUES (?,?,?,?,?)",
-                        (sub_agent_id, session_id, domain, "suspended",
-                         datetime.now().isoformat()))
-        self.db.commit()
-
-    async def find_warm_candidate(self, domain: str) -> str | None:
-        row = self.db.execute(
-            "SELECT session_id FROM pool WHERE domain=? AND status='suspended' "
-            "ORDER BY last_active DESC LIMIT 1", (domain,)).fetchone()
-        return row[0] if row else None
-
-    async def kill(self, sub_agent_id: str):
-        row = self.db.execute("SELECT session_id FROM pool WHERE sub_agent_id=?",
-                              (sub_agent_id,)).fetchone()
-        if row:
-            await delete_session_via_store(self.store, row[0])  # SDK 清理会话
-        self.db.execute("DELETE FROM pool WHERE sub_agent_id=?", (sub_agent_id,))
-        self.db.commit()
+    async def start(self) -> None: ...
+    async def close(self) -> None: ...
+    async def send(self, prompt: str) -> AsyncIterator[ChatEvent]: ...
+    async def query(self, prompt: str) -> AsyncIterator[Message]: ...
+    def cancel(self) -> None:
+    async def recover_after_cancel(self) -> None:
+    async def hot_restart(self) -> None:
 ```
 
-#### Step 6: SDK 原生压缩 + PreCompact + 用量监控兜底（~3h，P2 可后置）
+现有 `ChatSession` 瘦身为继承 `BaseAgentSession`，仅保留 REPL 命令处理、渲染事件派发、斜杠命令逻辑，保留给单 Agent 模式使用。
 
-> **v4.0 修正**：`get_context_usage()` 是 `ClaudeSDKClient` **实例方法**（须持长连接）；字段是 `percentage`（百分比，0–100），无 `.ratio`。主策略信任 SDK 自动压缩，KILL 仅兜底。
+#### Step 2: L0 Router 核心 — 路由判定（~1 天）
+
+> **对齐**：`_route()` 改为轻量级 `query()` 顶层 API（不新建 BaseAgentSession）；`handle_user_input` 返回 `AsyncIterator[ChatEvent]` 流。
 
 ```python
-class ContextGuard:
-    """用 SDK 真实用量驱动，而非压缩不回喂的 state['messages']。"""
+# core/architect.py — 路由判定部分 + 底座组合
+#
+# 关键设计：
+# - _route() 使用独立 query() 顶层 API,不经过 BaseAgentSession
+# - 路由判定输出 ROUTER_DECISION_SCHEMA 定义的结构化结果
+# - handle_user_input 返回 ChatEvent 流,而非 Message 列表
+# - Fast Lane 通过 self._session.send(text) 产出 ChatEvent
 
-    async def assess(self, client: ClaudeSDKClient) -> str:
-        usage = await client.get_context_usage()        # 实例方法，须长连接
-        # 信任 SDK 自动压缩；仅当其被禁用且逼近上限时才 KILL 兜底
-        if usage["percentage"] > 90 and not usage["isAutoCompactEnabled"]:
-            return "kill_and_respawn"   # 摘要交接 → 新 session 冷启动
-        return "continue"
+from harness_agent.core.base_session import BaseAgentSession
+from harness_agent.core.cli_utils import _extract_result_text, _extract_usage, _extract_cost
 
-# 原生压缩：注册 PreCompact 钩子，在 SDK 压缩前注入领域记忆，防关键上下文被压没
-async def on_pre_compact(inp: PreCompactHookInput, tool_use_id, ctx: HookContext):
-    # inp["trigger"]: "auto"|"manual"；可借 additionalContext 注入领域契约/关键决策
-    return {"hookSpecificOutput": {"hookEventName": "PreCompact",
-                                   "additionalContext": domain_memory_digest()}}
+ROUTER_DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "lane": {"type": "string", "enum": ["fast", "full"]},
+        "reason": {"type": "string"},
+        "tasks": {
+            "type": "array",
+            "items": {"type": "object", "properties": {
+                "domain": {"type": "string"},
+                "prompt": {"type": "string"},
+                "intended_files": {"type": "array", "items": {"type": "string"}},
+            }, "required": ["domain", "prompt"]},
+        },
+    },
+    "required": ["lane", "reason", "tasks"],
+}
 
-PRECOMPACT_HOOKS = {"PreCompact": [HookMatcher(hooks=[on_pre_compact])]}
+ROUTE_JUDGE_PROMPT = """判断用户需求属于单领域还是多领域执行。
+- 单领域 → lane="fast"
+- 多领域 → lane="full"
+返回 JSON: {"lane": "fast"|"full", "reason": "...", "tasks": [{"domain": "...", "prompt": "..."}]}"""
+
+EXECUTOR_PROMPT = """你是 Harness Agent 的执行者。
+当前处于 {lane} 模式。
+- Fast Lane: 直接在常驻会话中执行
+- Full 模式: …（动态 Prompt 增强）"""
+
+
+class L0Router:
+    """L0 极薄 Router。组合常驻 BaseAgentSession + 独立路由判定。"""
+
+    def __init__(self, project_dir: str, model: str | None = None):
+        self._current_lane: str | None = None
+        self.project_dir = project_dir
+        self.model = model
+        self._total_cost: float = 0.0
+        self._worktree_registry: dict[str, str] = {}
+        self.CLI_TIMEOUT: int = 900  # P0: ASYNCIO_TIMEOUT
+
+        # ── 常驻执行会话（Fast Lane 积累对话历史）──
+        self._session = BaseAgentSession(
+            project_dir=project_dir,
+            model=model,
+            system_prompt=EXECUTOR_PROMPT,
+            allowed_tools=[
+                "Read", "Glob", "Grep",
+                "Write", "Edit", "NotebookEdit",
+                "Bash",
+            ],
+            can_use_tool=self._lane_guard,
+            session_store=create_session_store(),
+        )
+
+    async def start(self) -> None:
+        await self._session.start()
+
+    async def _route(self, text: str) -> dict:
+        """独立 stateless 路由判定 —— 轻量 query() 顶层 API，不新建 BaseAgentSession。"""
+        from claude_agent_sdk import query, ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(
+            system_prompt=ROUTE_JUDGE_PROMPT,
+            allowed_tools=[],  # 路由判定纯 LLM 判定，不需要工具
+            output_format={"type": "json_schema", "schema": ROUTER_DECISION_SCHEMA},
+            model=self.model,
+        )
+        async for msg in query(prompt=text, options=opts):
+            if hasattr(msg, 'structured_output') and msg.structured_output:
+                return msg.structured_output
+        raise RuntimeError("路由判定未返回结构化结果")
+
+    async def handle_user_input(self, text: str) -> AsyncIterator[ChatEvent]:
+        # P0: SLASH_PRE_INTERCEPT — 斜杠命令前置拦截，跳过路由判定
+        #     /clear, /context, /undo, /help 等语义与领域路由无关，
+        #     直接交给常驻 session 处理，避免无效消耗路由 LLM token
+        if text.startswith('/'):
+            self._current_lane = None
+            async for event in self._session.send(text):
+                yield event
+            return
+
+        # 1. 入口重置 lane (防异常残留)
+        self._current_lane = None
+
+        # 2. 路由判定 — 轻量 query(),不进常驻会话
+        try:
+            decision = await self._route(text)
+        except Exception as e:
+            yield ChatEvent("text", "⚠️ 路由判定异常，已降级单领域执行。")
+            self._current_lane = "fast"
+            async for event in self._session.send(text):
+                yield event
+            return
+
+        lane = decision.get("lane", "fast")
+        self._current_lane = lane
+
+        yield ChatEvent("text", f"🔀 路由判定: {lane} ({decision.get('reason', '')})")
+
+        if lane == "fast":
+            # Fast Lane — 常驻会话自执行
+            async for event in self._session.send(text):
+                yield event
+
+            # 累积费用
+            if self._session.last_result and self._session.last_result.total_cost_usd:
+                self._total_cost += self._session.last_result.total_cost_usd
+        else:
+            # Full 模式 — CLI 子进程 + worktree (Step 4 实现)
+            async for event in self._run_full(text, decision):
+                yield event
 ```
 
-#### Step 7: 分层验收器（~3h）
+> **对齐**：
+> 1. `_route()` 用 `claude_agent_sdk.query()` 顶层 API + `output_format`，不再新建 BaseAgentSession
+> 2. `handle_user_input` 返回 `AsyncIterator[ChatEvent]`（而非 `Message`）
+> 3. Fast Lane 通过 `self._session.send(text)` 产出 ChatEvent 流
+> 4. 路由降级路径直接 `self._session.send(text)`，保持 ChatEvent 流一致
+
+#### Step 3: Fast Lane 对接常驻会话 + 动态权限回调（~0.5 天）
+
+因为底座已包含 can_use_tool 挂载能力，Step 3 只需确认 `_lane_guard` 回调正确挂载到常驻会话，Fast Lane 流式链路跑通。预计 0.5 天。
+
+#### Step 4: Full 模式 — CLI 子进程 + worktree 隔离 + merge 收口（~1 天）
+
+移除 `--verbose`（污染 stream-json）；增加 `_extract_cost()` 解析费用；`_spawn_cli()` 明确 `--cwd` 传递方式，不使用 `create_subprocess_exec(cwd=...)`。
 
 ```python
-class LayeredVerifier:
-    """① 确定性检查（零LLM） → ② LLM 评审（兜底）"""
+# core/cli_utils.py — 从 stream-json 输出解析结果
 
-    async def run(self, domain, task, criteria, project_dir) -> VerifyResult:
-        checks = DOMAIN_CHECKS.get(domain, [])      # 来自 domains.yaml
-        deterministic = await self._run_commands(checks, project_dir)
-        if deterministic.all_green:
-            return VerifyResult(passed=True, detail=deterministic.report)
-        # 红了或无确定性检查 → LLM 兜底
-        return await self._llm_review(task, criteria, deterministic.report)
+def _extract_result_text(stdout: str) -> str:
+    """从 claude code stream-json 输出提取最终结果文本。
+    与 Step 0 Spike 输出严格对齐。
+    """
+    ...
 
-    async def _run_commands(self, checks, cwd) -> DeterministicResult:
-        # checks 例: ["pytest -q", "ruff check .", "mypy ."] / ["npm test", "tsc --noEmit"]
-        ...
+def _extract_usage(stdout: str) -> dict | None:
+    """从 stream-json 输出提取 token 用量。
+    返回 {"input": ..., "output": ...} 或 None。
+    """
+    ...
+
+def _extract_cost(stdout: str) -> float | None:
+    """从 stream-json 输出提取费用（USD）。
+    由 ResultMessage.total_cost_usd 字段解析。
+    """
+    ...
 ```
 
-#### Step 8: 构建星射线主图（子图嵌套 + 反向连线，~6h）
+#### Step 5: REPL 集成 + 斜杠命令适配（~0.5 天）
 
-> **v3.0 修正全部图错误**：路由函数直接返回 Send（无 mapping dict、无 `state["sends"]`）；子图作为节点；补 finalize 收口与回流；异步 checkpointer。
+ChatCLI 入口增加模式开关（默认走 L0）。新增 `/fast`/`/full` 命令。`/undo` 仅 Fast Lane 生效。`/clear` 重置 `_current_lane` 为 `None`。
 
-```python
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver   # ← 异步图用 aio 版
+#### Step 6: 测试补全 + 废弃代码清理（~1 天）
 
-async def build_star_ray_graph(client) -> CompiledGraph:
-    g = StateGraph(OrchestratorState)
+全部 P0 项测试策略按 §5.1.5「测试方案修正」执行。mock 策略降低 CI 依赖。清理 `core/state.py` 废弃 docstring。
 
-    architect = ArchitectAgent(client)
-    g.add_node("architect", architect.__call__)
-    g.add_node("finalize", architect.finalize)
+#### 执行顺序依赖图
 
-    # L1 子图作为节点（领域来自配置注册表，动态构建）
-    g.add_node("main_agent_subgraph", build_main_agent_subgraph_dispatcher(client))
-
-    # 快车道：退化为 Phase 1 单 Agent
-    g.add_node("fast_lane", build_fast_lane_node(client))
-
-    g.set_entry_point("architect")
-
-    # L0 → L1（按 DAG 分批）或 → finalize 或 → fast_lane
-    g.add_conditional_edges("architect", route_from_architect)
-
-    # 回流：L1 子图完成 → 回 architect 再判断（DAG 是否还有下一批）
-    g.add_edge("main_agent_subgraph", "architect")
-
-    g.add_edge("fast_lane", END)
-    g.add_edge("finalize", END)
-
-    # 异步持久化（支持会话恢复 / 中断续跑）
-    async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as cp:
-        return g.compile(checkpointer=cp)
+```
+Step 0: CLI Spike (0.5天)
+   ↓
+Step 1: BaseAgentSession 底座 (1天)
+   ↓
+Step 2: L0 Router 骨架 + 路由判定 (1天)
+   ↓
+Step 3: Fast Lane 对接 (0.5天)
+   ↓
+Step 4: Full 模式 CLI 子进程 (1天)
+   ↓
+Step 5: REPL 集成 + 命令 (0.5天)
+   ↓
+Step 6: 测试 + 清理 (1天)
 ```
 
-> **回流环路说明**：`main_agent_subgraph → architect` 形成受控环。`architect` 每轮用 `dag.ready_batch(done=completed_domains)` 判断：还有就绪批次就再 Send 一批；没有就走 `finalize`。`completed_domains` 经 reducer 累加，保证环可收敛。需设 `recursion_limit` 足够覆盖 DAG 层数。
+总墙钟时间约 **5.5 天**，所有风险点全部前置验证。
 
-#### Step 9: ChatCLI 底层切换（~3h）
-
-> **v3.0 修正**：流式沿用 `on_custom_event`（Phase 1 已验证），**不监听 `on_chat_model_stream`**（模型调用在 SDK 内部，LangGraph 收不到）。`--continue/--resume` 映射到图的 `thread_id`。
+#### Step 5: ChatCLI 集成 L0Router（~2h）
 
 ```python
+# chat/repl.py — 集成 L0Router
+
 class ChatCLI:
     def __init__(self, project_dir: str):
         self.project_dir = project_dir
-        self.graph = None                  # 异步构建，在 start() 里 await
-        self.renderer = ChatRenderer()     # 复用 Phase 1
+        self.router = L0Router(project_dir)        # Phase 2 核心
+        self.renderer = ChatRenderer()
 
     async def _handle_message(self, prompt: str):
-        initial = {"user_request": prompt, "project_dir": self.project_dir}
-        config = {"configurable": {"thread_id": self.session_id},
-                  "recursion_limit": 50}
-        async for event in self.graph.astream_events(initial, config, version="v2"):
-            # 只关心自定义事件（agent_text/agent_tool/agent_result/agent_error）
-            if event["event"] == "on_custom_event":
-                self.renderer.handle(self._to_chat_event(event))
-            # 节点边界用于显示层级进度
-            elif event["event"] == "on_chain_start":
-                self._show_node_progress(event["name"])
-
-    def _show_node_progress(self, name: str):
-        label = {"architect": "👑 架构师分析中...",
-                 "main_agent_subgraph": "🛡️ 主智能体规划中...",
-                 "sub_agent_subgraph": "⚔️ 子智能体执行中...",
-                 "finalize": "📝 汇总结果..."}.get(name)
-        if label:
-            self.renderer.handle(ChatEvent(type="TEXT", content=label))
-
-    def _to_chat_event(self, ev: dict) -> ChatEvent:
-        name, data = ev["name"], ev["data"]
-        if name == "agent_text":   return ChatEvent(type="TEXT", content=data["text"])
-        if name == "agent_tool":   return ChatEvent(type="TOOL_USE", tool_name=data["tool_name"])
-        if name == "agent_result": return ChatEvent(type="TOOL_RESULT", result=data["content"])
-        if name == "agent_error":  return ChatEvent(type="ERROR", content=data["error"])
-        return ChatEvent(type="TEXT", content="")
+        # Phase 2: 经 L0Router 处理 (路由 + Fast Lane / Full)
+        async for message in self.router.handle_user_input(prompt):
+            self.renderer.handle(message)
 ```
 
-#### Step 10: 测试与验证（~5h）
+Fast Lane 下 `L0Router` 的常驻 session 自然积累对话历史，下一次输入可继续对话。Full 模式下各子进程独立执行，L0 session 只做派发和汇总，不积累领域执行细节。
+
+#### Step 6: 测试与验证（~3h）
 
 | 测试项 | 说明 |
 |-------|------|
-| **State reducer** | 并行写 `domain_reports` 等字段不报 `InvalidUpdateError` |
-| **Send 路由** | 路由函数返回 `list[Send]`，按 DAG 分批正确 |
-| **子图嵌套** | 主图 / MainAgent / SubAgent 三层子图可独立编译与组合 |
-| **依赖 DAG** | 下游领域等上游契约就绪才触发 |
-| **复杂度快车道** | 单领域小任务退化为单 Agent，跳过三层 |
-| **反向瀑布流** | summary→aggregate→finalize 连线，最终答复非空 |
-| **重试上限** | verify 连续失败 3 次 → escalate，不撞 recursion_limit |
-| **确定性验收** | 测试/lint 全绿不调 LLM；红了走 LLM 兜底 |
-| **工具层硬约束（OPT-1）** | L0/L1 调用 `Write`/`Edit`/`Bash` 应被 SDK 拒绝（不在 allowed_tools） |
-| **结构化输出（OPT-2）** | Architect 返回 `structured_output` dict，无需文本解析 |
-| **干净重试（OPT-3，P2）** | 重试前 `rewind_files` 回滚，失败代码不叠加 |
-| **成本观测（OPT-4）** | `cost_usd` 经 reducer 累计，报告含真实 `$` |
-| **温启动（P2）** | resume session 后模型"记得"上次改动 |
-| **用量监控（P2）** | `get_context_usage().percentage` 逼近上限触发 KILL 重建 |
-| **流式一致** | on_custom_event 正确渲染三层输出 |
-| **会话恢复** | `--continue/--resume` 经 thread_id 正确恢复（区分 SDK session_id） |
+| **LLM 路由判定** | 单领域需求返回 `{lane: "fast"}`，多领域返回 `{lane: "full", tasks: [...]}` |
+| **路由降级** | 路由判定异常（网络/schema 不符）→ 降级 Fast Lane 不阻断用户 |
+| **Fast Lane 自执行** | 单领域需求由当前 session 正常执行，不改文件时不涉及写工具；`can_use_tool` 全放行 |
+| **Full 模式并发** | 多领域需求拆出 N 份 prompt，并发拉起 N 个子进程（mock claude CLI） |
+| **worktree 隔离** | 每个子进程工作在独立 git worktree，互不干扰 |
+| **worktree 清理** | 成功和异常分支的 worktree 均被清理，`.harness/worktrees/` 无残留 |
+| **merge 收口** | 各 worktree 变更 merge 回主分支；冲突标记需人工介入 |
+| **动态权限硬约束** | Fast Lane 下业务写工具放行；Full 模式下 `Write/Edit/NotebookEdit` 被 `can_use_tool` 拒绝；`Bash` 放行（git 运维）；`None`（异常残留）按 Full 最严处理 |
+| **状态残留兜底** | 连续多次 `handle_user_input` 调用：每次 `_current_lane` 被入口重置为 `None`，不影响后续调用 |
+| **CLI 子进程契约** | `claude -p` headless 调用成功执行并解析输出 |
+| **流式一致** | Fast Lane 常规流式；Full 模式先 emit 一句"并行处理中…"再 await gather，最后 emit 收口汇总 |
+| **无后置机制残留** | 代码中无 GCH 调用、无 `TaskState` 枚举、无 GlobalDAG / 长轮询引用 |
 
 ---
 
-## 6. Phase 2 验收标准（修正版）
+## 6. Phase 2 验收标准
+
+验收项 15（BaseAgentSession 底座）+ 验收项 16（斜杠命令兼容）+ 验收项 17（spawn_claude_code 移除确认）+ 验收项 13 行数调整。
 
 | # | 验收项 | 通过条件 |
 |---|--------|---------|
-| 1 | **三层子图** | Architect/MainAgent/SubAgent 三层子图可独立编译并嵌套组合 |
-| 2 | **脑手解耦（硬约束）** | L0/L1 的 `allowed_tools` 仅只读集，调用写工具被 SDK 拒绝；L2 纯执行（OPT-1 可机器验证） |
-| 3 | **依赖感知路由** | 按 DAG 分批 Send，下游等上游契约就绪 |
-| 4 | **并行无冲突** | reducer 正确聚合并行写，无 `InvalidUpdateError` |
-| 5 | **双向瀑布流** | 向下只读快照 + 向上摘要回流，finalize 产出统一答复 |
-| 6 | **复杂度快车道** | 简单需求退化单 Agent，不强行三层 |
-| 7 | **重试可控** | verify 失败有上限，超限 escalate 不死循环 |
-| 8 | **分层验收** | 确定性检查优先，LLM 兜底 |
-| 9 | **结构化输出（OPT-2）** | Architect/验收用 `output_format`，免文本解析 |
-| 10 | **成本可控可观测（OPT-4）** | `task_budget` 生效，报告含真实 `total_cost_usd` |
-| 11 | **温启动（P2）** | resume SDK session，模型保留上轮记忆 |
-| 12 | **上下文管理（P2）** | SDK 原生自动压缩 + PreCompact；`percentage` 逼近上限才 KILL |
-| 13 | **CLI 入口不变** | `harness chat` 体验与 Phase 1 一致 |
-| 14 | **流式一致** | on_custom_event 正确渲染三层 |
-| 15 | **会话恢复** | `--continue/--resume` 不回退；thread_id 与 session_id 不混淆（OPT-7） |
-| 16 | **测试通过** | 所有新增测试通过 |
+| 1 | **LLM 路由判定** | 单领域需求返回 `{lane: "fast"}`，多领域返回 `{lane: "full", tasks: [...]}`；路由判定走独立 `query()`，不进常驻 session |
+| 2 | **路由降级** | 路由判定异常（网络/schema 不符）→ 降级 Fast Lane 执行，不阻断用户 |
+| 3 | **Fast Lane 自执行** | 单领域需求由 L0 常驻会话直接完成（带写权限），不拉外部进程 |
+| 4 | **Full 模式并发** | 多领域需求拆出 N 份 prompt，并发拉起 N 个 claude code 子进程 |
+| 5 | **worktree 隔离** | 每个 Full 子进程在独立 git worktree 执行，分支名 `l0-{domain}-{uuid6}` 带唯一标识，互不干扰 |
+| 6 | **merge 收口** | 各 worktree 变更 merge 回主分支；成功/异常均清理 worktree 防残留 |
+| 7 | **动态权限硬约束** | Full 模式下 `Write/Edit/NotebookEdit` 被 `can_use_tool` 拒绝；`Bash` 放行（运维）；Fast Lane 下全部放行；`None`（异常残留）按 Full 最严处理 |
+| 8 | **CLI 子进程契约** | `claude -p` headless 调用成功执行并解析输出；与 Step 0 Spike 输出的契约表对齐 |
+| 9 | **CLI 入口不变** | `harness chat` 体验与 Phase 1 一致（Fast Lane 保持对话连续性） |
+| 10 | **流式一致** | Fast Lane 常规流式；Full 模式先 emit 进度后 await gather，最后 emit 汇总 |
+| 11 | **无后置机制残留** | 代码中无 GCH 调用、无 `TaskState` 枚举、无 GlobalDAG / 长轮询 / Analyst 分裂引用 |
+| 12 | **无 LangGraph 依赖** | `pyproject.toml` 中不含 langgraph/langchain-core；代码中无 StateGraph/Send/reducer 引用 |
+| 13 | **极薄 Router** | `core/architect.py` 核心逻辑 ≤ ~260 行；不维护状态机 |
+| 14 | **测试通过** | 所有新增测试通过 |
+| 15 | **BaseAgentSession 底座** | 从 `chat/session.py` 成功抽离纯会话管理能力，L0Router 组合常驻 + 临时两类底座实例，`ChatSession` 瘦身继承底座 |
+| 16 | **斜杠命令兼容** | `/undo` 仅 Fast Lane 生效；`/clear`/`/context` 全模式生效；`/fast`/`/full` 新增命令强制指定车道 |
+| 17 | **spawn_claude_code 已移除** | L0Router 工具集中不含 `spawn_claude_code`；Full 模式走 `asyncio.create_subprocess_exec` |
+| 18 | **子进程超时兜底（P0: ASYNCIO_TIMEOUT）** | `_spawn_cli` 调用 `asyncio.wait_for` 包裹 `proc.communicate()`，超时后 SIGTERM→SIGKILL 升级；`CLI_TIMEOUT` 可配置（默认 900s） |
+| 19 | **worktree 创建回滚（P0: WORKTREE_ROLLBACK）** | `_run_full` 中 worktree 创建循环包裹在 try/except 中，失败时逆序清理已创建的 worktrees 再 re-raise |
+| 20 | **斜杠命令前置拦截（P0: SLASH_PRE_INTERCEPT）** | `handle_user_input` 入口对 `text.startswith('/')` 直接委托常驻 session，不经过 `_route()` |
+| 21 | **Full 结果持久化规则（P0: FULL_RESULT_PERSISTENCE）** | Full 模式仅最终 summary 写入 session 历史；中间日志显示但不持久化；Full 模式不调 `self._session.send()` |
 
 ---
 
-## 7. 时间预估（修正版）
-
-> **v3.0 修正**：原 37h 偏乐观。分布式 agent 基建（子图 + reducer + Send + session 续接 + 用量监控 + 流式打通 + 测试）按经验需上调。
-> **v4.0 增量**：OPT-1（`allowed_tools`）、OPT-2（`output_format`）、OPT-7（概念厘清）改动极小、并入对应 Step 内，几乎不加工时；OPT-3/4/6 单列。下表区分 P0/P1/P2。
+## 7. 时间预估
 
 | Step | 内容 | 优先级 | 预估 |
 |------|------|-------|-----:|
-| Step 1 | 三层 State + 快照 + DAG（含 cost/last_msg_id 字段） | P0 | ~3h |
-| Step 2 | 架构师 + 复杂度 + DAG + 收口（含 OPT-1/2） | P0 | ~5h |
-| Step 3 | 主智能体子图（参数化，含 OPT-1） | P0 | ~7h |
-| Step 4 | 子智能体子图 + 验收 + 重试（含 OPT-4 预算观测） | P0 | ~6h |
-| Step 7 | 分层验收器 | P1 | ~3h |
-| Step 8 | 星射线主图（子图嵌套 + 回流） | P0 | ~6h |
-| Step 9 | ChatCLI 切换（custom event，含 OPT-7 厘清） | P0 | ~3h |
-| Step 10 | 测试与验证 | P0 | ~5h |
-| | **P0+P1 主干小计** | | **~38h** |
-| Step 5 | 挂起池 + session 续接（含 OPT-3 rewind） | P2 | ~4h |
-| Step 6 | SDK 原生压缩 + PreCompact + 用量监控兜底 | P2 | ~3h |
-| OPT-6 | `can_use_tool` 危险护栏 | P2 | ~2h |
-| | **含 P2 全量合计** | | **~47h（含联调缓冲建议预留 1.5×，约 9–12 工作日）** |
+| Step 0 | Claude CLI 契约 Spike（验证 flag 名/输出格式/退出码/配置加载） | P0 | ~0.5d |
+| Step 1 | 抽 BaseAgentSession 底座 + 改造 ChatSession 瘦身 | P0 | ~1d |
+| Step 2 | L0 Router 核心 — 路由判定 + 底座组合（常驻+临时） | P0 | ~1d |
+| Step 3 | Fast Lane 对接常驻会话 + 动态权限回调挂载 | P0 | ~0.5d |
+| Step 4 | Full 模式 — CLI 子进程 + worktree 隔离 + merge 收口 | P0 | ~1d |
+| Step 5 | ChatCLI 集成 L0Router + 斜杠命令适配（`/fast`/`/full`） | P0 | ~0.5d |
+| Step 6 | 测试补全（mock 策略）+ 废弃代码清理（`core/state.py`） | P0 | ~1d |
+| | **P0 主干小计** | | **~5.5d** |
 
-> **建议节奏**：先交付 P0 主干 + P0 级 OPT（OPT-1/2/7 随主干一起，几乎零成本却显著提升正确性）；再迭代 P1（验收、OPT-4/5）、P2（续命/压缩/OPT-3/6）。不要一次性全做。
+相比初始估算增加了 Step 0 Spike、底座抽离和废弃代码清理。
+联调缓冲建议预留 1.2x，约 **6-7 工作日**。
+
+### 7.1 后置模块（Phase 3+）时间参考
+
+| 模块 | 触发条件 | 预估 | 落点 |
+|------|---------|-----:|------|
+| GCH 全局上下文中枢（SQLite + MCP 工具 + LLM 馆员） | 出现真实跨域契约协调需求 | ~10-15h | Phase 3 |
+| 自建 L1/L2 层 + 分层验收 + 依赖 DAG | Full 模式子进程协作需要编排名义层 | ~15-20h | Phase 3 |
+| merge 冲突自动解决 | worktree merge 频繁冲突 | ~3-5h | Phase 3 |
+| 挂起池 / 温启动 | 需要跨会话记忆续接 | ~3-5h | Phase 3 |
+| Hooks 代码审查拦截 / Sandbox | 代码质量保障需求 | ~8-12h | Phase 3 |
+| Skills 经验沉淀 | 经验积累需求 | ~8-10h | Phase 4 |
+| Web/Flutter 前端 | 可视化需求 | ~20-30h | Phase 5 |
 
 ---
 
-## 8. 风险与应对（修正版）
+## 8. 风险与应对
 
 | # | 风险 | 影响 | 应对 |
 |---|------|------|------|
-| 1 | 架构师拆解/DAG 不准 | 路由错误、下游空转 | 结构化输出校验 + 人工确认 + DAG 环检测 |
-| 2 | **并行写 state 竞态** | `InvalidUpdateError`/覆盖 | **所有并行字段强制 reducer**（必修） |
-| 3 | **test 回环无限重试** | 撞 recursion_limit | **retry_count 上限 + escalate**（必修） |
-| 4 | **压缩 state 无效** | 误以为省了 token | 改用 SDK 真实用量 + 原生压缩（已重定义） |
-| 5 | **温启动失忆** | query 无记忆 | 改用 SDK resume/session_id（已重定义） |
-| 6 | 子图嵌套调试复杂 | 定位困难 | 每层子图独立单测 + 节点级 custom event 追踪 |
-| 7 | 回流环不收敛 | 死循环 | `completed_domains` reducer 累加 + DAG 终止条件 |
-| 8 | LLM 调用过多 | 延迟/成本 | 拆解与提示词合并为一次结构化输出 + 确定性验收 |
-| 9 | 跨领域契约不一致 | 集成失败 | 接口契约 schema 校验纳入确定性验收 |
-| 10 | SDK 版本 API 变动 | 续接/压缩失效 | 锁定 `claude-agent-sdk==0.2.93`，能力封装在适配层 |
+| 1 | 路由判定误判（fast 误判 full 或反之） | 路由错误 | 判定带 `reason` 字段可审计；用户可即时纠正；宁可误 fast 也别漏（fast 开销小，降级策略见架构师.md §5） |
+| 2 | Full 模式 LLM 越界写业务代码 | 业务代码被 L0 直接修改 | `can_use_tool` 硬约束 deny `Write/Edit/NotebookEdit`，不靠 prompt 自觉 |
+| 3 | Full 模式 Bash 逃逸（经 bash 写文件绕过 Write） | 越界写风险 | Phase 2 接受：worktree 物理隔离兜底，L0 cwd 在主目录不污染子进程工作区；Phase 3 加 Bash 命令前缀白名单 |
+| 4 | `_current_lane` 异常残留导致权限错乱 | 安全漏洞 | 入口 `handle_user_input` 重置为 None；回调对 None 按最严（禁业务写）兜底 |
+| 5 | 多 worktree merge 冲突 | 部分领域无法自动合并 | Phase 2 标记"需人工介入"；Phase 3 加冲突解决子进程 |
+| 6 | claude code CLI flag 随版本变动 | 子进程调用失败 | headless 调用封装在 `_spawn_cli`，单一适配点 |
+| 7 | 子进程异常退出 | 部分领域失败 | `gather(return_exceptions=True)` 捕获，汇总报告标注 ❌；异常分支也清理 worktree 防残留 |
+| 8 | 路由判定异常中断整个流程 | 用户被阻断 | `try/except` 捕获，降级 Fast Lane 执行；提示用户可重新发送重判 |
+| 9 | 同领域重复执行 worktree 命名冲突 | 并发冲突 | 分支名带 uuid 短 id（`l0-{domain}-{uuid6}`），每次执行独立 |
+| 10 | Fast Lane 长任务撑爆 L0 session 上下文 | 上下文溢出 | Phase 2 先观察；触发后置 Phase 3 的压缩兜底 |
+| 11 | SDK 版本 API 变动 | `can_use_tool` 签名等变化 | 锁定 `claude-agent-sdk==0.2.93`，回调封装在 `L0Router` 内部 |
+| 12 | **P0: `_spawn_cli` 子进程无超时 → 子进程僵尸挂死 L0** | L0 永久 hang，无法响应用户 | `asyncio.wait_for` 包裹 `proc.communicate()`（默认 900s），超时后 SIGTERM→SIGKILL 升级；配置暴露为 `CLI_TIMEOUT` 类常量 |
+| 13 | **P0: worktree 创建循环部分失败 → 残留垃圾文件** | `.harness/worktrees/` 下残留孤立 worktree | worktree 循环包裹 `try/except`，异常时逆序清理已创建的 worktrees |
+| 14 | **P0: 斜杠命令未前置拦截 → 无效消耗路由 LLM token** | `/clear`、`/context` 等命令支付不必要的模型调用成本 | `handle_user_input` 入口 `text.startswith('/')` 检查，跳过 `_route()` |
+| 15 | **P0: Full 模式结果写入 session 历史规则未定义 → 可能污染历史** | 中间日志持久化挤占上下文，或关键 summary 丢失 | 仅最终 summary 写入 assistant 消息；中间日志显示但不持久化；Full 模式不调 `self._session.send()` |
 
 ---
 
-## 9. 关键设计决策记录（v3.0 新增 ADR）
+## 9. 关键设计决策记录
 
 | ID | 决策 | 理由 |
 |----|------|------|
-| ADR-1 | 三层用 **subgraph 嵌套**而非扁平多 State | LangGraph 一图一 schema；嵌套即"分形"本义 |
-| ADR-2 | 执行/会话/压缩**下沉 SDK 原生能力** | v0.2.93 已提供 agents/resume/fork/usage/precompact，避免重造 |
-| ADR-3 | 领域**参数化 + 配置注册表** | 兑现"加领域零改编排代码" |
-| ADR-4 | 验收**确定性优先、LLM 兜底** | 降幻觉、降成本，且为 Phase 3 Hooks 预留 |
-| ADR-5 | 路由按 **依赖 DAG 分批** | 防下游基于不存在契约编码 |
-| ADR-6 | 流式坚持 **custom event** | 模型调用在 SDK 内部，LangGraph 收不到 model 事件 |
-| ADR-7 | 简单需求走**快车道** | 避免小任务付三层开销 |
+| ADR-1 | ~~三层 subgraph 嵌套~~ → ~~纯 async 函数 + asyncio.gather~~ → **L0 极薄 Router** | 纯 async 方案已正确移除了 LangGraph，但三层分形架构（L0/L1/L2 全自建）对于 Phase 2 范围过大。当前方案将 L1/L2 后置到 Phase 3+，Full 模式改为 `claude code` CLI 子进程 + git worktree 物理隔离。 |
+| ADR-2 | 执行/会话/压缩 **下沉 SDK 原生能力** | v0.2.93 已提供 `query`/`can_use_tool`/`resume`/`fork`/`usage`/`precompact`，避免重造 |
+| ADR-3 | 路由判定用 **LLM（一次 `output_format` 调用）**，不用正则 | 正则太死板——可能本涉及一个领域却匹配到多领域关键词。模型能力足够直接决策。独立 stateless query 不进常驻 session |
+| ADR-4 | Full 模式 **不自建 L1/L2**，改用 **claude code CLI 子进程 + git worktree** | claude code 自带完善的 subagent 识别 + 独立工作区机制，不重造。L0 只做"判领域 + 分 worktree + 派发 + 收结果 + merge" |
+| ADR-5 | **worktree 物理隔离** | Full 模式多个子进程并行写同一项目目录必撞车。每个领域一个 git worktree，做完 merge 回主分支。git 原生，成本极低 |
+| ADR-6 | 权限用 **`can_use_tool` 动态准入**，不用静态 `allowed_tools` | L0 Fast Lane 需要写权限（自执行），Full 模式 L0 只应派发。静态白名单无法同时满足两个场景，动态回调按 lane 来 |
+| ADR-7 | 路由降级：**宁可误 fast，不可误 full** | 路由判定异常默认降级 Fast Lane 执行，不阻断用户。fast 是安全兜底；确为多领域时用户重新发送即可 |
+| ADR-8 | **worktree 分支名带 uuid 短 id** | `l0-{domain}-{uuid6}`，防同领域重复执行时分支名/路径冲突（必现 bug），每次执行独立可追溯 |
+| ADR-9 | **LLM 路由判定走独立 stateless `query()`** | 不进常驻 session 历史——避免路由 JSON 污染后续执行流、避免 text 重复 |
+| ADR-10 | **只禁业务写（Write/Edit/NotebookEdit），放行 Bash** | Full 模式下 L0 仍需执行 git worktree/merge 等运维操作，一刀切禁 Bash 会让 Full 流程跑不通 |
+| ADR-11 | 入口重置 `_current_lane = None` + 回调对 None 按最严兜底 | 防异常状态残留导致权限错乱；None 仅在异常残留时出现，按最严处理最安全 |
+| ADR-12 | GCH / 自建 L1-L2 / 分层验收 / 依赖 DAG **全部后置 Phase 3+** | Phase 2 先跑通 Router 骨架。复杂协调机制等真正需要时再加。过早引入会拖慢交付 |
 
 ---
 
@@ -1124,25 +750,31 @@ class ChatCLI:
 
 Phase 1 已完成单 Agent MVP（SDK 连通、流式、CLI/REPL、TUI、会话恢复）。
 
-Phase 2 采用**星射线三层分形架构**，v3.0 相比初版的核心修正：
+Phase 2 采用 **L0 极薄 Router 架构**，核心变更：
 
-| 维度 | 初版问题 | v3.0 修正 |
-|------|---------|----------|
-| **图结构** | 三 State 塞一张扁平图（无法编译） | subgraph 嵌套，一层一 schema |
-| **路由** | Send 经 state 中转 + mapping dict 误用 | 路由函数直接返回 `list[Send]` |
-| **并行** | 并行写无 reducer（必崩） | 所有并行字段强制 reducer |
-| **瀑布流** | 反向上报是孤儿方法，图无连线 | aggregate/finalize 连线 + 收口答复 |
-| **压缩** | 压 `state["messages"]`（不回喂，无效） | SDK 真实用量 + PreCompact 原生压缩 |
-| **温启动** | query 无记忆，无法续命 | SDK resume/session_id 续接 |
-| **领域扩展** | 三个硬编码文件（违背零修改） | 参数化 + 配置注册表 |
-| **执行层** | 自建 subagent 循环 | 复用 SDK 原生 agents |
-| **健壮性** | 无重试上限/无快车道/无 DAG | retry 上限 + 快车道 + 依赖 DAG |
-| **流式** | 监听 model 事件（收不到） | 坚持 custom event |
+| 维度 | 原方案（三层分形全栈） | 当前方案（L0 极薄 Router） |
+|------|---------------------|---------------------|
+| **L0 职责** | 入口架构师：拆解 + DAG + 复杂度判定 + 收口 | 极薄 Router：一次 LLM 调用判 lane（Fast/Full），Fast 自执行 / Full 派发 CLI 子进程 |
+| **L1/L2 实现** | 自建：MainAgent（参数化类）+ SubAgent（执行循环） | 不自建：Full 模式用 claude code CLI 子进程（自带 subagent 机制）。自建 L1/L2 后置 Phase 3+ |
+| **GCH 全局记忆** | P0 必做：SQLite 事实源 + MCP 工具表面 | Phase 3+：出现真实跨域契约协调需求时再加 |
+| **权限模型** | 静态 `allowed_tools`（L0/L1 只读，L2 可写） | 动态 `can_use_tool`（Fast 放行 / Full 禁业务写 / None 最严兜底） |
+| **并行隔离** | git worktree（L2 级别） | git worktree（Full 模式领域级别），分支名 `l0-{domain}-{uuid6}` 带唯一标识 |
+| **路由判定** | 一次 LLM `output_format` 输出 `{complexity, tasks, prompts, dag}` | 一次 LLM `output_format` 输出 `{lane, reason, tasks[]}`；独立 stateless `query()`，不进常驻 session |
+| **验收** | 分层验收器（确定性 + LLM 兜底） | 子进程内部自验证。Phase 3+ 自建 L1/L2 时再加 |
+| **依赖调度** | DAG + TaskScheduler（按依赖分批） | 无（Full 模式各领域独立 worktree，无跨需求依赖） |
+| **快车道** | Fast Lane：单 Agent 执行 | Fast Lane：L0 当前常驻 session 直执行（带写权限，不拉外部进程） |
+| **状态管理** | 数据类 + 函数参数 + SQLite 编排进度 | 极简元信息（`_current_lane`、`_worktree_registry`、`_total_cost`），不维护状态机 |
+| **路由降级** | 未明确 | 异常默认降级 Fast Lane，不阻断用户 |
+| **代码量** | ~300 行 async 函数 + 调度器 + ~8 个新模块 | `core/architect.py` ≤ ~250 行 + `core/worktree.py` ~80 行 |
+| **P0 时间** | ~27h | ~16.5h |
 
 Phase 2 完成后，系统实现：
-- **降低上下文雪崩**：主脑只看摘要，执行层用 SDK 真实用量驱动压缩。
-- **降低幻觉的局部专注**：子Agent 专属 System Prompt + 只读快照，不被全量代码库干扰。
-- **架构的极致简洁**：新增领域仅改配置，编排层代码零修改。
-- **经验的渐进沉淀**：SDK session 续接 + 挂起池，为 Phase 4 经验库铺路。
+- **极简路由**：一次 LLM 调用判定单/多领域，单领域自执行、多领域并发派发 claude code 子进程。
+- **物理隔离**：git worktree 保证多领域并行执行互不污染。
+- **动态权限**：`can_use_tool` 按 lane 硬约束业务写，Fast 放行、Full 拒绝、None 最严兜底。
+- **架构简洁**：`core/architect.py` ≤ ~250 行，不建 L1/L2、不做状态机、零框架依赖。
+- **渐进路线**：自建 L1/L2、GCH、分层验收等复杂能力后置 Phase 3+，先跑通 Router 骨架。
 
-为 Phase 3（Hooks + Sandbox）和 Phase 4（经验沉淀）打下坚实基础。
+Phase 2 的 Router 骨架为 Phase 3（GCH + 自建 L1/L2 + Hooks + Sandbox）和 Phase 4（经验沉淀）提供坚实的路由基础。
+
+> **权威设计文档**：Phase 2 架构细节以 [`docs/架构师 agent.md`](./架构师%20agent.md) 为准，本文档为编排计划对齐。

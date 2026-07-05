@@ -1,10 +1,20 @@
-"""Agent 基类 — 纯函数，全类型事件发射，无 IO 副作用
+"""极简 Agent 执行函数 — 纯 async generator，零框架依赖
 
-⚠️ 系统提示词配置：
-   目前默认使用自定义的简单系统提示词。
-   如需使用 Claude Code CLI 的完整系统提示词，可在 ContextProvider 中配置：
-   {"type": "preset", "preset": "claude_code"}
+职责：
+1. 调用 claude-agent-sdk 执行任务
+2. 对 SDK 返回的每种 Block 类型 yield 不同的事件 dict
+3. 完全不依赖 LangGraph / langchain-core
+
+产出的事件格式（与 cli.py TerminalRenderer 兼容）：
+    {"event": "on_custom_event", "name": "<type>", "data": {...}}
+
+绝不做的事：
+- ❌ print() / sys.stdout.write()
+- ❌ 直接操作终端
+- ❌ 管理对话历史（SDK 内部闭环）
 """
+
+import time
 
 from claude_agent_sdk import (
     query,
@@ -13,12 +23,7 @@ from claude_agent_sdk import (
     ResultMessage,
     TextBlock,
     ToolUseBlock,
-    ToolResultBlock,
 )
-from langchain_core.messages import AIMessage
-from langchain_core.callbacks import adispatch_custom_event
-
-from harness_agent.core.state import HarnessState
 
 
 # 基础系统提示词（当不使用 Claude Code preset 时使用）
@@ -32,166 +37,129 @@ _BASE_SYSTEM_PROMPT = """你是 Harness Agent 系统中的通用开发助手。
   再按 cwd 定位文件。不要跨 cwd 范围去寻找项目外的路径。"""
 
 
-class BaseAgent:
-    """LangGraph 节点 — 纯函数语义
+async def run_agent(
+    task: str,
+    project_dir: str = ".",
+    *,
+    name: str = "default",
+    system_prompt: str = _BASE_SYSTEM_PROMPT,
+    allowed_tools: list[str] | None = None,
+    max_turns: int = 15,
+    model: str | None = None,
+):
+    """纯 async generator：执行 SDK 任务并 yield 流式事件
 
-    核心职责：
-    1. 调用 claude-agent-sdk 执行任务
-    2. 对 SDK 返回的每种 Block 类型发射不同的自定义事件
-    3. 组装完整结果，返回 State update
+    Args:
+        task:         用户任务描述
+        project_dir:  项目工作目录
+        name:         Agent 名称
+        system_prompt: 系统提示词
+        allowed_tools: 工具白名单
+        max_turns:    最大轮次
+        model:        模型名称
 
-    绝不做的事：
-    - ❌ print() / sys.stdout.write()
-    - ❌ 直接操作终端
-    - ❌ 管理对话历史（SDK 内部闭环）
+    Yields:
+        dict: 格式为 {"event": "on_custom_event", "name": "<type>", "data": {...}}
+              保证与 cli.py TerminalRenderer 兼容。
     """
+    tools = allowed_tools or ["Read", "Write", "Edit", "Bash"]
 
-    def __init__(
-        self,
-        name: str = "default",
-        system_prompt: str = _BASE_SYSTEM_PROMPT,
-        allowed_tools: list[str] | None = None,
-        max_turns: int = 15,
-        model: str | None = None,
-    ):
-        self.name = name
-        self.system_prompt = system_prompt
-        self.allowed_tools = allowed_tools or ["Read", "Write", "Edit", "Bash"]
-        self.max_turns = max_turns
-        self.model = model
+    _system_prompt = (
+        f"{system_prompt}\n\n"
+        f"## 当前工作目录\n"
+        f"cwd = {project_dir}\n"
+        f"所有相对路径都基于此目录解析。"
+    )
 
-    def _build_options(self, project_dir: str) -> ClaudeAgentOptions:
-        """构建 SDK 配置"""
-        # 把 cwd 显式注入 system_prompt，避免 Agent 误将相对路径
-        # 解析到 shell 启动目录（如 C:\Users\root）
-        system_prompt = (
-            f"{self.system_prompt}\n\n"
-            f"## 当前工作目录\n"
-            f"cwd = {project_dir}\n"
-            f"所有相对路径都基于此目录解析。"
-        )
-        return ClaudeAgentOptions(
-            system_prompt=system_prompt,
-            cwd=project_dir,
-            allowed_tools=self.allowed_tools,
-            max_turns=self.max_turns,
-            permission_mode="acceptEdits",
-            model=self.model,
-        )
+    options = ClaudeAgentOptions(
+        system_prompt=_system_prompt,
+        cwd=project_dir,
+        allowed_tools=tools,
+        max_turns=max_turns,
+        permission_mode="acceptEdits",
+        model=model,
+    )
 
-    async def __call__(self, state: HarnessState) -> dict:
-        """LangGraph 节点入口
+    collected_texts: list[str] = []
+    tool_calls: list[dict] = []
+    model_info: dict | None = None
+    start_time = time.monotonic()
 
-        ⚠️ 关于状态管理的"脑裂"：
-        我们只从 state 中取 task 和 project_dir。
-        state["messages"] 中的历史记录不会被喂给 SDK。
-        SDK 内部有自己的 ReAct 状态机，负责工具调用循环。
-        LangGraph 的 messages 仅用于归档最终结果。
-        """
-        task = state["task"]
-        project_dir = state.get("project_dir", ".")
-        options = self._build_options(project_dir)
+    try:
+        async for message in query(prompt=task, options=options):
 
-        collected_texts: list[str] = []
-        tool_calls: list[dict] = []
-        model_info: dict | None = None
+            # ── AssistantMessage: 模型的思考和工具调用意图 ──
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
 
-        # 计时
-        import time
-        start_time = time.monotonic()
-
-        # 捕获可能由于 SDK 初始化失败或 Key 不正确导致的异常
-        try:
-            async for message in query(prompt=task, options=options):
-
-                # ── AssistantMessage: 模型的思考和工具调用意图 ──
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-
-                        # 文本块：模型在"说话"
-                        if isinstance(block, TextBlock):
-                            collected_texts.append(block.text)
-                            await adispatch_custom_event(
-                                "agent_text",
-                                {
-                                    "agent": self.name,
-                                    "text": block.text,
-                                },
-                            )
-
-                        # 工具调用块：模型在"动手"
-                        elif isinstance(block, ToolUseBlock):
-                            tool_info = {
-                                "agent": self.name,
-                                "tool_name": block.name,
-                                "tool_id": block.id,
-                                "tool_input": _summarize_tool_input(block.input),
-                            }
-                            tool_calls.append(tool_info)
-                            await adispatch_custom_event(
-                                "agent_tool",
-                                tool_info,
-                            )
-
-                # ── ResultMessage: 任务整体执行结果 ──
-                elif isinstance(message, ResultMessage):
-                    # 提取实际模型信息
-                    if hasattr(message, "model_usage") and message.model_usage:
-                        model_info = dict(message.model_usage)
-
-                    if getattr(message, "is_error", False):
-                        errors = getattr(message, "errors", [])
-                        err_text = "\\n".join(errors) if errors else "API 无法连接或其它错误"
-                        await adispatch_custom_event(
-                            "agent_error",
-                            {
-                                "agent": self.name,
-                                "error": err_text[:500],
+                    # 文本块：模型在"说话"
+                    if isinstance(block, TextBlock):
+                        collected_texts.append(block.text)
+                        yield {
+                            "event": "on_custom_event",
+                            "name": "agent_text",
+                            "data": {
+                                "agent": name,
+                                "text": block.text,
                             },
-                        )
-                    else:
-                        duration_s = round(time.monotonic() - start_time, 1)
-                        res = getattr(message, "result", "")
-                        await adispatch_custom_event(
-                            "agent_result",
-                            {
-                                "agent": self.name,
-                                "content": str(res)[:500] if res else "✅ 任务顺利完成",
-                                "is_error": False,
-                                "model_usage": model_info,
-                                "duration_s": duration_s,
-                            },
-                        )
+                        }
 
-        except Exception as e:
-            # 向外发射错误事件，防止程序静默崩溃
-            await adispatch_custom_event(
-                "agent_error",
-                {
-                    "agent": self.name,
-                    "error": f"SDK 内部异常: {str(e)}",
-                },
-            )
-            collected_texts.append(f"\n[❌ 致命错误: SDK 内部异常] {str(e)}")
+                    # 工具调用块：模型在"动手"
+                    elif isinstance(block, ToolUseBlock):
+                        tool_info = {
+                            "agent": name,
+                            "tool_name": block.name,
+                            "tool_id": block.id,
+                            "tool_input": _summarize_tool_input(block.input),
+                        }
+                        tool_calls.append(tool_info)
+                        yield {
+                            "event": "on_custom_event",
+                            "name": "agent_tool",
+                            "data": tool_info,
+                        }
 
-        # ── 组装最终归档结果 ──
-        summary_parts = []
-        if collected_texts:
-            summary_parts.append("\n".join(collected_texts))
-        if tool_calls:
-            tool_summary = ", ".join(
-                f"{t['tool_name']}({t['tool_input']})" for t in tool_calls
-            )
-            summary_parts.append(f"\n[工具调用记录] {tool_summary}")
+            # ── ResultMessage: 任务整体执行结果 ──
+            elif isinstance(message, ResultMessage):
+                if msg_model_usage := getattr(message, "model_usage", None):
+                    model_info = dict(msg_model_usage)
 
-        response_text = (
-            "\n".join(summary_parts) if summary_parts
-            else "[Agent 执行完毕，无文本输出]"
-        )
+                if getattr(message, "is_error", False):
+                    errors = getattr(message, "errors", [])
+                    err_text = "\n".join(errors) if errors else "API 无法连接或其它错误"
+                    yield {
+                        "event": "on_custom_event",
+                        "name": "agent_error",
+                        "data": {
+                            "agent": name,
+                            "error": err_text[:500],
+                        },
+                    }
+                else:
+                    duration_s = round(time.monotonic() - start_time, 1)
+                    res = getattr(message, "result", "")
+                    yield {
+                        "event": "on_custom_event",
+                        "name": "agent_result",
+                        "data": {
+                            "agent": name,
+                            "content": str(res)[:500] if res else "✅ 任务顺利完成",
+                            "is_error": False,
+                            "model_usage": model_info,
+                            "duration_s": duration_s,
+                        },
+                    }
 
-        return {
-            "messages": [AIMessage(content=response_text, name=self.name)]
+    except Exception as exc:
+        yield {
+            "event": "on_custom_event",
+            "name": "agent_error",
+            "data": {
+                "agent": name,
+                "error": f"SDK 内部异常: {exc}",
+            },
         }
+        collected_texts.append(f"\n[❌ 致命错误: SDK 内部异常] {exc}")
 
 
 def _summarize_tool_input(tool_input: dict) -> str:
@@ -199,7 +167,6 @@ def _summarize_tool_input(tool_input: dict) -> str:
     if not isinstance(tool_input, dict):
         return str(tool_input)[:100]
 
-    # 常见的工具输入字段
     if "command" in tool_input:
         return tool_input["command"][:100]
     if "file_path" in tool_input:

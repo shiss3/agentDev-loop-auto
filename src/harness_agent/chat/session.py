@@ -70,7 +70,12 @@ from harness_agent.context.provider import ContextProvider, DefaultContextProvid
 
 _BASE_SYSTEM_PROMPT = """你是 Harness Agent 系统中的通用开发助手。
 你可以读写文件、执行命令来完成用户的开发任务。
-请直接动手完成任务，不要只给建议。"""
+请直接动手完成任务，不要只给建议。
+
+## 路径说明
+- 所有相对路径（如 docs/1.md）都基于当前工作目录（cwd）解析。
+- 如果用户问\"项目中某个文件\"，先用 Glob 或 Bash 确认项目根目录结构，
+  再按 cwd 定位文件。不要跨 cwd 范围去寻找项目外的路径。"""
 
 _logger = logging.getLogger(__name__)
 

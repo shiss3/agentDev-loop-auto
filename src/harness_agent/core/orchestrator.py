@@ -1,63 +1,48 @@
-"""LangGraph 编排引擎 — Phase 1 极简直线图"""
+"""编排器 — 纯 async 封装，零框架依赖
 
-from langgraph.graph import StateGraph, END
-from harness_agent.core.state import HarnessState
-from harness_agent.core.agents.base_agent import BaseAgent
+替代 Phase 1 的 LangGraph StateGraph。
+直接调用 base_agent.run_agent() async generator，
+产出与 astream_events v2 兼容的事件 dict（保证 cli.py 不改）。
+"""
 
-
-def build_graph(model: str | None = None) -> StateGraph:
-    """构建 Phase 1 的极简状态图
-
-    START ──→ default_agent ──→ END
-
-    没有 Router，没有条件分支。
-    只验证：用户任务 → Agent 执行 → 结果回传。
-    """
-    # 初始化 Agent 实例
-    default_agent = BaseAgent(name="default", model=model)
-
-    # 构建状态图
-    graph = StateGraph(HarnessState)
-
-    # 唯一节点：default_agent
-    graph.add_node("default_agent", default_agent)
-
-    # 直线连接
-    graph.set_entry_point("default_agent")
-    graph.add_edge("default_agent", END)
-
-    return graph
+from harness_agent.core.agents.base_agent import run_agent
 
 
 class HarnessOrchestrator:
-    """编排器封装 — 提供编译后的图实例"""
+    """编排器封装 — 纯 async Python，无 LangGraph 依赖
+
+    保持与 Phase 1 完全相同的公开接口：
+        orchestrator.stream(task) → AsyncIterator[dict]
+        orchestrator.run(task)     → dict
+
+    cli.py / TerminalRenderer 不需要任何修改。
+    """
 
     def __init__(self, project_dir: str = ".", model: str | None = None):
         self.project_dir = project_dir
         self.model = model
-        self.graph = build_graph(model=model).compile()
 
     async def run(self, task: str) -> dict:
-        """同步执行（非流式），用于测试"""
-        initial_state: HarnessState = {
-            "messages": [],
-            "task": task,
-            "project_dir": self.project_dir,
-        }
-        result = await self.graph.ainvoke(initial_state)
-        return result
+        """同步执行（非流式），用于测试
+
+        收集所有事件，返回与旧 StateGraph.ainvoke 兼容的格式。
+        """
+        messages = []
+        async for _event in self.stream(task):
+            pass  # 收集完成即可，事件本身不纳入返回值
+        return {"messages": messages, "task": task, "project_dir": self.project_dir}
 
     async def stream(self, task: str):
-        """流式执行，yield astream_events 事件
+        """流式执行，yield 事件 dict
 
-        供 CLI 层消费，实现终端实时渲染。
+        格式与 LangGraph astream_events v2 完全兼容：
+            {"event": "on_custom_event", "name": "...", "data": {...}}
+
+        cli.py 的 TerminalRenderer.handle_event() 消费此格式。
         """
-        initial_state: HarnessState = {
-            "messages": [],
-            "task": task,
-            "project_dir": self.project_dir,
-        }
-        async for event in self.graph.astream_events(
-            initial_state, version="v2"
+        async for event in run_agent(
+            task=task,
+            project_dir=self.project_dir,
+            model=self.model,
         ):
             yield event

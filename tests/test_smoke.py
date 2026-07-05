@@ -188,7 +188,6 @@ def test_config_import():
 
 
 def test_state_import():
-    """验证状态模块可以正确导入"""
-    from harness_agent.core.state import HarnessState
-    # TypedDict 是类型，验证它是 dict 的子类
-    assert issubclass(HarnessState, dict)
+    """验证编排器模块可以正确导入（替代废弃的 HarnessState）"""
+    from harness_agent.core.orchestrator import HarnessOrchestrator
+    assert HarnessOrchestrator is not None
