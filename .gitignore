@@ -32,3 +32,6 @@ htmlcov/
 
 # uv
 uv.lock
+
+# Harness Agent worktrees (Phase 2 L0 Full mode)
+.harness/
