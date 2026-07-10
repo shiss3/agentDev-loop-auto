@@ -65,7 +65,7 @@ class TerminalRenderer:
             if is_error:
                 console.print(f"  [red]❌ 失败:[/red] [dim]{content}[/dim]")
             else:
-                console.print(f"  [green]✅ 完成[/green]")
+                console.print("  [green]✅ 完成[/green]")
 
         elif name == "agent_error":
             error = data.get("error", "")[:300]

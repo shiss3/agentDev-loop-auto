@@ -3,12 +3,11 @@
 测试会话存储和会话恢复的基础功能
 """
 
-import asyncio
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-from claude_agent_sdk import SessionKey, SessionStore, SessionStoreEntry, fold_session_summary
+from unittest.mock import MagicMock, patch
+from claude_agent_sdk import SessionKey, SessionStoreEntry, fold_session_summary
 
-from harness_agent.chat.session_store import FileSessionStore, create_session_store
+from harness_agent.chat.session_store import FileSessionStore
 
 
 class TestFileSessionStore:
@@ -206,7 +205,6 @@ class TestChatSessionIntegration:
     @pytest.mark.asyncio
     async def test_create_new_session(self):
         """测试创建新会话"""
-        store = create_session_store()
 
         # 直接创建一个会话
         from harness_agent.chat.session import ChatSession
@@ -227,7 +225,6 @@ class TestChatSessionIntegration:
 
 def test_fold_session_summary():
     """测试 fold_session_summary 函数"""
-    import time
     from claude_agent_sdk import SessionKey
 
     key = SessionKey(project_key="test", session_id="test-session")

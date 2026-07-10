@@ -9,7 +9,6 @@ from harness_agent.chat.tui_app import TuiApp
 from harness_agent.chat.renderer import ChatRenderer
 from harness_agent.chat.events import (
     ChatEvent,
-    EventType,
     text_event,
     tool_use_event,
     tool_result_event,

@@ -7,8 +7,7 @@ import pytest
 @pytest.mark.asyncio
 async def test_sdk_import():
     """验证 SDK 核心类型可正确导入"""
-    from claude_agent_sdk import query, ClaudeAgentOptions
-    from claude_agent_sdk import AssistantMessage, TextBlock
+    from claude_agent_sdk import ClaudeAgentOptions
 
     options = ClaudeAgentOptions(max_turns=1)
     assert options is not None
@@ -177,7 +176,7 @@ async def test_result_message_structure():
 def test_package_import():
     """验证 harness_agent 包可以正确导入"""
     from harness_agent import __version__
-    assert __version__ == "0.1.0"
+    assert __version__ == "0.1.2"
 
 
 def test_config_import():

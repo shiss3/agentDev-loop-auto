@@ -1,7 +1,6 @@
 """ChatEvent 事件类型测试"""
 
 from harness_agent.chat.events import (
-    ChatEvent,
     EventType,
     text_event,
     tool_use_event,

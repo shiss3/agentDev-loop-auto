@@ -260,7 +260,7 @@ class ChatRenderer:
         """
         error = event.data.get("error", "未知流错误")[:300]
         stream_type = event.data.get("stream_event_type", "")
-        hint = f"⚠️ 流错误"
+        hint = "⚠️ 流错误"
         if stream_type:
             hint += f" [{stream_type}]"
         hint += f": {error}"
