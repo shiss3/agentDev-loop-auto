@@ -6,7 +6,7 @@ Phase 2.5 (TUI 版):
   所有输出通过 ContentBuffer → prompt_toolkit 渲染。
 
 职责：
-1. 管理 TuiApp / ChatRenderer / ChatSession 的生命周期
+1. 管理 TuiApp / ChatRenderer / Governor 的生命周期
 2. 分发用户输入（消息 vs 斜杠命令）
 3. 处理退出信号
 4. 处理请求取消
@@ -24,12 +24,11 @@ from harness_agent.chat.session_store import FileSessionStore, create_session_st
 from harness_agent.chat.session_selector import SessionSelector, NEW_SESSION
 from harness_agent.chat.tui_app import TuiApp
 from harness_agent.chat.renderer import ChatRenderer
-from harness_agent.chat.session import ChatSession
+from harness_agent.core.architect import Governor
 
 # 导入 commands 以注册所有内置斜杠命令（必须保留此 import）
 from harness_agent.chat import commands as _commands  # noqa: F401
 from harness_agent.chat.commands import get_command
-from harness_agent.context.provider import ContextProvider, DefaultContextProvider
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +46,6 @@ class ChatCLI:
         self,
         project_dir: str = ".",
         model: str | None = None,
-        context_provider: ContextProvider | None = None,
         history_file: str | None = None,
         session_store: FileSessionStore | None = None,
         resume_session_id: str | None = None,
@@ -56,7 +54,6 @@ class ChatCLI:
     ) -> None:
         self.project_dir = str(Path(project_dir).resolve())
         self.model = model
-        self.context_provider = context_provider or DefaultContextProvider()
 
         # 会话模式
         # - enable_undo=True: 检查点模式（支持 /undo，禁用会话恢复）
@@ -80,23 +77,24 @@ class ChatCLI:
             history_file=history_file,
         )
         self.renderer = ChatRenderer(tui=self.tui)
-        self.session = self._create_session()
+        self.governor = self._create_session()
 
         # 状态
         self._should_exit = False
         # 当前消息处理的任务引用（用于取消）
         self._message_task: asyncio.Task | None = None
 
-    def _create_session(self) -> ChatSession:
-        return ChatSession(
+    def _create_session(self) -> Governor:
+        return Governor(
             project_dir=self.project_dir,
             model=self.model,
-            context_provider=self.context_provider,
             session_store=self.session_store,
-            resume_session_id=self.resume_session_id,
-            continue_conversation=self.continue_conversation,
-            enable_undo=self.enable_undo,
         )
+
+    @property
+    def session(self):
+        """穿透到 Governor 常驻执行体（commands.py 的 cli.session.* 零改动）。"""
+        return self.governor.session
 
     async def run(self) -> None:
         """启动 TUI 应用（阻塞直到退出）"""
@@ -115,17 +113,17 @@ class ChatCLI:
                 else:
                     # 用户选择恢复历史会话
                     self.resume_session_id = selected_session
-                    # 重新创建会话以使用新的 session_id
-                    await self.session.close()
-                    self.session = self._create_session()
+                    # 重建 Governor（注：Governor 暂不支持 resume，会话恢复后置）
+                    await self.governor.close()
+                    self.governor = self._create_session()
 
         # 注册输入回调
         self.tui.set_on_submit(self._on_user_input)
         # 注册取消回调
         self.tui.set_on_cancel(self._cancel_current_request)
 
-        # 启动 SDK 会话
-        await self.session.start()
+        # 启动 Governor（含常驻执行体）
+        await self.governor.start()
 
         # 如果用户指定了模型，显示指定的模型名；否则显示 "default" 等待首次回复后更新
         initial_model = self.model or "default"
@@ -136,14 +134,16 @@ class ChatCLI:
 
         # 如果是恢复会话，显示恢复提示
         if self.resume_session_id:
-            self.renderer.render_command_result(f"已恢复会话: {self.resume_session_id[:8]}...")
+            self.renderer.render_command_result(
+                f"会话恢复暂未支持，已开新会话（原选: {self.resume_session_id[:8]}...）"
+            )
 
         try:
             await self.tui.run()
         finally:
             # 确保退出时取消任何正在进行的请求
             await self._cancel_message_task()
-            await self.session.close()
+            await self.governor.close()
             self.renderer.render_goodbye(self.session.stats.to_dict())
 
     async def _on_user_input(self, text: str) -> None:
@@ -211,7 +211,7 @@ class ChatCLI:
 
         这是实际处理消息的方法，可以被取消。
         """
-        async for event in self.session.send(prompt):
+        async for event in self.governor.handle_user_input(prompt):
             # 检查任务是否被取消
             if asyncio.current_task().cancelled():
                 break
@@ -238,23 +238,21 @@ class ChatCLI:
         self.tui.exit()
 
     async def reset_session(self) -> None:
-        """清空会话，重建 ChatSession"""
+        """清空会话，重建 Governor 常驻执行体"""
         # 取消正在进行的任务
         await self._cancel_message_task()
 
-        await self.session.close()
-        self.session = self._create_session()
-        await self.session.start()
+        await self.governor.rebuild()
         self.content_buffer.clear()
         self._render_welcome()
 
     async def switch_project(self, new_dir: str) -> None:
         """切换项目目录"""
         self.project_dir = str(Path(new_dir).resolve())
-        await self.reset_session()
+        await self.governor.rebuild(project_dir=self.project_dir)
 
     async def switch_model(self, model: str) -> None:
         """切换模型"""
         self.model = model
         self.tui.model_name = model
-        await self.reset_session()
+        await self.governor.rebuild(model=model)
