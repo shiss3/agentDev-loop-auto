@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>服务健康状态</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f5f5f5;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      color: #333;
+    }
+    .card {
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.1);
+      padding: 2.5rem 3rem;
+      max-width: 480px;
+      width: 90%;
+      text-align: center;
+    }
+    h1 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin-bottom: 1.5rem;
+      color: #666;
+    }
+    .status-indicator {
+      width: 80px;
+      height: 80px;
+      border-radius: 50%;
+      margin: 0 auto 1rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 2rem;
+      color: #fff;
+      transition: background 0.3s;
+    }
+    .status-indicator.healthy {
+      background: #22c55e;
+    }
+    .status-indicator.unhealthy {
+      background: #ef4444;
+    }
+    .status-indicator.loading {
+      background: #9ca3af;
+      animation: pulse 1.2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    .status-label {
+      font-size: 1.5rem;
+      font-weight: 700;
+      margin-bottom: 0.5rem;
+    }
+    .status-label.healthy { color: #22c55e; }
+    .status-label.unhealthy { color: #ef4444; }
+    .status-label.loading { color: #9ca3af; }
+    .service-name {
+      font-size: 0.95rem;
+      color: #888;
+      margin-bottom: 1rem;
+    }
+    .raw-json {
+      text-align: left;
+      background: #f8f8f8;
+      border: 1px solid #eee;
+      border-radius: 6px;
+      padding: 0.75rem;
+      font-family: "Fira Code", "Consolas", monospace;
+      font-size: 0.8rem;
+      color: #555;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .raw-json.error { color: #ef4444; }
+    .refresh-btn {
+      margin-top: 1.5rem;
+      padding: 0.5rem 1.5rem;
+      background: #3b82f6;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .refresh-btn:hover { background: #2563eb; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>服务健康状态</h1>
+    <div id="indicator" class="status-indicator loading">…</div>
+    <div id="label" class="status-label loading">检查中…</div>
+    <div id="service" class="service-name"></div>
+    <pre id="raw" class="raw-json">{}</pre>
+    <button class="refresh-btn" onclick="checkHealth()">刷新</button>
+  </div>
+
+  <script>
+    function checkHealth() {
+      const indicator = document.getElementById('indicator');
+      const label = document.getElementById('label');
+      const service = document.getElementById('service');
+      const raw = document.getElementById('raw');
+
+      indicator.className = 'status-indicator loading';
+      indicator.textContent = '…';
+      label.className = 'status-label loading';
+      label.textContent = '检查中…';
+      service.textContent = '';
+      raw.className = 'raw-json';
+      raw.textContent = '{}';
+
+      fetch('/health')
+        .then(function(resp) {
+          if (!resp.ok) {
+            throw new Error('HTTP ' + resp.status);
+          }
+          return resp.json();
+        })
+        .then(function(data) {
+          var isOk = data.status === 'ok';
+          indicator.className = 'status-indicator ' + (isOk ? 'healthy' : 'unhealthy');
+          indicator.textContent = isOk ? '✓' : '✕';
+          label.className = 'status-label ' + (isOk ? 'healthy' : 'unhealthy');
+          label.textContent = isOk ? '健康' : '异常';
+          service.textContent = data.service ? ('服务: ' + data.service) : '';
+          raw.className = 'raw-json';
+          raw.textContent = JSON.stringify(data, null, 2);
+        })
+        .catch(function(err) {
+          indicator.className = 'status-indicator unhealthy';
+          indicator.textContent = '✕';
+          label.className = 'status-label unhealthy';
+          label.textContent = '异常';
+          service.textContent = '';
+          raw.className = 'raw-json error';
+          raw.textContent = String(err);
+        });
+    }
+
+    checkHealth();
+  </script>
+</body>
+</html>
