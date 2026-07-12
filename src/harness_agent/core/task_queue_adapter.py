@@ -35,7 +35,7 @@ class TaskQueueAdapter:
         return store
 
     def seed(self, tasks: list[dict]) -> int:
-        """灌队列。tasks 项: {id, req_id, domain, prompt, intended_files(list|None), deps([id])}。
+        """灌队列。tasks 项: {id, req_id, domain, module_id, prompt, intended_files(list|None), deps([id])}。
         返回实际插入行数（INSERT OR IGNORE，可重灌）。
         """
         return self._store.seed(tasks, db_path=self.task_db_path)
@@ -45,9 +45,13 @@ class TaskQueueAdapter:
         conn = sqlite3.connect(self.task_db_path)
         try:
             rows = conn.execute(
-                "SELECT id, domain, status, deps FROM tasks WHERE req_id=? ORDER BY rowid",
+                "SELECT id, domain, module_id, status, deps FROM tasks WHERE req_id=? ORDER BY rowid",
                 (req_id,),
             ).fetchall()
         finally:
             conn.close()
-        return [{"id": r[0], "domain": r[1], "status": r[2], "deps": r[3]} for r in rows]
+        return [{"id": r[0], "domain": r[1], "module_id": r[2], "status": r[3], "deps": r[4]} for r in rows]
+
+    def is_req_done(self, req_id: str) -> bool:
+        """需求完成判定：req_id 下无 pending/claimed 任务（全 done）-> True。"""
+        return self._store.is_req_done(req_id, db_path=self.task_db_path)

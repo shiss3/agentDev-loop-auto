@@ -6,6 +6,7 @@ TaskQueueAdapter 指向 tmp_path。隔离 sys.path / sys.modules 污染。
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -30,6 +31,7 @@ def init_db(db_path):
                 id TEXT PRIMARY KEY,
                 req_id TEXT,
                 domain TEXT,
+                module_id TEXT,
                 prompt TEXT,
                 intended_files TEXT,
                 deps TEXT,
@@ -51,12 +53,13 @@ def seed(tasks, db_path=None):
         for t in tasks:
             cur = conn.execute(
                 """INSERT OR IGNORE INTO tasks
-                   (id, req_id, domain, prompt, intended_files, deps, status)
-                   VALUES (?, ?, ?, ?, ?, ?, 'pending')""",
+                   (id, req_id, domain, module_id, prompt, intended_files, deps, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')""",
                 (
                     t["id"],
                     t["req_id"],
                     t.get("domain", ""),
+                    t.get("module_id"),
                     t.get("prompt", ""),
                     json.dumps(t.get("intended_files") or []),
                     json.dumps(t.get("deps") or []),
@@ -67,6 +70,19 @@ def seed(tasks, db_path=None):
     finally:
         conn.close()
     return inserted
+
+
+def is_req_done(req_id, db_path=None):
+    init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM tasks WHERE req_id=? AND status!='done' LIMIT 1",
+            (req_id,),
+        ).fetchone()
+        return row is None
+    finally:
+        conn.close()
 '''
 
 
@@ -90,6 +106,7 @@ def _make_tasks(req_id: str = "r1") -> list[dict]:
             "id": f"{req_id}-t1",
             "req_id": req_id,
             "domain": "backend",
+            "module_id": "payment",
             "prompt": "do 1",
             "intended_files": ["a.py"],
             "deps": [],
@@ -98,6 +115,7 @@ def _make_tasks(req_id: str = "r1") -> list[dict]:
             "id": f"{req_id}-t2",
             "req_id": req_id,
             "domain": "frontend",
+            "module_id": "payment",
             "prompt": "do 2",
             "intended_files": None,
             "deps": [f"{req_id}-t1"],
@@ -106,6 +124,7 @@ def _make_tasks(req_id: str = "r1") -> list[dict]:
             "id": f"{req_id}-t3",
             "req_id": req_id,
             "domain": "docs",
+            "module_id": "payment",
             "prompt": "do 3",
             "intended_files": None,
             "deps": [],
@@ -127,6 +146,7 @@ def test_seed_inserts_tasks(stub_store_dir, tmp_path):
     assert len(rows) == 3
     assert all(r["status"] == "pending" for r in rows)
     assert [r["id"] for r in rows] == ["r1-t1", "r1-t2", "r1-t3"]
+    assert all(r["module_id"] == "payment" for r in rows)
 
 
 def test_seed_idempotent(stub_store_dir, tmp_path):
@@ -165,3 +185,36 @@ def test_seed_forwards_db_path(stub_store_dir, tmp_path):
     adapter.seed(_make_tasks())
     assert calls == [db_path]
     assert calls[0] == adapter.task_db_path
+
+
+# ── is_req_done 三态 ──────────────────────────────────
+
+
+def test_is_req_done_empty_true(stub_store_dir, tmp_path):
+    """无任何任务（req_id 不存在）-> True。"""
+    db_path = str(tmp_path / "db.sqlite")
+    adapter = TaskQueueAdapter(stub_store_dir, db_path)
+    assert adapter.is_req_done("r1") is True
+
+
+def test_is_req_done_pending_false(stub_store_dir, tmp_path):
+    """有 pending/claimed 任务 -> False。"""
+    db_path = str(tmp_path / "db.sqlite")
+    adapter = TaskQueueAdapter(stub_store_dir, db_path)
+    adapter.seed(_make_tasks("r1"))
+    assert adapter.is_req_done("r1") is False
+
+
+def test_is_req_done_all_done_true(stub_store_dir, tmp_path):
+    """全 done -> True。"""
+    db_path = str(tmp_path / "db.sqlite")
+    adapter = TaskQueueAdapter(stub_store_dir, db_path)
+    adapter.seed(_make_tasks("r1"))
+    # 直接把所有任务标 done
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("UPDATE tasks SET status='done' WHERE req_id='r1'")
+        conn.commit()
+    finally:
+        conn.close()
+    assert adapter.is_req_done("r1") is True
