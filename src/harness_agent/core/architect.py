@@ -51,13 +51,24 @@ TASK_SPEC_SCHEMA = {
             "enum": ["interactive", "delivery"],
         },
         "expected_scope": {"type": "string"},  # 预估影响范围（仅调度参考）
-        "subtasks": {  # 仅交付轨复杂需求：按技术领域 + 业务功能单元拆
+        "change_type": {  # 客观字段：修补 / 功能交付（_decide_track 消费）
+            "type": "string",
+            "enum": ["patch", "feature"],
+        },
+        "file_count_bucket": {  # 客观字段：预估改动文件档（_decide_track 消费）
+            "type": "string",
+            "enum": ["1-5", "6+"],
+        },
+        "cross_domain": {  # 客观字段：跨领域/改公共契约（_decide_track 消费）
+            "type": "boolean",
+        },
+        "subtasks": {  # 复杂需求按技术领域+业务模块拆（A 方案：feature/6+/cross_domain 触发）
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string"},  # 本批内唯一短 id（如 "t1"），供 deps 引用
-                    "domain": {"type": "string"},  # 技术领域：frontend/backend/database/docs/...
+                    "domain": {"type": "string", "enum": ["frontend", "backend", "database", "docs", "infra", "test"]},  # 技术领域枚举
                     "summary": {"type": "string"},
                     "acceptance": {"type": "array", "items": {"type": "string"}},
                     "intended_files": {  # 预期改动文件（可空）
@@ -68,13 +79,22 @@ TASK_SPEC_SCHEMA = {
                         "type": "array",
                         "items": {"type": "string"},
                     },
+                    "module_id": {"type": "string"},  # 业务模块英文 slug（小写+下划线）
                     "scope_hint": {"type": "string"},  # 影响文件/模块提示，worktree 隔离用
                 },
-                "required": ["id", "domain", "summary", "acceptance"],
+                "required": ["id", "domain", "summary", "acceptance", "module_id"],
             },
         },
     },
-    "required": ["task_summary", "acceptance_criteria", "risk_level", "suggest_track"],
+    "required": [
+        "task_summary",
+        "acceptance_criteria",
+        "risk_level",
+        "suggest_track",
+        "change_type",
+        "file_count_bucket",
+        "cross_domain",
+    ],
 }
 
 REQUIREMENT_PARSER_PROMPT = """\
@@ -86,17 +106,29 @@ REQUIREMENT_PARSER_PROMPT = """\
 - task_summary：一句话概括任务核心目标。
 - acceptance_criteria：结构化验收要点列表，每项必须可验证（能跑命令/测试/接口验证），
   锚定原始需求，禁止自行增减范围。
-- risk_level：低/中/高，用于调度与验收等级匹配。
-- suggest_track：interactive（单模块局部改动）/ delivery（多模块/多领域完整需求）。
+- risk_level：low/medium/high。high=高风险（改支付/迁移/删数据/安全敏感），强制走 delivery
+  让下游验收/隔离；常驻 acceptEdits 不直写高风险改动。
+- change_type：客观判定改动性质。patch=修修补补（改文案/调样式/加字段/改参数/小 bug）；
+  feature=完整功能交付。
+- file_count_bucket：预估改动文件数分档。1-5=少量文件；6+=多文件。不猜精确数，只分档。
+- cross_domain：是否跨技术领域（前后端/多模块）或改公共契约（新增接口/改数据结构/改公共依赖）。
+  true=是；false=否。
+- suggest_track：interactive / delivery（LLM 主观参考，不作 track 依据；track 由代码规则定）。
 - expected_scope：预估影响的业务范围与功能模块（仅调度参考）。
-- subtasks：仅当 suggest_track=delivery 时，按【技术领域 + 业务功能单元】拆分；每项：
+- subtasks：按【技术领域 + 业务功能单元】拆分。拆分规则（A 方案）：
+  当 change_type=feature 或 file_count_bucket=6+ 或 cross_domain=true 时**必须拆 subtasks**；
+  否则不拆（subtasks 为空数组）。粒度软约束：每 subtask 聚焦 1-5 文件，整批 2-8 个
+  （太细膨胀队列+deps 网，太粗失聚拢；超范围按真实硬依赖切分）。每项：
   - id：本批内唯一短 id（"t1","t2",...），供 deps 引用。
-  - domain：技术领域（frontend/backend/database/docs/...）。
+  - domain：技术领域枚举 frontend/backend/database/docs/infra/test，必选其一。
+  - module_id：业务大模块的英文 slug（小写+下划线，如 payment/user_auth/session）。
+    同一需求内同一模块用同一 slug；一个模块可含多领域（前端+后端+数据库）。
   - summary：该子任务核心目标。
   - acceptance：该子任务可验证的验收要点。
   - intended_files：预期改动的文件路径列表（不确定可留空）。
   - deps：依赖的同批 subtask id 列表（必须先完成的；无依赖留空数组）。
-  单模块任务留空数组。
+  每项标 module_id（业务模块）+ domain（技术领域）；同 (module_id, domain) 可多 subtask。
+  执行器按 (module_id, domain) 聚合领取以减上下文噪音，故 module_id/domain 须规范一致。
 
 ## 纪律
 - 严格锚定原始需求，所有验收项可追溯到需求原文。
@@ -104,7 +136,9 @@ REQUIREMENT_PARSER_PROMPT = """\
 - 依赖按真实硬依赖填（"先建表再写 API"），软偏好不填。
 - 仅做语义层面的歧义补全，遵循项目通用规范与行业默认最佳实践；补全决策在 task_summary
   或 acceptance_criteria 中体现可追溯性。
-- 模糊时 suggest_track 取 interactive（开销小，宁可走交互轨）。
+- 模糊时取保守（change_type 倾向 feature、file_count_bucket 倾向 6+、cross_domain 倾向 true、
+  risk_level 倾向 high，即倾向 delivery）。
+- track 由代码规则消费 change_type/file_count_bucket/cross_domain 判定，suggest_track 仅供参考。
 - 不指导实现方案、不指定技术栈、不替模型做执行层决策。
 """
 
@@ -222,49 +256,64 @@ class Governor:
         acc = "\n".join(f"- {a}" for a in subtask.get("acceptance", []))
         files = subtask.get("intended_files") or []
         files_line = f"\n预期文件: {', '.join(files)}" if files else ""
+        module_id = subtask.get("module_id", "default")
+        domain = subtask.get("domain", "default")
         return (
             f"# 任务: {subtask['summary']}\n"
             f"## 需求背景\n{spec.get('task_summary', '')}\n"
+            f"## 模块/领域\n{module_id}/{domain}\n"
             f"## 验收标准\n{acc}{files_line}"
         )
 
     async def _parse_requirement(
         self, text: str, *, context_continuation: bool
     ) -> dict:
-        """独立 stateless 需求解析。query() 顶层 API + output_format，不新建 BaseAgentSession。
+        """独立 stateless 需求解析。结构化输出(SDK 强制合规 JSON)。
 
-        - tools=[]（纯解析，不调工具，不写代码）
-        - max_turns=3
-        - 不挂 session_store（一次性，用完即弃）
-        - 不挂 can_use_tool（判定无工具调用）
-        返回 ResultMessage.structured_output（dict）。未返回 → RuntimeError（被 handle_user_input 捕获降级）。
+        - tools=[](禁内置工具)+ strict_mcp_config=True(禁外部 MCP server,
+          只用传入的 mcp_servers=空)。双隔离防模型看到 MCP 工具(如 codegraph)
+          在复杂需求时调用 -> 耗尽 max_turns(error_max_turns 降级根因)。
+          ⚠️ 不用 setting_sources=[]:它会连带禁 settings.json 的 model/env 块,
+          导致 CLI 丢模型配置回退到不可用代理模型(success error)。
+        - output_format=json_schema:SDK 结构化通道强制合规 JSON(字段转义+enum),
+          比文本自解析可靠(glm-5.2 文本输出常漏转义内引号 -> json.loads 失败)。
+        - max_turns=2(结构化输出实测需 2 turn,留余量防 error_max_turns)。
+        - 不挂 session_store(一次性,用完即弃)/ can_use_tool(判定无工具调用)。
+        读 ResultMessage.structured_output(dict)。None -> RuntimeError(降级交互轨)。
         """
         opts = ClaudeAgentOptions(
             system_prompt=REQUIREMENT_PARSER_PROMPT,
             tools=[],
-            output_format={"type": "json_schema", "schema": TASK_SPEC_SCHEMA},
             cwd=self.project_dir,
             model=self.model,
-            max_turns=3,
+            max_turns=2,
+            strict_mcp_config=True,  # 禁外部 MCP(codegraph 等),保留 model/env
+            output_format={"type": "json_schema", "schema": TASK_SPEC_SCHEMA},
         )
         prefix = "接续修改" if context_continuation else "全新任务"
         prompt = f"[{prefix}] {text}"
         async for msg in query(prompt=prompt, options=opts):
-            if isinstance(msg, ResultMessage) and msg.structured_output:
-                return msg.structured_output
+            if isinstance(msg, ResultMessage):
+                if msg.structured_output:
+                    return msg.structured_output
         raise RuntimeError("需求解析未返回结构化结果")
 
-    def _decide_track(self, spec: dict, *, context_continuation: bool) -> str:
-        """双轨调度判定 —— 纯规则，不调 LLM。
+    def _decide_track(self, spec: dict) -> str:
+        """双轨调度判定 -- 纯规则消费 LLM 客观字段，不调 LLM。
 
-        规则（对齐 governance_plan §4.3）：
-        - spec.subtasks 非空 → delivery（多模块）
-        - 否则取 spec.suggest_track（缺省 interactive）
-        context_continuation 当前仅记录，Step 6 接入 REPL 后用于「接续 → 升级 delivery」判定。
+        risk_level=high -> delivery（高风险必走队列，下游可验收/隔离；本层拦死，常驻不直写）
+        交互轨(全满足且非 high)：change_type=patch AND file_count_bucket=1-5 AND cross_domain=False
+        任一不满足或缺省 -> delivery（保守）
+        context_continuation 不再影响 track（续聊也可能来复杂需求该走 delivery），
+        仅作 _parse_requirement 的 prompt 前缀([接续修改]/[全新任务])。
         """
-        if spec.get("subtasks"):
+        if spec.get("risk_level") == "high":
             return "delivery"
-        return spec.get("suggest_track", "interactive")
+        if (spec.get("change_type") == "patch"
+                and spec.get("file_count_bucket") == "1-5"
+                and spec.get("cross_domain") is False):
+            return "interactive"
+        return "delivery"
 
     async def handle_user_input(
         self, text: str, *, forced_track: str | None = None
@@ -299,7 +348,7 @@ class Governor:
                 async for event in self._resident.send(text):
                     yield event
                 return
-            track = self._decide_track(spec, context_continuation=context_continuation)
+            track = self._decide_track(spec)
 
         yield _build_message(
             f"🔀 调度: {track}（{spec.get('task_summary', '')[:40]}）"
@@ -341,6 +390,7 @@ class Governor:
                 "id": id_map[st["id"]],
                 "req_id": req_id,
                 "domain": st.get("domain", "default"),
+                "module_id": st.get("module_id", "default"),
                 "prompt": self._build_task_prompt(st, spec),
                 "intended_files": st.get("intended_files") or [],
                 "deps": [id_map[d] for d in st.get("deps", []) if d in id_map],

@@ -1,8 +1,8 @@
 """Governor 单元测试 — Phase 2 Step 3
 
 覆盖：
-- _parse_requirement: stateless query() 需求解析（structured_output / RuntimeError）
-- _decide_track: 双轨调度纯规则判定（subtasks / suggest_track / 缺省）
+- _parse_requirement: stateless query() 需求解析（结构化输出 / RuntimeError）
+- _decide_track: 双轨调度纯规则判定（risk_level / change_type / file_count_bucket / cross_domain / 缺省）
 - handle_user_input: 自动判定 / forced_track / 异常降级
 - _build_resident_session: 执行层配置接线（可写 / 不挂 can_use_tool）
 - session property / rebuild
@@ -23,7 +23,7 @@ from claude_agent_sdk import ResultMessage, SessionStore
 
 from harness_agent.chat.events import EventType, text_event
 from harness_agent.core import architect
-from harness_agent.core.architect import EXECUTOR_PROMPT, Governor
+from harness_agent.core.architect import EXECUTOR_PROMPT, Governor, TASK_SPEC_SCHEMA
 from harness_agent.core.base_session import BaseAgentSession
 from harness_agent.core.task_queue_adapter import TaskQueueAdapter
 
@@ -31,13 +31,14 @@ from harness_agent.core.task_queue_adapter import TaskQueueAdapter
 # ── 辅助 ──────────────────────────────────────────────
 
 
-def make_fake_result_msg(structured_output):
+def make_fake_result_msg(structured=None):
     """构造能通过 isinstance(msg, ResultMessage) 检查的 fake 消息。
 
     MagicMock(spec=ResultMessage) —— spec 让 isinstance 返回 True。
+    structured: 填 msg.structured_output(结构化输出 dict;None 表示无)。
     """
     msg = MagicMock(spec=ResultMessage)
-    msg.structured_output = structured_output
+    msg.structured_output = structured
     return msg
 
 
@@ -76,23 +77,23 @@ def _text_events_containing(events, keyword):
 
 @pytest.fixture
 def patch_query(monkeypatch):
-    """返回 setter：传 structured_output，patch architect.query 返回它。
+    """返回 setter:传 spec dict,patch architect.query 返回它。
 
-    用法：
-        patch_query({"task_summary": "...", "acceptance_criteria": [], ...})
+    用法:
+        patch_query({"task_summary":"...","acceptance_criteria":[],...})
         spec = await governor._parse_requirement("x", context_continuation=False)
     """
 
-    def _set(structured_output):
+    def _set(structured):
         async def fake_query(*, prompt, options=None):
-            yield make_fake_result_msg(structured_output)
+            yield make_fake_result_msg(structured)
 
         monkeypatch.setattr(architect, "query", fake_query)
 
     return _set
 
 
-# ── 1. _parse_requirement 返回 structured_output ──
+# ── 1. _parse_requirement 返回解析结果 ──
 
 
 async def test_parse_requirement_returns_spec(patch_query):
@@ -111,52 +112,91 @@ async def test_parse_requirement_returns_spec(patch_query):
     assert spec == expected
 
 
-# ── 2. _parse_requirement 无 structured_output → RuntimeError ──
+# ── 2. _parse_requirement 无 JSON 文本 → RuntimeError ──
 
 
 async def test_parse_requirement_no_output_raises(patch_query):
-    """query 返回 structured_output=None → _parse_requirement raise RuntimeError"""
+    """query 返回无 structured_output -> _parse_requirement raise RuntimeError"""
     governor = make_governor()
-    patch_query(None)
+    patch_query(None)  # 无结构化输出
 
     with pytest.raises(RuntimeError, match="未返回结构化结果"):
         await governor._parse_requirement("x", context_continuation=False)
 
 
-# ── 3. _decide_track subtasks 非空 → delivery ──
+
+# ── 3. _decide_track 全满足(patch+1-3+cross_domain=False) -> interactive ──
 
 
-def test_decide_track_subtasks_delivery():
-    """spec 有 subtasks → delivery（多模块）"""
+def test_decide_track_all_patch_interactive():
+    """spec 全满足交互轨条件 -> interactive"""
     governor = make_governor()
-    spec = {"suggest_track": "interactive", "subtasks": [{"summary": "a", "acceptance": []}]}
+    spec = {
+        "change_type": "patch",
+        "file_count_bucket": "1-5",
+        "cross_domain": False,
+    }
+    assert governor._decide_track(spec) == "interactive"
 
-    assert governor._decide_track(spec, context_continuation=False) == "delivery"
+
+# ── 4. _decide_track 任一不满足 -> delivery ──
 
 
-# ── 4. _decide_track 无 subtasks → 跟随 suggest_track ──
-
-
-def test_decide_track_no_subtasks_follow_suggest():
-    """spec 无 subtasks → 取 suggest_track"""
+def test_decide_track_feature_delivery():
+    """change_type=feature -> delivery"""
     governor = make_governor()
-    assert (
-        governor._decide_track({"suggest_track": "delivery"}, context_continuation=False)
-        == "delivery"
-    )
-    assert (
-        governor._decide_track({"suggest_track": "interactive"}, context_continuation=False)
-        == "interactive"
-    )
+    spec = {
+        "change_type": "feature",
+        "file_count_bucket": "1-5",
+        "cross_domain": False,
+    }
+    assert governor._decide_track(spec) == "delivery"
 
 
-# ── 5. _decide_track 无 subtasks 无 suggest_track → interactive ──
-
-
-def test_decide_track_default_interactive():
-    """spec 无 subtasks 无 suggest_track → interactive（缺省）"""
+def test_decide_track_many_files_delivery():
+    """file_count_bucket=6+ -> delivery"""
     governor = make_governor()
-    assert governor._decide_track({}, context_continuation=False) == "interactive"
+    spec = {
+        "change_type": "patch",
+        "file_count_bucket": "6+",
+        "cross_domain": False,
+    }
+    assert governor._decide_track(spec) == "delivery"
+
+
+def test_decide_track_cross_domain_delivery():
+    """cross_domain=True -> delivery"""
+    governor = make_governor()
+    spec = {
+        "change_type": "patch",
+        "file_count_bucket": "1-5",
+        "cross_domain": True,
+    }
+    assert governor._decide_track(spec) == "delivery"
+
+
+# ── 5b. _decide_track risk_level=high 即使三字段全中 -> delivery ──
+
+
+def test_decide_track_risk_high_delivery():
+    """risk_level=high 即使三字段全中(patch+1-5+单领域) -> delivery（高风险本层拦死）"""
+    governor = make_governor()
+    spec = {
+        "change_type": "patch",
+        "file_count_bucket": "1-5",
+        "cross_domain": False,
+        "risk_level": "high",
+    }
+    assert governor._decide_track(spec) == "delivery"
+
+
+# ── 5. _decide_track 字段缺省 -> delivery ──
+
+
+def test_decide_track_missing_fields_delivery():
+    """字段缺省 -> delivery（保守）"""
+    governor = make_governor()
+    assert governor._decide_track({}) == "delivery"
 
 
 # ── 6. handle_user_input 自动交互轨 ──
@@ -171,6 +211,9 @@ async def test_handle_interactive_auto():
             "acceptance_criteria": [],
             "risk_level": "low",
             "suggest_track": "interactive",
+            "change_type": "patch",
+            "file_count_bucket": "1-5",
+            "cross_domain": False,
         }
     )
     fake_ev = text_event("fake-exec")
@@ -202,10 +245,14 @@ async def test_handle_delivery_placeholder():
             "acceptance_criteria": ["支付链路全通"],
             "risk_level": "high",
             "suggest_track": "delivery",
+            "change_type": "feature",
+            "file_count_bucket": "4+",
+            "cross_domain": True,
             "subtasks": [
                 {
                     "id": "t1",
                     "domain": "backend",
+                    "module_id": "payment",
                     "summary": "建表",
                     "acceptance": ["表存在"],
                     "intended_files": ["db.sql"],
@@ -214,6 +261,7 @@ async def test_handle_delivery_placeholder():
                 {
                     "id": "t2",
                     "domain": "frontend",
+                    "module_id": "payment",
                     "summary": "支付页",
                     "acceptance": ["页面渲染"],
                     "intended_files": ["pay.vue"],
@@ -238,9 +286,11 @@ async def test_handle_delivery_placeholder():
     # 全 id = {req_id}-{short_id}
     t1 = seeded[0]
     assert t1["id"].endswith("-t1")
+    assert t1["module_id"] == "payment"
     # deps 短 id -> 全 id 映射：t2.deps == [t1 全 id]
     t2 = seeded[1]
     assert t2["deps"] == [t1["id"]]
+    assert t2["module_id"] == "payment"
 
 
 # ── 8. forced_track="interactive" 跳过解析 ──
@@ -349,17 +399,12 @@ async def test_rebuild_creates_new_session(monkeypatch):
 
 async def test_parse_requirement_uses_query_top_level_api(monkeypatch):
     """_parse_requirement 调 architect.query，关键字参数 prompt/options，
-    options.tools=[] / output_format=json_schema / max_turns=3"""
+    options.tools=[] / strict_mcp_config=True / output_format=json_schema / max_turns=2"""
     governor = make_governor()
 
     async def fake_query(*, prompt, options=None):
         yield make_fake_result_msg(
-            {
-                "task_summary": "s",
-                "acceptance_criteria": [],
-                "risk_level": "low",
-                "suggest_track": "interactive",
-            }
+            {"task_summary": "s", "acceptance_criteria": [], "risk_level": "low", "suggest_track": "interactive"}
         )
 
     mock_query = MagicMock(side_effect=fake_query)
@@ -372,9 +417,9 @@ async def test_parse_requirement_uses_query_top_level_api(monkeypatch):
     assert "x" in kwargs["prompt"]  # prompt 含原始 text（带 [全新任务] 前缀）
     opts = kwargs["options"]
     assert opts.tools == []
-    assert opts.output_format is not None
-    assert opts.output_format["type"] == "json_schema"
-    assert opts.max_turns == 3
+    assert opts.output_format == {"type": "json_schema", "schema": TASK_SPEC_SCHEMA}
+    assert opts.strict_mcp_config is True  # 禁外部 MCP,防工具注入耗尽 turn
+    assert opts.max_turns == 2
 
 
 # ── 15. _parse_requirement 传递 context_continuation 前缀 ──
@@ -389,12 +434,7 @@ async def test_parse_requirement_context_continuation_prefix(monkeypatch):
     async def fake_query(*, prompt, options=None):
         captured_prompts.append(prompt)
         yield make_fake_result_msg(
-            {
-                "task_summary": "s",
-                "acceptance_criteria": [],
-                "risk_level": "low",
-                "suggest_track": "interactive",
-            }
+            {"task_summary": "s", "acceptance_criteria": [], "risk_level": "low", "suggest_track": "interactive"}
         )
 
     monkeypatch.setattr(architect, "query", fake_query)
@@ -447,7 +487,7 @@ async def test_run_delivery_no_queue_degrades(monkeypatch):
         "task_summary": "重构支付",
         "suggest_track": "delivery",
         "subtasks": [
-            {"id": "t1", "domain": "backend", "summary": "建表", "acceptance": ["表存在"]}
+            {"id": "t1", "domain": "backend", "module_id": "core", "summary": "建表", "acceptance": ["表存在"]}
         ],
     }
     events = await collect(governor._run_delivery(spec))
@@ -477,6 +517,7 @@ async def test_run_delivery_returns_req_id():
             {
                 "id": "t1",
                 "domain": "backend",
+                "module_id": "payment",
                 "summary": "建表",
                 "acceptance": ["表存在"],
                 "intended_files": ["db.sql"],
@@ -485,6 +526,7 @@ async def test_run_delivery_returns_req_id():
             {
                 "id": "t2",
                 "domain": "frontend",
+                "module_id": "payment",
                 "summary": "支付页",
                 "acceptance": ["页面渲染"],
                 "intended_files": ["pay.vue"],
@@ -505,17 +547,19 @@ async def test_run_delivery_returns_req_id():
     for t in seeded:
         assert t["id"].startswith(f"{req_id}-")
         assert t["req_id"] == req_id
+        assert t["module_id"] == "payment"
 
 
 # ── 19. _build_task_prompt 自包含 ──
 
 
 def test_build_task_prompt_self_contained():
-    """_build_task_prompt: 输出含 summary + 每条 acceptance + intended_files，
-    不含上下文延续依赖词"""
+    """_build_task_prompt: 输出含 summary + 每条 acceptance + intended_files +
+    模块/领域行，不含上下文延续依赖词"""
     subtask = {
         "id": "t1",
         "domain": "backend",
+        "module_id": "payment",
         "summary": "建支付表",
         "acceptance": ["表存在", "含金额字段"],
         "intended_files": ["db.sql", "migrate.py"],
@@ -535,6 +579,7 @@ def test_build_task_prompt_self_contained():
     assert "db.sql" in prompt
     assert "migrate.py" in prompt
     assert "重构支付链路" in prompt
+    assert "payment/backend" in prompt
     assert "context_continuation" not in prompt
     assert "上文" not in prompt
 
