@@ -21,6 +21,7 @@ _STUB_STORE = '''\
 """Minimal store stub for testing TaskQueueAdapter."""
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 
 def init_db(db_path):
@@ -81,6 +82,55 @@ def is_req_done(req_id, db_path=None):
             (req_id,),
         ).fetchone()
         return row is None
+    finally:
+        conn.close()
+
+
+def reclaim_stale(lease_seconds, db_path=None):
+    init_db(db_path)
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=lease_seconds)).isoformat()
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE tasks SET status='pending', claimed_at=NULL "
+            "WHERE status='claimed' AND claimed_at < ?",
+            (cutoff,),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def has_pending(module_id=None, domain=None, db_path=None):
+    init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        where = "WHERE status='pending'"
+        params = []
+        if module_id is not None:
+            where += " AND module_id=?"
+            params.append(module_id)
+        if domain is not None:
+            where += " AND domain=?"
+            params.append(domain)
+        row = conn.execute("SELECT 1 FROM tasks " + where + " LIMIT 1", params).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def reset_slot_claimed(module_id, domain, db_path=None):
+    init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE tasks SET status='pending', claimed_at=NULL "
+            "WHERE module_id=? AND domain=? AND status='claimed'",
+            (module_id, domain),
+        )
+        conn.commit()
+        return cur.rowcount
     finally:
         conn.close()
 '''
@@ -218,3 +268,142 @@ def test_is_req_done_all_done_true(stub_store_dir, tmp_path):
     finally:
         conn.close()
     assert adapter.is_req_done("r1") is True
+
+
+# ── reclaim_stale ─────────────────────────────────────
+
+
+def test_reclaim_stale_forwards_db_path(stub_store_dir, tmp_path):
+    db_path = str(tmp_path / "db.sqlite")
+    adapter = TaskQueueAdapter(stub_store_dir, db_path)
+
+    calls: list[str | None] = []
+
+    class FakeStore:
+        def reclaim_stale(self, lease_seconds, db_path=None):
+            calls.append(db_path)
+            return 0
+
+    # 替换为 fake store，验证 reclaim_stale 把 self.task_db_path 透传给 store.reclaim_stale
+    adapter._store = FakeStore()  # type: ignore[assignment]
+    adapter.reclaim_stale(60)
+    assert calls == [db_path]
+    assert calls[0] == adapter.task_db_path
+
+
+def test_reclaim_stale_returns_count(stub_store_dir, tmp_path):
+    """超时 claimed 被回收 -> 返回回收行数；未超时不动。"""
+    db_path = str(tmp_path / "db.sqlite")
+    adapter = TaskQueueAdapter(stub_store_dir, db_path)
+    adapter.seed(_make_tasks("r1"))
+
+    # 标 2 个 claimed：一个超时（旧时间）、一个未超时（现在）
+    from datetime import datetime, timezone
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET status='claimed', claimed_at='2020-01-01T00:00:00+00:00' "
+            "WHERE id IN ('r1-t1','r1-t2')"
+        )
+        conn.execute(
+            "UPDATE tasks SET status='claimed', claimed_at=? WHERE id='r1-t3'",
+            (now_iso,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # lease=60s：只有 2020 那批超时 -> 回收 2 行
+    assert adapter.reclaim_stale(60) == 2
+
+    rows = {r["id"]: r["status"] for r in adapter.list_by_req("r1")}
+    assert rows["r1-t1"] == "pending"
+    assert rows["r1-t2"] == "pending"
+    assert rows["r1-t3"] == "claimed"
+
+
+# ── reset_slot_claimed ─────────────────────────────────
+
+
+def test_reset_slot_claimed_forwards_db_path(stub_store_dir, tmp_path):
+    db_path = str(tmp_path / "db.sqlite")
+    adapter = TaskQueueAdapter(stub_store_dir, db_path)
+
+    calls: list[str | None] = []
+
+    class FakeStore:
+        def reset_slot_claimed(self, module_id, domain, db_path=None):
+            calls.append(db_path)
+            return 0
+
+    adapter._store = FakeStore()  # type: ignore[assignment]
+    adapter.reset_slot_claimed("m1", "d1")
+    assert calls == [db_path]
+    assert calls[0] == adapter.task_db_path
+
+
+def test_reset_slot_claimed_returns_count(stub_store_dir, tmp_path):
+    """同槽 claimed 被回收 -> 返回行数；另槽 claimed 不受影响。"""
+    db_path = str(tmp_path / "db.sqlite")
+    adapter = TaskQueueAdapter(stub_store_dir, db_path)
+    adapter.seed(
+        [
+            {"id": "a1", "req_id": "r1", "domain": "d1", "module_id": "m1", "prompt": "p", "intended_files": None, "deps": []},
+            {"id": "a2", "req_id": "r1", "domain": "d1", "module_id": "m1", "prompt": "p", "intended_files": None, "deps": []},
+            {"id": "b1", "req_id": "r1", "domain": "d1", "module_id": "m2", "prompt": "p", "intended_files": None, "deps": []},
+        ]
+    )
+    # 标 m1 槽 1 个 claimed + m2 槽 1 个 claimed
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("UPDATE tasks SET status='claimed', claimed_at='2024-01-01T00:00:00+00:00' WHERE id='a1'")
+        conn.execute("UPDATE tasks SET status='claimed', claimed_at='2024-01-01T00:00:00+00:00' WHERE id='b1'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 只回收 m1 槽 -> 1 行
+    assert adapter.reset_slot_claimed("m1", "d1") == 1
+    rows = {r["id"]: r["status"] for r in adapter.list_by_req("r1")}
+    assert rows["a1"] == "pending"
+    assert rows["a2"] == "pending"
+    # m2 槽 claimed 不受影响
+    assert rows["b1"] == "claimed"
+
+    # 再 reset 空 claimed -> 0
+    assert adapter.reset_slot_claimed("m1", "d1") == 0
+
+
+# ── has_pending ────────────────────────────────────────
+
+
+def test_has_pending_forwards_db_path(stub_store_dir, tmp_path):
+    db_path = str(tmp_path / "db.sqlite")
+    adapter = TaskQueueAdapter(stub_store_dir, db_path)
+
+    calls: list[str | None] = []
+
+    class FakeStore:
+        def has_pending(self, module_id=None, domain=None, db_path=None):
+            calls.append(db_path)
+            return False
+
+    adapter._store = FakeStore()  # type: ignore[assignment]
+    adapter.has_pending("m1", "d1")
+    assert calls == [db_path]
+    assert calls[0] == adapter.task_db_path
+
+
+def test_has_pending_affinity(stub_store_dir, tmp_path):
+    """指定槽有 pending -> True；空槽 -> False。"""
+    db_path = str(tmp_path / "db.sqlite")
+    adapter = TaskQueueAdapter(stub_store_dir, db_path)
+    adapter.seed(
+        [
+            {"id": "a1", "req_id": "r1", "domain": "d1", "module_id": "m1", "prompt": "p", "intended_files": None, "deps": []},
+        ]
+    )
+    assert adapter.has_pending("m1", "d1") is True
+    assert adapter.has_pending("m2", "d1") is False

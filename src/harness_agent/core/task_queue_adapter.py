@@ -55,3 +55,19 @@ class TaskQueueAdapter:
     def is_req_done(self, req_id: str) -> bool:
         """需求完成判定：req_id 下无 pending/claimed 任务（全 done）-> True。"""
         return self._store.is_req_done(req_id, db_path=self.task_db_path)
+
+    def reclaim_stale(self, lease_seconds: int) -> int:
+        """回收超时 claimed 任务 -> pending（L0 E 阶段轮询用）。
+        返回回收行数。
+        """
+        return self._store.reclaim_stale(lease_seconds, db_path=self.task_db_path)
+
+    def reset_slot_claimed(self, module_id: str, domain: str) -> int:
+        """重置指定槽 (module_id, domain) 下 claimed 任务 -> pending（L0 执行器退出后续 spawn 前调）。
+        返回回收行数。
+        """
+        return self._store.reset_slot_claimed(module_id, domain, db_path=self.task_db_path)
+
+    def has_pending(self, module_id: str, domain: str) -> bool:
+        """指定槽是否有 pending 任务。"""
+        return self._store.has_pending(module_id=module_id, domain=domain, db_path=self.task_db_path)

@@ -93,6 +93,15 @@ def patch_query(monkeypatch):
     return _set
 
 
+@pytest.fixture
+def stub_executors(monkeypatch):
+    """stub _run_executors 为空 async gen(测 seed/降级/拦截时不真 spawn claude/git)。"""
+    async def _stub(self, tasks, req_id):
+        if False:
+            yield  # 标记 async generator,实际空跑
+    monkeypatch.setattr(Governor, "_run_executors", _stub)
+
+
 # ── 1. _parse_requirement 返回解析结果 ──
 
 
@@ -230,7 +239,7 @@ async def test_handle_interactive_auto():
 # ── 7. handle_user_input 交付轨灌队列 ──
 
 
-async def test_handle_delivery_placeholder():
+async def test_handle_delivery_placeholder(stub_executors):
     """mock 解析→delivery+subtasks + mock task_queue → events 含 req_id + seed 被调"""
     task_queue = MagicMock(spec=TaskQueueAdapter)
     task_queue.seed.return_value = 2
@@ -296,7 +305,7 @@ async def test_handle_delivery_placeholder():
 # ── 7b. high+patch+1-5+单领域+subtasks 非空 -> delivery 灌队列不降级 ──
 
 
-async def test_handle_high_patch_no_degrade():
+async def test_handle_high_patch_no_degrade(stub_executors):
     """high 风险小补丁(patch+1-5+单领域)但 risk_level=high -> delivery；
     subtasks 非空 -> 灌队列不降级常驻（risk_level 拦截不被降级路径架空）"""
     task_queue = MagicMock(spec=TaskQueueAdapter)
@@ -549,7 +558,7 @@ async def test_run_delivery_no_queue_degrades(monkeypatch):
 # ── 18. _run_delivery 返回 req_id（8 hex + 一致性）──
 
 
-async def test_run_delivery_returns_req_id():
+async def test_run_delivery_returns_req_id(stub_executors):
     """_run_delivery: 有 subtasks+有 queue -> yield 行含 req_id（8 hex），
     tasks 植入的 id 形如 {req_id}-{short_id}，req_id 字段一致"""
     task_queue = MagicMock(spec=TaskQueueAdapter)
@@ -566,7 +575,7 @@ async def test_run_delivery_returns_req_id():
             {
                 "id": "t1",
                 "domain": "backend",
-                "module_id": "payment",
+                "module_id": "Pay-Ment",
                 "summary": "建表",
                 "acceptance": ["表存在"],
                 "intended_files": ["db.sql"],
@@ -575,7 +584,7 @@ async def test_run_delivery_returns_req_id():
             {
                 "id": "t2",
                 "domain": "frontend",
-                "module_id": "payment",
+                "module_id": "Pay-Ment",
                 "summary": "支付页",
                 "acceptance": ["页面渲染"],
                 "intended_files": ["pay.vue"],
@@ -596,7 +605,7 @@ async def test_run_delivery_returns_req_id():
     for t in seeded:
         assert t["id"].startswith(f"{req_id}-")
         assert t["req_id"] == req_id
-        assert t["module_id"] == "payment"
+        assert t["module_id"] == "pay_ment"
 
 
 # ── 18b. high+空 subtasks -> 拦截不降级常驻 ──
@@ -710,6 +719,136 @@ def test_build_task_prompt_self_contained():
     assert "payment/backend" in prompt
     assert "context_continuation" not in prompt
     assert "上文" not in prompt
+
+
+# ── 20. _run_executors 编排(spawn+续跑+merge+验证)──
+
+
+def _make_governor_with_queue(project_dir: str):
+    task_queue = MagicMock(spec=TaskQueueAdapter)
+    task_queue.task_db_path = "/tmp/db"
+    task_queue.reset_slot_claimed.return_value = 0
+    governor = Governor(
+        project_dir=project_dir,
+        session_store=MagicMock(spec=SessionStore),
+        task_queue=task_queue,
+    )
+    return governor, task_queue
+
+
+@pytest.fixture
+def mock_exec_env(monkeypatch, tmp_path):
+    """mock executor/worktree 模块函数,返 proc 供测试配 wait side_effect。"""
+    proc = MagicMock()
+    proc.wait = AsyncMock(return_value=0)
+    monkeypatch.setattr(architect, "create_delivery_worktree", MagicMock(return_value=str(tmp_path / "wt")))
+    monkeypatch.setattr(architect, "write_mcp_config", MagicMock())
+    monkeypatch.setattr(architect, "spawn_executor", AsyncMock(return_value=proc))
+    monkeypatch.setattr(architect, "commit_worktree", MagicMock(return_value=True))
+    monkeypatch.setattr(architect, "merge_worktree_branch", MagicMock(return_value=(True, "")))
+    monkeypatch.setattr(architect, "remove_worktree", MagicMock())
+    return proc
+
+
+def _texts(events):
+    return " ".join(e.data.get("text", "") for e in events if e.type == EventType.TEXT)
+
+
+async def test_run_executors_done(mock_exec_env, tmp_path):
+    """单槽:has_pending -> spawn exit 0 -> is_req_done -> merge+验证通过 -> 完成+清理。"""
+    governor, task_queue = _make_governor_with_queue(str(tmp_path))
+    task_queue.has_pending.return_value = True
+    task_queue.is_req_done.return_value = True
+    governor._run_validation = AsyncMock(return_value=(True, ""))
+    tasks = [{"id": "r1-t1", "req_id": "r1", "domain": "backend",
+              "module_id": "payment", "prompt": "", "intended_files": [], "deps": []}]
+    events = await collect(governor._run_executors(tasks, "r1"))
+    txt = _texts(events)
+    assert "执行器启动" in txt
+    assert "交付完成" in txt
+    architect.remove_worktree.assert_called_once()
+
+
+async def test_run_executors_vacuum_no_spawn(mock_exec_env, tmp_path):
+    """坑1:has_pending=False(真空) -> 不 spawn,跳过该槽。"""
+    governor, task_queue = _make_governor_with_queue(str(tmp_path))
+    task_queue.has_pending.return_value = False
+    task_queue.is_req_done.return_value = True
+    governor._run_validation = AsyncMock(return_value=(True, ""))
+    tasks = [{"id": "r1-t1", "req_id": "r1", "domain": "backend",
+              "module_id": "payment", "prompt": "", "intended_files": [], "deps": []}]
+    events = await collect(governor._run_executors(tasks, "r1"))
+    txt = _texts(events)
+    assert "执行器启动" not in txt
+    architect.spawn_executor.assert_not_called()
+
+
+async def test_run_executors_retry_then_done(mock_exec_env, tmp_path):
+    """坑2续跑:exit 0 + is_req_done=False + has_pending=True -> 重 spawn 到 done。"""
+    governor, task_queue = _make_governor_with_queue(str(tmp_path))
+    task_queue.has_pending.return_value = True
+    task_queue.is_req_done.side_effect = [False, True, True]
+    mock_exec_env.wait = AsyncMock(side_effect=[0, 0])
+    governor._run_validation = AsyncMock(return_value=(True, ""))
+    tasks = [{"id": "r1-t1", "req_id": "r1", "domain": "backend",
+              "module_id": "payment", "prompt": "", "intended_files": [], "deps": []}]
+    events = await collect(governor._run_executors(tasks, "r1"))
+    txt = _texts(events)
+    assert "attempt 1/3" in txt
+    assert "attempt 2/3" in txt
+    assert "交付完成" in txt
+    assert architect.spawn_executor.await_count == 2
+
+
+async def test_run_executors_merge_conflict(mock_exec_env, tmp_path):
+    """merge 冲突 -> yield 冲突 + 不清理(留 worktree 人工解)。"""
+    governor, task_queue = _make_governor_with_queue(str(tmp_path))
+    task_queue.has_pending.return_value = True
+    task_queue.is_req_done.return_value = True
+    architect.merge_worktree_branch.return_value = (False, "CONFLICT content")
+    governor._run_validation = AsyncMock(return_value=(True, ""))
+    tasks = [{"id": "r1-t1", "req_id": "r1", "domain": "backend",
+              "module_id": "payment", "prompt": "", "intended_files": [], "deps": []}]
+    events = await collect(governor._run_executors(tasks, "r1"))
+    txt = _texts(events)
+    assert "merge 冲突" in txt
+    architect.remove_worktree.assert_not_called()
+
+
+async def test_run_executors_validation_fail(mock_exec_env, tmp_path):
+    """验证失败(merge 前) -> req blocked + 保留 worktree 供排查(不 merge 不清理)。"""
+    governor, task_queue = _make_governor_with_queue(str(tmp_path))
+    task_queue.has_pending.return_value = True
+    task_queue.is_req_done.return_value = True
+    governor._run_validation = AsyncMock(return_value=(False, "pytest FAILED"))
+    tasks = [{"id": "r1-t1", "req_id": "r1", "domain": "backend",
+              "module_id": "payment", "prompt": "", "intended_files": [], "deps": []}]
+    events = await collect(governor._run_executors(tasks, "r1"))
+    txt = _texts(events)
+    assert "验证失败" in txt
+    assert "pytest FAILED" in txt
+    assert "worktree 保留" in txt
+    architect.remove_worktree.assert_not_called()
+
+
+async def test_run_executors_claimed_stuck_recovers(mock_exec_env, tmp_path):
+    """#1: exit 0 留 claimed(领了没 report) -> 退出后 reset 转 pending -> has_pending True 续 spawn 重领到 done。
+    旧 bug:判 exit_code==0 and not has_pending(has_pending 不含 claimed)误 break 丢 task。
+    """
+    governor, task_queue = _make_governor_with_queue(str(tmp_path))
+    task_queue.has_pending.return_value = True  # reset 后 A 回 pending,总 True
+    task_queue.is_req_done.side_effect = [False, True, True]
+    mock_exec_env.wait = AsyncMock(side_effect=[0, 0])
+    governor._run_validation = AsyncMock(return_value=(True, ""))
+    tasks = [{"id": "r1-t1", "req_id": "r1", "domain": "backend",
+              "module_id": "payment", "prompt": "", "intended_files": [], "deps": []}]
+    events = await collect(governor._run_executors(tasks, "r1"))
+    txt = _texts(events)
+    assert "放弃" not in txt  # 不丢 task
+    assert "交付完成" in txt
+    assert architect.spawn_executor.await_count == 2
+    # 退出后 reset 被调(防回归旧 break 判定):reset 次数 >= spawn 次数
+    assert task_queue.reset_slot_claimed.call_count >= 2
 
 
 if __name__ == "__main__":

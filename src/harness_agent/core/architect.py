@@ -17,9 +17,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import shutil
+import subprocess
 import uuid
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
@@ -31,8 +35,21 @@ from claude_agent_sdk import (
 from harness_agent.chat.events import ChatEvent
 from harness_agent.chat.session_store import create_session_store
 from harness_agent.core.base_session import BaseAgentSession
+from harness_agent.core.executor import (
+    build_executor_args,
+    build_loop_prompt,
+    spawn_executor,
+    write_mcp_config,
+)
+from harness_agent.core.module_affinity import normalize_module_id, sanitize_module_id
 from harness_agent.core.task_queue_adapter import TaskQueueAdapter
 from harness_agent.core.utils import _build_message
+from harness_agent.core.worktree import (
+    commit_worktree,
+    create_delivery_worktree,
+    merge_worktree_branch,
+    remove_worktree,
+)
 
 # ── 常量 ──────────────────────────────────────────────────────────────
 
@@ -257,7 +274,7 @@ class Governor:
         acc = "\n".join(f"- {a}" for a in subtask.get("acceptance", []))
         files = subtask.get("intended_files") or []
         files_line = f"\n预期文件: {', '.join(files)}" if files else ""
-        module_id = subtask.get("module_id", "default")
+        module_id = normalize_module_id(subtask.get("module_id", "default"))
         domain = subtask.get("domain", "default")
         return (
             f"# 任务: {subtask['summary']}\n"
@@ -402,7 +419,7 @@ class Governor:
                 "id": id_map[st["id"]],
                 "req_id": req_id,
                 "domain": st.get("domain", "default"),
-                "module_id": st.get("module_id", "default"),
+                "module_id": normalize_module_id(st.get("module_id", "default")),
                 "prompt": self._build_task_prompt(st, spec),
                 "intended_files": st.get("intended_files") or [],
                 "deps": [id_map[d] for d in st.get("deps", []) if d in id_map],
@@ -425,3 +442,147 @@ class Governor:
         yield _build_message(
             f"🌐 交付轨 req_id={req_id}：已灌入 {n} 个任务到队列"
         )
+        async for event in self._run_executors(tasks, req_id):
+            yield event
+
+    async def _run_executors(
+        self, tasks: list[dict], req_id: str
+    ) -> AsyncIterator[ChatEvent]:
+        """交付轨执行器编排:槽分组 -> worktree -> 串行 spawn -> 验证(merge 前) -> merge。
+
+        都单策略:单 worktree + 串行执行器(按 (module_id,domain) 聚合,每槽一个)。
+        续跑:执行器退出但 is_req_done=False 时重 spawn(限 3 次)。
+          - 坑1(空转):续前判 has_pending,真空槽不续(is_req_done=False 是别槽的事)。
+          - 坑2(claimed 卡):续前 reset_slot_claimed 回收崩溃遗留 claimed。
+        判定靠退出码 + is_req_done,不解析 stream-json(stdout 重定向日志)。
+        """
+        if shutil.which("claude") is None:
+            yield _build_message(
+                "⚠️ claude CLI 未在 PATH 找到,无法 spawn 执行器,交付中止。"
+            )
+            return
+        slots = sorted({(t["module_id"], t["domain"]) for t in tasks})
+        try:
+            worktree_path = await asyncio.to_thread(
+                create_delivery_worktree, self.project_dir, req_id
+            )
+        except Exception as e:
+            yield _build_message(f"⚠️ worktree 创建失败({str(e)[:80]})，交付中止。")
+            return
+
+        svc_dir = os.environ.get("TASK_SERVICE_DIR", "")
+        logs_dir = Path(self.project_dir) / ".claude" / "delivery-logs" / req_id
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        mcp_config_path = str(logs_dir / "mcp-config.json")
+        write_mcp_config(
+            self._task_queue.task_db_path, svc_dir, mcp_config_path
+        )
+
+        all_done = False
+        for mod, dom in slots:
+            slot_count = sum(
+                1 for t in tasks if t["module_id"] == mod and t["domain"] == dom
+            )
+            max_turns = max(20, slot_count * 5)
+            retry = 0
+            while retry < 3:
+                # 坑2:回收该槽崩溃执行器遗留的 claimed(领了没 report)
+                self._task_queue.reset_slot_claimed(mod, dom)
+                # 坑1:真空槽不续(is_req_done=False 是别槽的事,等别槽)
+                if not self._task_queue.has_pending(mod, dom):
+                    break
+                log_path = str(
+                    logs_dir / f"executor-{mod}-{sanitize_module_id(dom)}-{retry}.log"
+                )
+                args = build_executor_args(
+                    build_loop_prompt(mod, dom), mcp_config_path, max_turns
+                )
+                yield _build_message(
+                    f"▶ 槽 {mod}/{dom} 执行器启动 "
+                    f"(attempt {retry + 1}/3, max_turns={max_turns})"
+                )
+                try:
+                    proc = await spawn_executor(args, worktree_path, log_path)
+                    exit_code = await proc.wait()
+                except Exception as e:
+                    yield _build_message(
+                        f"⚠️ 槽 {mod}/{dom} spawn 失败({str(e)[:80]})"
+                    )
+                    retry += 1
+                    continue
+                req_done = self._task_queue.is_req_done(req_id)
+                yield _build_message(
+                    f"◀ 槽 {mod}/{dom} 退出码 {exit_code}, req_done={req_done}"
+                )
+                if req_done:
+                    all_done = True
+                    break
+                # 退出后:回收当前轮遗留 claimed(领了没 report),再判该槽真空。
+                # has_pending 不含 claimed;不 reset 则 max_turns/崩溃留的 claimed 误判真空 -> break 丢 task。
+                self._task_queue.reset_slot_claimed(mod, dom)
+                if not self._task_queue.has_pending(mod, dom):
+                    break  # 真空才停;claimed 卡住则 has_pending True 续 spawn 重领
+                retry += 1
+            if all_done:
+                break
+            if retry >= 3:
+                yield _build_message(f"⚠️ 槽 {mod}/{dom} 续 3 次未完成，放弃")
+
+        # ── 收尾:验证(merge 前) -> merge ──
+        if not self._task_queue.is_req_done(req_id):
+            yield _build_message(f"⚠️ req_id={req_id} 未全完成，不 merge。")
+            await asyncio.to_thread(remove_worktree, self.project_dir, req_id)
+            return
+
+        await asyncio.to_thread(
+            commit_worktree, worktree_path, f"deliver {req_id}"
+        )
+
+        # 验证在 worktree 跑(merge 前):失败代码不进主分支,worktree 保留供排查
+        vok, vout = await self._run_validation(worktree_path)
+        if not vok:
+            yield _build_message(
+                f"⚠️ 验证失败,req blocked(worktree 保留: {worktree_path}):\n"
+                f"{vout[:400]}"
+            )
+            return
+
+        ok, conflict = await asyncio.to_thread(
+            merge_worktree_branch, self.project_dir, req_id
+        )
+        if not ok:
+            yield _build_message(
+                f"⚠️ merge 冲突,人工解(worktree 保留: {worktree_path}):\n"
+                f"{conflict[:400]}"
+            )
+            return
+        yield _build_message(f"✅ req_id={req_id} 交付完成(merge + 验证通过)")
+        await asyncio.to_thread(remove_worktree, self.project_dir, req_id)
+
+    async def _run_validation(self, repo_root: str) -> tuple[bool, str]:
+        """L0 merge 前验证(在 worktree 跑):pytest + ruff。命令不存在跳过;非 0 退出失败。
+
+        执行器无 Bash(--disallowed-tools Bash)跑不了测试,验证集中 L0 单点。
+        """
+        results: list[str] = []
+        for cmd in (["pytest", "-q"], ["ruff", "check", "."]):
+            try:
+                r = await asyncio.to_thread(
+                    subprocess.run,
+                    cmd,
+                    cwd=repo_root,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+            except FileNotFoundError:
+                continue
+            except subprocess.TimeoutExpired:
+                results.append(f"$ {' '.join(cmd)} TIMEOUT")
+                return False, "\n".join(results)
+            if r.returncode != 0:
+                results.append(
+                    f"$ {' '.join(cmd)}\n{r.stdout[-200:]}\n{r.stderr[-200:]}"
+                )
+                return False, "\n".join(results)
+        return True, ""
