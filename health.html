@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>健康检查状态页</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #f5f5f5;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .card {
+            background: #fff;
+            border-radius: 12px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.1);
+            padding: 40px;
+            max-width: 480px;
+            width: 90%;
+            text-align: center;
+        }
+        h1 { font-size: 1.5rem; color: #333; margin-bottom: 24px; }
+        #status-badge {
+            display: inline-block;
+            padding: 10px 28px;
+            border-radius: 999px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            margin-bottom: 24px;
+        }
+        .status-ok    { background: #e6f7ed; color: #1a7f3e; border: 1px solid #1a7f3e; }
+        .status-error { background: #fde8e8; color: #c0392b; border: 1px solid #c0392b; }
+        .status-loading { background: #eef0f2; color: #888; border: 1px solid #888; }
+        #detail {
+            font-family: "Cascadia Code", "Consolas", monospace;
+            font-size: 0.9rem;
+            color: #555;
+            background: #fafafa;
+            border-radius: 8px;
+            padding: 16px;
+            text-align: left;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        #refresh-btn {
+            margin-top: 24px;
+            padding: 8px 24px;
+            font-size: 0.95rem;
+            color: #fff;
+            background: #4a90d9;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        #refresh-btn:hover { background: #357abd; }
+        #refresh-btn:disabled { background: #aaa; cursor: not-allowed; }
+        #timestamp { font-size: 0.8rem; color: #aaa; margin-top: 16px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>🏥 健康检查状态</h1>
+        <div id="status-badge" class="status-loading">检查中…</div>
+        <div id="detail">正在连接后端服务…</div>
+        <div id="timestamp"></div>
+        <button id="refresh-btn" onclick="checkHealth()">刷新</button>
+    </div>
+
+    <script>
+        const HEALTH_URL = '/health';
+
+        async function checkHealth() {
+            const badge   = document.getElementById('status-badge');
+            const detail  = document.getElementById('detail');
+            const ts      = document.getElementById('timestamp');
+            const refresh = document.getElementById('refresh-btn');
+
+            badge.className = 'status-loading';
+            badge.textContent = '检查中…';
+            detail.textContent = '正在请求 /health …';
+            refresh.disabled = true;
+
+            try {
+                const resp = await fetch(HEALTH_URL);
+                const data = await resp.json();
+
+                if (resp.ok && data.status === 'ok') {
+                    badge.className = 'status-ok';
+                    badge.textContent = '✅ 服务正常';
+                } else {
+                    badge.className = 'status-error';
+                    badge.textContent = '⚠️ 状态异常';
+                }
+                detail.textContent = JSON.stringify(data, null, 2);
+            } catch (err) {
+                badge.className = 'status-error';
+                badge.textContent = '❌ 连接失败';
+                detail.textContent = String(err);
+            } finally {
+                refresh.disabled = false;
+                ts.textContent = '更新时间: ' + new Date().toLocaleString('zh-CN');
+            }
+        }
+
+        checkHealth();
+    </script>
+</body>
+</html>
