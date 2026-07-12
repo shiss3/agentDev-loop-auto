@@ -1,4 +1,4 @@
-"""Chat 事件类型定义 — Session 与 Renderer 之间的协议
+"""Chat 事件类型定义 - Session 与 Renderer 之间的协议
 
 ⚠️ 长期资产：
    ChatEvent 协议是跨 Phase 的稳定接口。
@@ -44,27 +44,31 @@ class EventType(str, Enum):
 class ChatEvent:
     """单个事件
 
-    Session 层产出 → Renderer 层消费。
+    Session 层产出 -> Renderer 层消费。
     所有终端渲染决策由 Renderer 根据 event.type 决定。
 
     Attributes:
-        type:      事件类型
-        data:      事件数据（结构由 type 决定）
-        agent:     产出事件的 Agent 名称
-        timestamp: 事件产生时间
+        type:       事件类型
+        data:       事件数据（结构由 type 决定）
+        agent:      产出事件的 Agent 名称
+        timestamp:  事件产生时间
+        request_id: 所属请求标识（同一请求的所有事件共享；None 表示未归属）
     """
 
     type: EventType
     data: dict[str, Any] = field(default_factory=dict)
     agent: str = "default"
     timestamp: datetime = field(default_factory=datetime.now)
+    request_id: str | None = None
 
 
 # ── 便捷工厂函数 ──────────────────────────────────────
 
 
-def text_event(text: str, agent: str = "default") -> ChatEvent:
-    return ChatEvent(type=EventType.TEXT, data={"text": text}, agent=agent)
+def text_event(text: str, agent: str = "default", request_id: str | None = None) -> ChatEvent:
+    return ChatEvent(
+        type=EventType.TEXT, data={"text": text}, agent=agent, request_id=request_id
+    )
 
 
 def tool_use_event(
@@ -72,6 +76,7 @@ def tool_use_event(
     tool_id: str,
     tool_input: str,
     agent: str = "default",
+    request_id: str | None = None,
 ) -> ChatEvent:
     return ChatEvent(
         type=EventType.TOOL_USE,
@@ -81,6 +86,7 @@ def tool_use_event(
             "tool_input": tool_input,
         },
         agent=agent,
+        request_id=request_id,
     )
 
 
@@ -89,6 +95,7 @@ def tool_result_event(
     content: str,
     is_error: bool = False,
     agent: str = "default",
+    request_id: str | None = None,
 ) -> ChatEvent:
     return ChatEvent(
         type=EventType.TOOL_RESULT,
@@ -98,13 +105,19 @@ def tool_result_event(
             "is_error": is_error,
         },
         agent=agent,
+        request_id=request_id,
     )
 
 
-def turn_start_event(turn_number: int, prompt: str) -> ChatEvent:
+def turn_start_event(
+    turn_number: int,
+    prompt: str,
+    request_id: str | None = None,
+) -> ChatEvent:
     return ChatEvent(
         type=EventType.TURN_START,
         data={"turn_number": turn_number, "prompt": prompt},
+        request_id=request_id,
     )
 
 
@@ -112,6 +125,7 @@ def turn_end_event(
     turn_number: int,
     tool_count: int,
     duration_ms: int,
+    request_id: str | None = None,
 ) -> ChatEvent:
     return ChatEvent(
         type=EventType.TURN_END,
@@ -120,12 +134,17 @@ def turn_end_event(
             "tool_count": tool_count,
             "duration_ms": duration_ms,
         },
+        request_id=request_id,
     )
 
 
-def error_event(error: str, agent: str = "default") -> ChatEvent:
+def error_event(
+    error: str,
+    agent: str = "default",
+    request_id: str | None = None,
+) -> ChatEvent:
     return ChatEvent(
-        type=EventType.ERROR, data={"error": error}, agent=agent
+        type=EventType.ERROR, data={"error": error}, agent=agent, request_id=request_id
     )
 
 
@@ -135,6 +154,7 @@ def usage_event(
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
     model_name: str | None = None,
+    request_id: str | None = None,
 ) -> ChatEvent:
     """创建 usage 事件
 
@@ -144,6 +164,7 @@ def usage_event(
         cache_read_tokens: 缓存读取 token 数
         cache_creation_tokens: 缓存创建 token 数
         model_name: 实际使用的模型名称（从 SDK 返回中提取）
+        request_id: 所属请求标识
     """
     data: dict[str, Any] = {
         "input_tokens": input_tokens,
@@ -153,22 +174,33 @@ def usage_event(
     }
     if model_name:
         data["model_name"] = model_name
-    return ChatEvent(type=EventType.USAGE, data=data)
+    return ChatEvent(type=EventType.USAGE, data=data, request_id=request_id)
 
 
-def thinking_event(agent: str = "default") -> ChatEvent:
-    return ChatEvent(type=EventType.THINKING, data={}, agent=agent)
+def thinking_event(
+    agent: str = "default",
+    request_id: str | None = None,
+) -> ChatEvent:
+    return ChatEvent(
+        type=EventType.THINKING, data={}, agent=agent, request_id=request_id
+    )
 
 
-def cancelled_event(reason: str = "用户取消") -> ChatEvent:
+def cancelled_event(
+    reason: str = "用户取消",
+    request_id: str | None = None,
+) -> ChatEvent:
     """创建取消事件"""
-    return ChatEvent(type=EventType.CANCELLED, data={"reason": reason})
+    return ChatEvent(
+        type=EventType.CANCELLED, data={"reason": reason}, request_id=request_id
+    )
 
 
 def retry_event(
     attempt: int,
     reason: str,
     max_attempts: int | None = None,
+    request_id: str | None = None,
 ) -> ChatEvent:
     """创建重试事件
 
@@ -176,6 +208,7 @@ def retry_event(
         attempt: 当前重试次数（从 1 开始）
         reason: 重试原因（如 "连接超时"、"API 错误"、"rate limit"）
         max_attempts: 最大重试次数（可选，CLI 告知）
+        request_id: 所属请求标识
     """
     data: dict[str, Any] = {
         "attempt": attempt,
@@ -183,7 +216,7 @@ def retry_event(
     }
     if max_attempts is not None:
         data["max_attempts"] = max_attempts
-    return ChatEvent(type=EventType.RETRY, data=data)
+    return ChatEvent(type=EventType.RETRY, data=data, request_id=request_id)
 
 
 def rate_limit_event(
@@ -192,6 +225,7 @@ def rate_limit_event(
     resets_at: int | None = None,
     utilization: float | None = None,
     message: str = "",
+    request_id: str | None = None,
 ) -> ChatEvent:
     """创建速率限制事件
 
@@ -201,6 +235,7 @@ def rate_limit_event(
         resets_at: 重置时间戳
         utilization: 使用率 0.0-1.0
         message: 人类可读提示
+        request_id: 所属请求标识
     """
     return ChatEvent(
         type=EventType.RATE_LIMIT,
@@ -211,12 +246,14 @@ def rate_limit_event(
             "utilization": utilization,
             "message": message,
         },
+        request_id=request_id,
     )
 
 
 def stream_error_event(
     error: str,
     stream_event_type: str | None = None,
+    request_id: str | None = None,
 ) -> ChatEvent:
     """创建流错误事件
 
@@ -225,6 +262,7 @@ def stream_error_event(
     Args:
         error: 错误描述
         stream_event_type: stream_event 中的 event 字段值
+        request_id: 所属请求标识
     """
     return ChatEvent(
         type=EventType.STREAM_ERROR,
@@ -232,4 +270,5 @@ def stream_error_event(
             "error": error,
             "stream_event_type": stream_event_type,
         },
+        request_id=request_id,
     )
