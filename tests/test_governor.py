@@ -293,6 +293,55 @@ async def test_handle_delivery_placeholder():
     assert t2["module_id"] == "payment"
 
 
+# ── 7b. high+patch+1-5+单领域+subtasks 非空 -> delivery 灌队列不降级 ──
+
+
+async def test_handle_high_patch_no_degrade():
+    """high 风险小补丁(patch+1-5+单领域)但 risk_level=high -> delivery；
+    subtasks 非空 -> 灌队列不降级常驻（risk_level 拦截不被降级路径架空）"""
+    task_queue = MagicMock(spec=TaskQueueAdapter)
+    task_queue.seed.return_value = 1
+    governor = Governor(
+        project_dir=".",
+        session_store=MagicMock(spec=SessionStore),
+        task_queue=task_queue,
+    )
+    governor._parse_requirement = AsyncMock(
+        return_value={
+            "task_summary": "改支付回调签名校验",
+            "acceptance_criteria": ["签名校验改用 HMAC-SHA256"],
+            "risk_level": "high",
+            "suggest_track": "delivery",
+            "change_type": "patch",
+            "file_count_bucket": "1-5",
+            "cross_domain": False,
+            "subtasks": [
+                {
+                    "id": "t1",
+                    "domain": "backend",
+                    "module_id": "payment",
+                    "summary": "改签名校验",
+                    "acceptance": ["用 HMAC-SHA256"],
+                    "intended_files": ["callback.py"],
+                    "deps": [],
+                },
+            ],
+        }
+    )
+    fake_ev = text_event("fake-exec")
+    governor._resident.send = make_fake_send([fake_ev])
+
+    events = await collect(governor.handle_user_input("改支付回调签名校验"))
+
+    dispatch_evs = _text_events_containing(events, "调度")
+    assert "delivery" in dispatch_evs[0].data["text"]
+    # 灌队列（seed 被调），不降级常驻（send 不被调，无降级事件）
+    assert task_queue.seed.call_count == 1
+    degrade_evs = _text_events_containing(events, "降级")
+    assert len(degrade_evs) == 0
+    assert fake_ev not in events
+
+
 # ── 8. forced_track="interactive" 跳过解析 ──
 
 

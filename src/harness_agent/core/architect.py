@@ -116,8 +116,9 @@ REQUIREMENT_PARSER_PROMPT = """\
 - suggest_track：interactive / delivery（LLM 主观参考，不作 track 依据；track 由代码规则定）。
 - expected_scope：预估影响的业务范围与功能模块（仅调度参考）。
 - subtasks：按【技术领域 + 业务功能单元】拆分。拆分规则（A 方案）：
-  当 change_type=feature 或 file_count_bucket=6+ 或 cross_domain=true 时**必须拆 subtasks**；
-  否则不拆（subtasks 为空数组）。粒度软约束：每 subtask 聚焦 1-5 文件，整批 2-8 个
+  当 change_type=feature 或 file_count_bucket=6+ 或 cross_domain=true 或 risk_level=high 时**必须拆 subtasks**；
+  否则不拆（subtasks 为空数组）。high 小补丁也拆（整个补丁当 1 个 task 灌队列，保 delivery 隔离不降级常驻）。
+  粒度软约束：每 subtask 聚焦 1-5 文件，整批 2-8 个
   （太细膨胀队列+deps 网，太粗失聚拢；超范围按真实硬依赖切分）。每项：
   - id：本批内唯一短 id（"t1","t2",...），供 deps 引用。
   - domain：技术领域枚举 frontend/backend/database/docs/infra/test，必选其一。
@@ -138,7 +139,7 @@ REQUIREMENT_PARSER_PROMPT = """\
   或 acceptance_criteria 中体现可追溯性。
 - 模糊时取保守（change_type 倾向 feature、file_count_bucket 倾向 6+、cross_domain 倾向 true、
   risk_level 倾向 high，即倾向 delivery）。
-- track 由代码规则消费 change_type/file_count_bucket/cross_domain 判定，suggest_track 仅供参考。
+- track 由代码规则消费 risk_level/change_type/file_count_bucket/cross_domain 判定，suggest_track 仅供参考。
 - 不指导实现方案、不指定技术栈、不替模型做执行层决策。
 """
 
