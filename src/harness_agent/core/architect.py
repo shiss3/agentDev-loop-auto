@@ -118,7 +118,7 @@ REQUIREMENT_PARSER_PROMPT = """\
 - subtasks：按【技术领域 + 业务功能单元】拆分。拆分规则（A 方案）：
   当 change_type=feature 或 file_count_bucket=6+ 或 cross_domain=true 或 risk_level=high 时**必须拆 subtasks**；
   否则不拆（subtasks 为空数组）。high 小补丁也拆（整个补丁当 1 个 task 灌队列，保 delivery 隔离不降级常驻）。
-  粒度软约束：每 subtask 聚焦 1-5 文件，整批 2-8 个
+  粒度软约束：每 subtask 聚焦 1-5 文件，整批 1-8 个（high 小补丁可仅 1 个，豁免下限）
   （太细膨胀队列+deps 网，太粗失聚拢；超范围按真实硬依赖切分）。每项：
   - id：本批内唯一短 id（"t1","t2",...），供 deps 引用。
   - domain：技术领域枚举 frontend/backend/database/docs/infra/test，必选其一。
@@ -370,13 +370,24 @@ class Governor:
         纯解耦：灌完即返回，不 spawn 执行器。
         """
         subtasks = spec.get("subtasks") or []
+        is_high = spec.get("risk_level") == "high"
         if not subtasks:
+            if is_high:
+                yield _build_message(
+                    "⚠️ 高风险需求但解析未拆出子任务（模型违规），已拦截不执行（常驻不直写高风险）。请人工介入或重述需求。"
+                )
+                return
             yield _build_message("⚠️ 交付轨无子任务，降级交互轨执行。")
             async for event in self._resident.send(self._last_text):
                 yield event
             return
 
         if self._task_queue is None:
+            if is_high:
+                yield _build_message(
+                    "⚠️ 高风险需求但未配置任务队列，已拦截不执行（常驻不直写高风险）。请配置队列或人工介入。"
+                )
+                return
             yield _build_message("⚠️ 未配置任务队列，降级交互轨执行。")
             async for event in self._resident.send(self._last_text):
                 yield event
@@ -397,7 +408,20 @@ class Governor:
                 "deps": [id_map[d] for d in st.get("deps", []) if d in id_map],
             })
 
-        n = self._task_queue.seed(tasks)
+        try:
+            n = self._task_queue.seed(tasks)
+        except Exception as e:
+            if is_high:
+                yield _build_message(
+                    f"⚠️ 高风险需求灌队列失败({str(e)[:80]})，已拦截不执行。请人工介入。"
+                )
+                return
+            yield _build_message(
+                f"⚠️ 灌队列失败({str(e)[:80]})，降级交互轨执行。"
+            )
+            async for event in self._resident.send(self._last_text):
+                yield event
+            return
         yield _build_message(
             f"🌐 交付轨 req_id={req_id}：已灌入 {n} 个任务到队列"
         )

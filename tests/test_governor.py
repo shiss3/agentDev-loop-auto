@@ -125,7 +125,7 @@ async def test_parse_requirement_no_output_raises(patch_query):
 
 
 
-# ── 3. _decide_track 全满足(patch+1-3+cross_domain=False) -> interactive ──
+# ── 3. _decide_track 全满足(patch+1-5+cross_domain=False) -> interactive ──
 
 
 def test_decide_track_all_patch_interactive():
@@ -246,7 +246,7 @@ async def test_handle_delivery_placeholder():
             "risk_level": "high",
             "suggest_track": "delivery",
             "change_type": "feature",
-            "file_count_bucket": "4+",
+            "file_count_bucket": "6+",
             "cross_domain": True,
             "subtasks": [
                 {
@@ -597,6 +597,85 @@ async def test_run_delivery_returns_req_id():
         assert t["id"].startswith(f"{req_id}-")
         assert t["req_id"] == req_id
         assert t["module_id"] == "payment"
+
+
+# ── 18b. high+空 subtasks -> 拦截不降级常驻 ──
+
+
+async def test_run_delivery_high_no_subtasks_intercepts():
+    """high 风险 + 空 subtasks（模型违规）-> 拦截不执行，不降级常驻 send"""
+    governor = make_governor()
+    governor._last_text = "改支付签名"
+    governor._resident.send = make_fake_send([text_event("fake")])
+
+    spec = {"task_summary": "改支付签名", "risk_level": "high", "subtasks": []}
+    events = await collect(governor._run_delivery(spec))
+
+    intercept_evs = _text_events_containing(events, "拦截")
+    assert len(intercept_evs) == 1
+    assert "fake" not in [e.data.get("text") for e in events]  # 不降级常驻
+
+
+# ── 18c. high+seed 失败 -> 拦截不降级常驻 ──
+
+
+async def test_run_delivery_high_seed_fail_intercepts():
+    """high 风险 + seed raise -> 拦截不执行，不降级常驻 send"""
+    task_queue = MagicMock(spec=TaskQueueAdapter)
+    task_queue.seed.side_effect = RuntimeError("db locked")
+    governor = Governor(
+        project_dir=".",
+        session_store=MagicMock(spec=SessionStore),
+        task_queue=task_queue,
+    )
+    governor._last_text = "改支付签名"
+    governor._resident.send = make_fake_send([text_event("fake")])
+
+    spec = {
+        "task_summary": "改支付签名",
+        "risk_level": "high",
+        "subtasks": [
+            {"id": "t1", "domain": "backend", "module_id": "payment",
+             "summary": "改签名", "acceptance": ["通过"]}
+        ],
+    }
+    events = await collect(governor._run_delivery(spec))
+
+    intercept_evs = _text_events_containing(events, "拦截")
+    assert len(intercept_evs) == 1
+    assert "db locked" in intercept_evs[0].data["text"]
+    assert "fake" not in [e.data.get("text") for e in events]
+
+
+# ── 18d. 非 high+seed 失败 -> 降级常驻 ──
+
+
+async def test_run_delivery_seed_fail_degrades():
+    """非 high + seed raise -> 降级常驻 send"""
+    task_queue = MagicMock(spec=TaskQueueAdapter)
+    task_queue.seed.side_effect = RuntimeError("db locked")
+    governor = Governor(
+        project_dir=".",
+        session_store=MagicMock(spec=SessionStore),
+        task_queue=task_queue,
+    )
+    governor._last_text = "重构支付"
+    fake_ev = text_event("fake")
+    governor._resident.send = make_fake_send([fake_ev])
+
+    spec = {
+        "task_summary": "重构支付",
+        "risk_level": "medium",
+        "subtasks": [
+            {"id": "t1", "domain": "backend", "module_id": "payment",
+             "summary": "建表", "acceptance": ["表存在"]}
+        ],
+    }
+    events = await collect(governor._run_delivery(spec))
+
+    degrade_evs = _text_events_containing(events, "灌队列失败")
+    assert len(degrade_evs) == 1
+    assert fake_ev in events  # 降级常驻
 
 
 # ── 19. _build_task_prompt 自包含 ──
