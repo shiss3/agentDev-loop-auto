@@ -1,6 +1,6 @@
-# 🐴 Harness Agent
+# agentDev-autoLoop
 
-> 驾驭工程实践 — 基于 Claude Agent SDK 的智能开发编排系统
+> 基于 Claude Agent SDK 的需求自动循环开发系统
 
 ## 安装 (使用 pip)
 
