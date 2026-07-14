@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import os
 import shutil
@@ -98,6 +99,58 @@ def build_executor_args(loop_prompt: str, mcp_config_path: str, max_turns: int) 
         "--allowed-tools", EXECUTOR_ALLOWED_TOOLS,
         "--disallowed-tools", "Bash",
     ]
+
+
+def build_dispatch_manifest(
+    args: list[str],
+    *,
+    req_id: str,
+    module_id: str,
+    domain: str,
+    attempt: int,
+    cwd: str,
+    log_path: str,
+    max_turns: int,
+) -> dict:
+    """组装交付轨调度清单(spawn 前 dump,回答"给执行器传了什么/禁了什么能力")。
+
+    args: build_executor_args 返回的完整 argv(忠实备份,可原样复现命令)。
+    其余字段为人类可读解读 -- 用户要看清传给 claude 的提示词 + 被砍掉的能力。
+    prompt/mcp_config_path 从 args 提取(就是实际传的,零歧义)。
+    """
+    return {
+        "req_id": req_id,
+        "slot": {"module_id": module_id, "domain": domain},
+        "attempt": attempt,
+        "cwd": cwd,
+        "log_path": log_path,
+        "max_turns": max_turns,
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+        "argv": args,
+        "prompt": args[args.index("-p") + 1],
+        "system_prompt": EXECUTOR_SYSTEM_PROMPT,
+        "model": EXECUTOR_MODEL,
+        "allowed_tools": EXECUTOR_ALLOWED_TOOLS,
+        "disallowed_tools": "Bash",
+        "mcp": {
+            "config_path": args[args.index("--mcp-config") + 1],
+            "strict": True,
+            "servers": ["task_queue"],
+        },
+        "permission_mode": "acceptEdits",
+        "flags": [
+            "--bare",
+            "--strict-mcp-config",
+            "--output-format stream-json",
+            "--verbose",
+        ],
+        "disabled_capabilities": [
+            "--bare: 跳过全局 CLAUDE.md / skills / hooks(无人值守防'先问'压制自驱)",
+            "--strict-mcp-config: 仅允许 task_queue MCP,禁其他(codegraph 等)",
+            "--disallowed-tools Bash: 硬禁 Bash(acceptEdits 下 Bash 非自动接受会卡死无人值守)",
+            "allowed_tools 仅 5 个: 无 Task(subagent)/WebFetch/Agent/Glob/Grep",
+        ],
+    }
 
 
 async def spawn_executor(args: list[str], cwd: str, log_path: str) -> asyncio.subprocess.Process:

@@ -1,41 +1,36 @@
 """Governor — L0 治理者（Phase 2 Step 3）。
-
 职责：
 1. 需求解析：独立 stateless query() + output_format，输出标准化任务单，不进常驻 session 历史
 2. 双轨调度：纯规则判定交互轨 / 交付轨（任务规模 + 上下文连续性），不调 LLM
 3. 交互轨直执行：经 self._resident.send() 产出 ChatEvent 流（常驻执行体，上下文连续）
 4. 解析异常降级：_parse_requirement 异常 → 降级交互轨直接执行，不阻断用户
-
 核心铁则：L0 绝不下场编码。判定与执行物理分离：
 - 判定 session：stateless query()，tools=[]（只读，不挂业务写工具）
 - 交互轨执行体：常驻 BaseAgentSession（可写，复用上下文）
 - 交付轨执行体：独立 BaseAgentSession 实例 + worktree cwd（后续层实装）
 不再有 lane guard —— 执行体本身可写，判定 session 本身不挂业务写工具。
-
 交付轨灌队列本步实装；执行器 spawn/worktree/验收/修复闭环属后续层。
 """
-
 from __future__ import annotations
-
 import asyncio
+import json
 import os
 import shutil
 import subprocess
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
-
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ResultMessage,
     SessionStore,
     query,
 )
-
 from harness_agent.chat.events import ChatEvent
 from harness_agent.chat.session_store import create_session_store
 from harness_agent.core.base_session import BaseAgentSession
 from harness_agent.core.executor import (
+    build_dispatch_manifest,
     build_executor_args,
     build_loop_prompt,
     spawn_executor,
@@ -50,9 +45,7 @@ from harness_agent.core.worktree import (
     merge_worktree_branch,
     remove_worktree,
 )
-
 # ── 常量 ──────────────────────────────────────────────────────────────
-
 # 标准化任务单 schema —— 替换原 ROUTER_DECISION_SCHEMA（按技术领域拆任务的产物）
 TASK_SPEC_SCHEMA = {
     "type": "object",
@@ -113,12 +106,9 @@ TASK_SPEC_SCHEMA = {
         "cross_domain",
     ],
 }
-
 REQUIREMENT_PARSER_PROMPT = """\
 # 角色：L0 需求解析员
-
 你只做一件事：把用户需求转化为结构化、可验证的标准任务单。你不执行需求，不指导实现细节。
-
 ## 输出字段
 - task_summary：一句话概括任务核心目标。
 - acceptance_criteria：结构化验收要点列表，每项必须可验证（能跑命令/测试/接口验证），
@@ -147,7 +137,6 @@ REQUIREMENT_PARSER_PROMPT = """\
   - deps：依赖的同批 subtask id 列表（必须先完成的；无依赖留空数组）。
   每项标 module_id（业务模块）+ domain（技术领域）；同 (module_id, domain) 可多 subtask。
   执行器按 (module_id, domain) 聚合领取以减上下文噪音，故 module_id/domain 须规范一致。
-
 ## 纪律
 - 严格锚定原始需求，所有验收项可追溯到需求原文。
 - subtasks 的 prompt/summary 必须自包含（执行器看不到你的上下文）。
@@ -158,38 +147,48 @@ REQUIREMENT_PARSER_PROMPT = """\
   risk_level 倾向 high，即倾向 delivery）。
 - track 由代码规则消费 risk_level/change_type/file_count_bucket/cross_domain 判定，suggest_track 仅供参考。
 - 不指导实现方案、不指定技术栈、不替模型做执行层决策。
+## 非开发需求兜底
+若输入不是开发任务（寒暄/闲聊/纯提问/澄清/无明确改动意图），不要拒绝、不要追问、不要留空字段，
+直接按 schema 输出，字段约定：
+- task_summary：摘要用户原话（如"用户提问:xxx"）
+- acceptance_criteria：[]（空数组，无可验收项）
+- risk_level：low
+- change_type：patch
+- file_count_bucket：1-5
+- cross_domain：false
+- suggest_track：interactive
+- subtasks：[]（空数组）
+调度层据此判为 interactive 走常驻交互。必填字段禁止留空、禁止输出 schema 外内容。
 """
-
 EXECUTOR_PROMPT = """\
 # 角色：执行层（由 L0 治理层派发任务）
-
 你是代码实现的执行者。L0 治理层只下发任务目标与验收标准，不干预你的实现路径。
-
 ## 你的自主权
 - 自主规划实现步骤、安排开发顺序。
 - 自主读代码、编辑文件、执行命令。
 - 按需派生 subagent 处理子任务、做代码评审。
-
 ## 你的契约
 - 你的输出是「待验收半成品」，不自行宣告任务完成 —— L0 会用客观工具验收。
 - 严格对齐 L0 下发的验收要求，不修改验收标准。
 - 遇到需求模糊先澄清，不要擅自扩大或缩小范围。
 """
-
-
+# 明显非需求输入(寒暄/确认/道别)白名单 -- handle_user_input 直接走交互轨跳过 LLM 解析省 token。
+# 仅抓最无歧义词;真任务(含动词/文件名/需求描述)不在此列,走 _parse_requirement。
+_CASUAL_INPUTS = frozenset({
+    "你好", "您好", "嗨", "在吗", "在不在",
+    "谢谢", "感谢", "收到", "明白", "了解", "好的", "嗯", "哦", "ok",
+    "早", "早上好", "下午好", "晚上好",
+    "再见", "拜拜", "hi", "hello", "hey", "thanks", "thx", "bye",
+})
 # ── Governor ──────────────────────────────────────────────────────────
-
-
 class Governor:
     """L0 治理者 — 需求解析 + 双轨调度。验收/修复闭环 Step 4-6 接入。
-
     - 需求解析走 query() 顶层 API（stateless，不进常驻执行体历史，不持久化）
     - 交互轨经 self._resident.send(text) 产出 ChatEvent 流（text 首次进常驻执行体）
     - 交付轨灌队列本步实装，执行器属后续层
     - 判定与执行物理分离：执行体 permission_mode="acceptEdits" + 业务写进 allowed_tools，
       不挂 can_use_tool；判定 session tools=[] 天然只读。无需 lane guard。
     """
-
     def __init__(
         self,
         project_dir: str,
@@ -208,15 +207,12 @@ class Governor:
             task_queue if task_queue is not None else self._build_task_queue()
         )
         self._last_text: str | None = None
-
     @property
     def session(self) -> BaseAgentSession:
         """穿透到常驻执行体（commands.py 的 cli.session.* 零改动，Step 6 用）。"""
         return self._resident
-
     def _build_resident_session(self) -> BaseAgentSession:
         """构造交互轨常驻执行体（__init__ 与 rebuild 共用）。
-
         执行层配置（非 L0 判定 session）：
         - system_prompt=EXECUTOR_PROMPT（极简执行契约，不写领域指导）
         - permission_mode="acceptEdits"（执行体可写）
@@ -232,13 +228,10 @@ class Governor:
             permission_mode="acceptEdits",
             session_store=self._session_store,
         )
-
     async def start(self) -> None:
         await self._resident.start()
-
     async def close(self) -> None:
         await self._resident.close()
-
     async def rebuild(
         self, *, project_dir: str | None = None, model: str | None = None
     ) -> None:
@@ -250,12 +243,10 @@ class Governor:
         await self._resident.close()
         self._resident = self._build_resident_session()
         await self._resident.start()
-
     @staticmethod
     def _new_req_id() -> str:
         """生成 8 字符 hex req_id（uuid4 截断）。"""
         return uuid.uuid4().hex[:8]
-
     @staticmethod
     def _build_task_queue() -> TaskQueueAdapter | None:
         """从环境变量构造 adapter；未配置返回 None（交付轨降级）。"""
@@ -267,7 +258,6 @@ class Governor:
             return TaskQueueAdapter(svc_dir, db_path)
         except Exception:
             return None
-
     @staticmethod
     def _build_task_prompt(subtask: dict, spec: dict) -> str:
         """拼自包含任务 prompt（执行器看不到解析上下文）。"""
@@ -282,12 +272,10 @@ class Governor:
             f"## 模块/领域\n{module_id}/{domain}\n"
             f"## 验收标准\n{acc}{files_line}"
         )
-
     async def _parse_requirement(
         self, text: str, *, context_continuation: bool
     ) -> dict:
         """独立 stateless 需求解析。结构化输出(SDK 强制合规 JSON)。
-
         - tools=[](禁内置工具)+ strict_mcp_config=True(禁外部 MCP server,
           只用传入的 mcp_servers=空)。双隔离防模型看到 MCP 工具(如 codegraph)
           在复杂需求时调用 -> 耗尽 max_turns(error_max_turns 降级根因)。
@@ -315,10 +303,8 @@ class Governor:
                 if msg.structured_output:
                     return msg.structured_output
         raise RuntimeError("需求解析未返回结构化结果")
-
     def _decide_track(self, spec: dict) -> str:
         """双轨调度判定 -- 纯规则消费 LLM 客观字段，不调 LLM。
-
         risk_level=high -> delivery（高风险必走队列，下游可验收/隔离；本层拦死，常驻不直写）
         交互轨(全满足且非 high)：change_type=patch AND file_count_bucket=1-5 AND cross_domain=False
         任一不满足或缺省 -> delivery（保守）
@@ -332,12 +318,18 @@ class Governor:
                 and spec.get("cross_domain") is False):
             return "interactive"
         return "delivery"
-
+    @staticmethod
+    def _is_casual_input(text: str) -> bool:
+        """明显非需求输入(寒暄/确认/道别)直接走交互轨,跳过 LLM 解析省 token。
+        去空白 + 去末尾标点 + 小写后精确匹配 _CASUAL_INPUTS 白名单。
+        仅抓最无歧义的寒暄词;真任务(含动词/文件名/需求描述)不会被误判。
+        """
+        s = text.strip().rstrip("？！?!.。,，~~").lower()
+        return s in _CASUAL_INPUTS
     async def handle_user_input(
         self, text: str, *, forced_track: str | None = None
     ) -> AsyncIterator[ChatEvent]:
         """用户输入 → ChatEvent 流。
-
         forced_track 语义：
           None             → 自动判定（_parse_requirement + _decide_track）
           "interactive"    → 跳过解析，直接交互轨执行
@@ -345,7 +337,6 @@ class Governor:
         """
         self._last_text = text
         context_continuation = self._resident.stats.turn_count > 0
-
         if forced_track:
             track = forced_track
             spec = {
@@ -355,35 +346,40 @@ class Governor:
                 "suggest_track": track,
             }
         else:
-            try:
-                spec = await self._parse_requirement(
-                    text, context_continuation=context_continuation
-                )
-            except Exception as e:
-                yield _build_message(
-                    f"⚠️ 需求解析异常({str(e)[:80]}),已降级为交互轨直接执行。"
-                )
-                async for event in self._resident.send(text):
-                    yield event
-                return
-            track = self._decide_track(spec)
-
+            if self._is_casual_input(text):
+                # 寒暄/确认等非需求输入直接常驻交互,跳过 LLM 解析省 token
+                track = "interactive"
+                spec = {
+                    "task_summary": text,
+                    "acceptance_criteria": [],
+                    "risk_level": "low",
+                    "suggest_track": "interactive",
+                }
+            else:
+                try:
+                    spec = await self._parse_requirement(
+                        text, context_continuation=context_continuation
+                    )
+                except Exception as e:
+                    yield _build_message(
+                        f"⚠️ 需求解析异常({str(e)[:80]}),已降级为交互轨直接执行。"
+                    )
+                    async for event in self._resident.send(text):
+                        yield event
+                    return
+                track = self._decide_track(spec)
         yield _build_message(
             f"🔀 调度: {track}（{spec.get('task_summary', '')[:40]}）"
         )
-
         if track == "interactive":
             async for event in self._resident.send(text):
                 yield event
             return
-
         # track == "delivery"
         async for event in self._run_delivery(spec):
             yield event
-
     async def _run_delivery(self, spec: dict) -> AsyncIterator[ChatEvent]:
         """交付轨：subtasks -> task_queue tasks -> seed 灌队列 -> 返回 req_id。
-
         纯解耦：灌完即返回，不 spawn 执行器。
         """
         subtasks = spec.get("subtasks") or []
@@ -398,7 +394,6 @@ class Governor:
             async for event in self._resident.send(self._last_text):
                 yield event
             return
-
         if self._task_queue is None:
             if is_high:
                 yield _build_message(
@@ -409,10 +404,8 @@ class Governor:
             async for event in self._resident.send(self._last_text):
                 yield event
             return
-
         req_id = self._new_req_id()
         id_map = {st["id"]: f"{req_id}-{st['id']}" for st in subtasks}
-
         tasks = []
         for st in subtasks:
             tasks.append({
@@ -424,7 +417,6 @@ class Governor:
                 "intended_files": st.get("intended_files") or [],
                 "deps": [id_map[d] for d in st.get("deps", []) if d in id_map],
             })
-
         try:
             n = self._task_queue.seed(tasks)
         except Exception as e:
@@ -444,12 +436,10 @@ class Governor:
         )
         async for event in self._run_executors(tasks, req_id):
             yield event
-
     async def _run_executors(
         self, tasks: list[dict], req_id: str
     ) -> AsyncIterator[ChatEvent]:
         """交付轨执行器编排:槽分组 -> worktree -> 串行 spawn -> 验证(merge 前) -> merge。
-
         都单策略:单 worktree + 串行执行器(按 (module_id,domain) 聚合,每槽一个)。
         续跑:执行器退出但 is_req_done=False 时重 spawn(限 3 次)。
           - 坑1(空转):续前判 has_pending,真空槽不续(is_req_done=False 是别槽的事)。
@@ -469,7 +459,6 @@ class Governor:
         except Exception as e:
             yield _build_message(f"⚠️ worktree 创建失败({str(e)[:80]})，交付中止。")
             return
-
         svc_dir = os.environ.get("TASK_SERVICE_DIR", "")
         logs_dir = Path(self.project_dir) / ".claude" / "delivery-logs" / req_id
         logs_dir.mkdir(parents=True, exist_ok=True)
@@ -477,7 +466,6 @@ class Governor:
         write_mcp_config(
             self._task_queue.task_db_path, svc_dir, mcp_config_path
         )
-
         all_done = False
         for mod, dom in slots:
             slot_count = sum(
@@ -496,6 +484,24 @@ class Governor:
                 )
                 args = build_executor_args(
                     build_loop_prompt(mod, dom), mcp_config_path, max_turns
+                )
+                # 调度清单:spawn 前写完整 argv + prompt + 禁用能力,供排查"传了啥/砍了啥"
+                manifest = build_dispatch_manifest(
+                    args,
+                    req_id=req_id,
+                    module_id=mod,
+                    domain=dom,
+                    attempt=retry,
+                    cwd=worktree_path,
+                    log_path=log_path,
+                    max_turns=max_turns,
+                )
+                manifest_path = (
+                    logs_dir / f"dispatch-{mod}-{sanitize_module_id(dom)}-{retry}.json"
+                )
+                manifest_path.write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
                 )
                 yield _build_message(
                     f"▶ 槽 {mod}/{dom} 执行器启动 "
@@ -527,17 +533,14 @@ class Governor:
                 break
             if retry >= 3:
                 yield _build_message(f"⚠️ 槽 {mod}/{dom} 续 3 次未完成，放弃")
-
         # ── 收尾:验证(merge 前) -> merge ──
         if not self._task_queue.is_req_done(req_id):
             yield _build_message(f"⚠️ req_id={req_id} 未全完成，不 merge。")
             await asyncio.to_thread(remove_worktree, self.project_dir, req_id)
             return
-
         await asyncio.to_thread(
             commit_worktree, worktree_path, f"deliver {req_id}"
         )
-
         # 验证在 worktree 跑(merge 前):失败代码不进主分支,worktree 保留供排查
         vok, vout = await self._run_validation(worktree_path)
         if not vok:
@@ -546,7 +549,6 @@ class Governor:
                 f"{vout[:400]}"
             )
             return
-
         ok, conflict = await asyncio.to_thread(
             merge_worktree_branch, self.project_dir, req_id
         )
@@ -558,10 +560,8 @@ class Governor:
             return
         yield _build_message(f"✅ req_id={req_id} 交付完成(merge + 验证通过)")
         await asyncio.to_thread(remove_worktree, self.project_dir, req_id)
-
     async def _run_validation(self, repo_root: str) -> tuple[bool, str]:
         """L0 merge 前验证(在 worktree 跑):pytest + ruff。命令不存在跳过;非 0 退出失败。
-
         执行器无 Bash(--disallowed-tools Bash)跑不了测试,验证集中 L0 单点。
         """
         results: list[str] = []

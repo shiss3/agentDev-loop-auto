@@ -19,7 +19,7 @@ env/
 *.swo
 
 # Environment
-//.env
+.env
 
 # OS
 .DS_Store
@@ -35,6 +35,9 @@ uv.lock
 
 # Harness Agent worktrees (Phase 2 L0 Full mode)
 .harness/
+
+# 本机交付日志(交付轨 run 产物,含本机路径)
+.claude/delivery-logs/
 
 # Task queue DB (Step 2)
 *.db

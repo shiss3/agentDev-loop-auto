@@ -17,6 +17,7 @@ from harness_agent.core.executor import (
     EXECUTOR_ALLOWED_TOOLS,
     EXECUTOR_MODEL,
     EXECUTOR_SYSTEM_PROMPT,
+    build_dispatch_manifest,
     build_executor_args,
     build_loop_prompt,
     write_mcp_config,
@@ -95,6 +96,39 @@ def test_build_executor_args_values():
     assert args[args.index("--permission-mode") + 1] == "acceptEdits"
     # --allowed-tools 后紧跟常量
     assert args[args.index("--allowed-tools") + 1] == EXECUTOR_ALLOWED_TOOLS
+
+
+# ── build_dispatch_manifest ─────────────────────────
+
+
+def test_build_dispatch_manifest_fields():
+    """清单含完整 argv + 解读字段,且可 json 序列化(供 spawn 前写盘排查)。"""
+    p = build_loop_prompt("m", "d")
+    args = build_executor_args(p, "/tmp/cfg.json", 40)
+    m = build_dispatch_manifest(
+        args,
+        req_id="r1",
+        module_id="m",
+        domain="d",
+        attempt=0,
+        cwd="/wt",
+        log_path="/x.log",
+        max_turns=40,
+    )
+    # argv 忠实备份 + prompt 从 argv 提取(就是实际传的)
+    assert m["argv"] == args
+    assert m["prompt"] == p
+    assert m["model"] == EXECUTOR_MODEL
+    assert m["system_prompt"] == EXECUTOR_SYSTEM_PROMPT
+    assert m["allowed_tools"] == EXECUTOR_ALLOWED_TOOLS
+    assert m["disallowed_tools"] == "Bash"
+    assert m["mcp"]["config_path"] == "/tmp/cfg.json"
+    assert m["mcp"]["strict"] is True
+    assert "--bare" in m["flags"]
+    # 禁用能力清单非空(用户核心诉求:看清砍了啥)
+    assert m["disabled_capabilities"]
+    # 可序列化
+    json.dumps(m, ensure_ascii=False)
 
 
 # ── write_mcp_config ─────────────────────────────────
