@@ -39,5 +39,8 @@ uv.lock
 # 本机交付日志(交付轨 run 产物,含本机路径)
 .claude/delivery-logs/
 
+# 本机解析日志(自测 HARNESS_PARSE_LOG=1 产物)
+.claude/parse-logs/
+
 # Task queue DB (Step 2)
 *.db

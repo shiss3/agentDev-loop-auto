@@ -11,9 +11,10 @@
 - BaseAgentSession.start/close 在 rebuild 测试中 patch 为 AsyncMock
 """
 from __future__ import annotations
+import json
 from unittest.mock import AsyncMock, MagicMock
 import pytest
-from claude_agent_sdk import AssistantMessage, SessionStore, ToolUseBlock
+from claude_agent_sdk import AssistantMessage, ResultMessage, SessionStore, ToolUseBlock
 from harness_agent.chat.events import EventType, text_event
 from harness_agent.core import architect
 from harness_agent.core.architect import Governor
@@ -30,6 +31,13 @@ def make_fake_assistant_msg(spec=None):
         msg.content = [ToolUseBlock(id="1", name="mcp__plan_capture__submit_analysis_plan", input=spec)]
     else:
         msg.content = []
+    return msg
+def make_fake_result_msg(usage=None):
+    """构造 fake ResultMessage(MagicMock spec 让 isinstance 过),带 usage dict。
+    usage: 填 msg.usage(dict|None);_parse_requirement 从 ResultMessage.usage 取 tokens。
+    """
+    msg = MagicMock(spec=ResultMessage)
+    msg.usage = usage
     return msg
 def make_fake_send(events):
     """构造 fake async generator send（替换 _resident.send）。
@@ -60,9 +68,11 @@ def patch_query(monkeypatch):
         patch_query({"task_summary":"...","acceptance_criteria":[],...})
         spec = await governor._parse_requirement("x", context_continuation=False)
     """
-    def _set(spec):
+    def _set(spec, usage=None):
         async def fake_query(*, prompt, options=None):
             yield make_fake_assistant_msg(spec)
+            if usage is not None:
+                yield make_fake_result_msg(usage)
         monkeypatch.setattr(architect, "query", fake_query)
     return _set
 @pytest.fixture
@@ -92,6 +102,38 @@ async def test_parse_requirement_no_output_raises(patch_query):
     patch_query(None)  # 无 tool_use
     with pytest.raises(RuntimeError, match="未返回结构化结果"):
         await governor._parse_requirement("x", context_continuation=False)
+# ── 2c. _parse_requirement 日志:记录 ResultMessage.usage tokens + 工具调用数 ──
+async def test_parse_requirement_logs_usage(tmp_path, patch_query, monkeypatch):
+    """设 HARNESS_PARSE_LOG=1 -> 解析后写 usage.jsonl,含 in/out tokens + tool_calls"""
+    monkeypatch.setenv("HARNESS_PARSE_LOG", "1")
+    governor = Governor(
+        project_dir=str(tmp_path), session_store=MagicMock(spec=SessionStore)
+    )
+    patch_query(
+        {"task_summary": "x"},
+        usage={"input_tokens": 123, "output_tokens": 45},
+    )
+    await governor._parse_requirement("x", context_continuation=False)
+    log_file = tmp_path / ".claude" / "parse-logs" / "usage.jsonl"
+    assert log_file.exists()
+    rec = json.loads(log_file.read_text(encoding="utf-8").strip())
+    assert rec["input_tokens"] == 123
+    assert rec["output_tokens"] == 45
+    assert rec["tool_calls"] == 1  # submit_analysis_plan
+    assert rec["captured"] is True
+# ── 2d. ResultMessage.usage=None 不崩(回归:旧 msg.input_tokens 属性错已修) ──
+async def test_parse_requirement_result_msg_none_usage(tmp_path, monkeypatch):
+    """ResultMessage.usage=None -> _usage={} 兜底,不 AttributeError,spec 仍截获"""
+    monkeypatch.delenv("HARNESS_PARSE_LOG", raising=False)
+    governor = Governor(
+        project_dir=str(tmp_path), session_store=MagicMock(spec=SessionStore)
+    )
+    async def fake_query(*, prompt, options=None):
+        yield make_fake_assistant_msg({"task_summary": "x"})
+        yield make_fake_result_msg(usage=None)
+    monkeypatch.setattr(architect, "query", fake_query)
+    spec = await governor._parse_requirement("x", context_continuation=False)
+    assert spec == {"task_summary": "x"}
 # ── 2b. _parse_requirement 不盲拆:options 含 codegraph MCP + submit_analysis_plan tool ──
 async def test_parse_requirement_explores_project(monkeypatch):
     """_parse_requirement 配置含 codegraph MCP server + submit_analysis_plan tool(不盲拆)"""
@@ -182,6 +224,38 @@ def test_decide_track_missing_fields_delivery():
     """字段缺省 -> delivery（保守）"""
     governor = make_governor()
     assert governor._decide_track({}) == "delivery"
+# ── 5c. _decide_track request_kind 门(meta/question -> interactive, other 不门) ──
+def test_decide_track_meta_request_gated_interactive():
+    """request_kind=meta_request 即使 feature/6+/cross_domain(原规则 delivery) -> interactive(门拦截)"""
+    governor = make_governor()
+    spec = {
+        "request_kind": "meta_request",
+        "change_type": "feature",
+        "file_count_bucket": "6+",
+        "cross_domain": True,
+    }
+    assert governor._decide_track(spec) == "interactive"
+def test_decide_track_other_not_gated_delivery():
+    """request_kind=other 不门 -> 走原规则(feature/6+/cross_domain -> delivery),other 非逃逸口"""
+    governor = make_governor()
+    spec = {
+        "request_kind": "other",
+        "change_type": "feature",
+        "file_count_bucket": "6+",
+        "cross_domain": True,
+    }
+    assert governor._decide_track(spec) == "delivery"
+def test_decide_track_meta_high_delivery():
+    """request_kind=meta_request + risk=high -> delivery(high 安全网先于门,防 high dev_task 误标 meta 漏网)"""
+    governor = make_governor()
+    spec = {
+        "request_kind": "meta_request",
+        "change_type": "patch",
+        "file_count_bucket": "1-5",
+        "cross_domain": False,
+        "risk_level": "high",
+    }
+    assert governor._decide_track(spec) == "delivery"
 # ── 6. handle_user_input 自动交互轨 ──
 async def test_handle_interactive_auto():
     """mock 解析→interactive + mock _resident.send → events 含调度提示 + send 事件"""

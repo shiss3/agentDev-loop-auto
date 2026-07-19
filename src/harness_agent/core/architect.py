@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 import asyncio
+import datetime
 import json
 import os
 import shutil
@@ -23,6 +24,7 @@ from pathlib import Path
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    ResultMessage,
     SessionStore,
     ToolUseBlock,
     create_sdk_mcp_server,
@@ -53,6 +55,10 @@ from harness_agent.core.worktree import (
 TASK_SPEC_SCHEMA = {
     "type": "object",
     "properties": {
+        "request_kind": {  # 输入分类(_decide_track 门消费):dev_task/meta_request/question/other
+            "type": "string",
+            "enum": ["dev_task", "meta_request", "question", "other"],
+        },
         "task_summary": {"type": "string"},  # 一句话核心目标
         "acceptance_criteria": {  # 结构化验收要点（可验证）
             "type": "array",
@@ -100,6 +106,7 @@ TASK_SPEC_SCHEMA = {
         },
     },
     "required": [
+        "request_kind",
         "task_summary",
         "acceptance_criteria",
         "risk_level",
@@ -113,7 +120,8 @@ REQUIREMENT_PARSER_PROMPT = """\
 # 角色：L0 需求解析员
 你只做一件事：把用户需求转化为结构化、可验证的标准任务单。你不执行需求，不指导实现细节。
 ## 工作流程（不盲拆）
-1. 探索项目：用 codegraph_explore 查符号/文件/调用路径，用 Read/Grep/Glob 读相关模块。
+0. 先判 request_kind（分类约定见下"request_kind 分类"）：meta_request/question 不探索代码、不拆 subtasks，直接跳第 2 步。
+1. 探索项目（仅 dev_task）：用 codegraph_explore 查符号/文件/调用路径，用 Read/Grep/Glob 读相关模块。
    先看代码再拆任务，intended_files/scope_hint 才有依据。不探索直接拆=盲拆，禁止。
 2. 调用 submit_analysis_plan 提交结构化任务单（参数=任务单各字段）。
 ## 输出字段
@@ -159,10 +167,15 @@ REQUIREMENT_PARSER_PROMPT = """\
   risk_level 倾向 high，即倾向 delivery）。
 - track 由代码规则消费 risk_level/change_type/file_count_bucket/cross_domain 判定，suggest_track 仅供参考。
 - 不指导实现方案、不指定技术栈、不替模型做执行层决策。
-## 非开发需求兜底
-若输入不是开发任务（寒暄/闲聊/纯提问/澄清/无明确改动意图），不要拒绝、不要追问、不要留空字段，
-直接按 schema 调用 submit_analysis_plan，字段约定：
-- task_summary：摘要用户原话（如"用户提问:xxx"）
+## request_kind 分类（先判类型再拆）
+- dev_task：改代码/加功能/修 bug 的开发任务 -> 走完整流程拆 subtasks。
+- meta_request：要你产出文本（生成需求/文档/方案/示例）而非改代码 -> subtasks=[]，risk=low，不探索代码。
+- question：问答/解释/分析 -> subtasks=[]，risk=low。
+- other：确非前三类且无法归类才用，罕用；不确定默认归 dev_task（勿用 other 逃逸分类）。
+meta_request/question 不标 high（无代码改动无高风险）。
+## 非开发需求字段约定（meta_request/question）
+不要拒绝、不要追问、不要留空字段，直接按 schema 调用 submit_analysis_plan：
+- task_summary：摘要用户原话或产出目标（如"生成一个能触发交付轨的需求"）
 - acceptance_criteria：[]（空数组，无可验收项）
 - risk_level：low
 - change_type：patch
@@ -170,7 +183,7 @@ REQUIREMENT_PARSER_PROMPT = """\
 - cross_domain：false
 - suggest_track：interactive
 - subtasks：[]（空数组）
-调度层据此判为 interactive 走常驻交互。必填字段禁止留空、禁止输出 schema 外内容。
+调度层据 request_kind 门判为 interactive 走常驻交互。必填字段禁止留空、禁止输出 schema 外内容。
 """
 EXECUTOR_PROMPT = """\
 # 角色：执行层（由 L0 治理层派发任务）
@@ -183,6 +196,9 @@ EXECUTOR_PROMPT = """\
 - 你的输出是「待验收半成品」，不自行宣告任务完成 —— L0 会用客观工具验收。
 - 严格对齐 L0 下发的验收要求，不修改验收标准。
 - 遇到需求模糊先澄清，不要擅自扩大或缩小范围。
+## 元任务处理（request_kind=meta_request/question）
+L0 可能下发非开发任务（生成需求/文档/方案/示例/问答/分析）。此类按字面产出文本，
+不当开发任务执行、不改业务代码；仅当任务明确要产出文件（如写文档）才创建对应文件。
 """
 # 明显非需求输入(寒暄/确认/道别)白名单 -- handle_user_input 直接走交互轨跳过 LLM 解析省 token。
 # 仅抓最无歧义词;真任务(含动词/文件名/需求描述)不在此列,走 _parse_requirement。
@@ -338,27 +354,58 @@ class Governor:
         )
         prefix = "接续修改" if context_continuation else "全新任务"
         prompt = f"[{prefix}] {text}"
-        async for msg in query(prompt=prompt, options=opts):
-            # 流兜底:handler 未触发时从 AssistantMessage 提取 tool_use input
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if (isinstance(block, ToolUseBlock)
-                            and block.name == "mcp__plan_capture__submit_analysis_plan"
-                            and captured_spec is None):
-                        captured_spec = block.input
+        in_tokens = out_tokens = tool_calls = 0
+        try:
+            async for msg in query(prompt=prompt, options=opts):
+                # 流兜底:handler 未触发时从 AssistantMessage 提取 tool_use input
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if not isinstance(block, ToolUseBlock):
+                            continue
+                        tool_calls += 1
+                        if (block.name == "mcp__plan_capture__submit_analysis_plan"
+                                and captured_spec is None):
+                            captured_spec = block.input
+                elif isinstance(msg, ResultMessage):
+                    # ResultMessage.usage 是 dict(SDK 不平铺 input_tokens)
+                    _usage = msg.usage or {}
+                    in_tokens += _usage.get("input_tokens", 0) or 0
+                    out_tokens += _usage.get("output_tokens", 0) or 0
+        finally:
+            # 自测日志(默认关,设 HARNESS_PARSE_LOG=1 开):解析阶段 in/out tokens + 工具调用数
+            # -> .claude/parse-logs/usage.jsonl。finally 兜底:解析异常也写部分值供排查。
+            if os.environ.get("HARNESS_PARSE_LOG"):
+                _log_path = (
+                    Path(self.project_dir) / ".claude" / "parse-logs" / "usage.jsonl"
+                )
+                _log_path.parent.mkdir(parents=True, exist_ok=True)
+                _rec = {
+                    "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "prefix": prefix,
+                    "input_tokens": in_tokens,
+                    "output_tokens": out_tokens,
+                    "tool_calls": tool_calls,
+                    "captured": captured_spec is not None,
+                }
+                with _log_path.open("a", encoding="utf-8") as _f:
+                    _f.write(json.dumps(_rec, ensure_ascii=False) + "\n")
         if captured_spec is None:
             raise RuntimeError("需求解析未返回结构化结果")
         return captured_spec
     def _decide_track(self, spec: dict) -> str:
         """双轨调度判定 -- 纯规则消费 LLM 客观字段，不调 LLM。
-        risk_level=high -> delivery（高风险必走队列，下游可验收/隔离；本层拦死，常驻不直写）
-        交互轨(全满足且非 high)：change_type=patch AND file_count_bucket=1-5 AND cross_domain=False
+        1. risk_level=high -> delivery（高风险安全网最先，防 high dev_task 被误标 meta/question 漏网）
+        2. request_kind in (meta_request, question) -> interactive（元任务/问答不走交付轨）
+           other 不门（按原规则判，避免成逃逸 interactive 的口）
+        3. 交互轨(全满足且非 high)：change_type=patch AND file_count_bucket=1-5 AND cross_domain=False
         任一不满足或缺省 -> delivery（保守）
         context_continuation 不再影响 track（续聊也可能来复杂需求该走 delivery），
         仅作 _parse_requirement 的 prompt 前缀([接续修改]/[全新任务])。
         """
         if spec.get("risk_level") == "high":
             return "delivery"
+        if spec.get("request_kind") in ("meta_request", "question"):
+            return "interactive"
         if (spec.get("change_type") == "patch"
                 and spec.get("file_count_bucket") == "1-5"
                 and spec.get("cross_domain") is False):
