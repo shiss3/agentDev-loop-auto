@@ -11,23 +11,25 @@
 - BaseAgentSession.start/close 在 rebuild 测试中 patch 为 AsyncMock
 """
 from __future__ import annotations
-import re
 from unittest.mock import AsyncMock, MagicMock
 import pytest
-from claude_agent_sdk import ResultMessage, SessionStore
+from claude_agent_sdk import AssistantMessage, SessionStore, ToolUseBlock
 from harness_agent.chat.events import EventType, text_event
 from harness_agent.core import architect
-from harness_agent.core.architect import EXECUTOR_PROMPT, Governor, TASK_SPEC_SCHEMA
-from harness_agent.core.base_session import BaseAgentSession
+from harness_agent.core.architect import Governor
 from harness_agent.core.task_queue_adapter import TaskQueueAdapter
 # ── 辅助 ──────────────────────────────────────────────
-def make_fake_result_msg(structured=None):
-    """构造能通过 isinstance(msg, ResultMessage) 检查的 fake 消息。
-    MagicMock(spec=ResultMessage) —— spec 让 isinstance 返回 True。
-    structured: 填 msg.structured_output(结构化输出 dict;None 表示无)。
+def make_fake_assistant_msg(spec=None):
+    """构造能通过 isinstance(msg, AssistantMessage) 检查的 fake 消息。
+    MagicMock(spec=AssistantMessage) —— spec 让 isinstance 返回 True。
+    spec: 填 tool_use block 的 input(任务单 dict;None 表示无 tool_use)。
+    _parse_requirement 从流 AssistantMessage.tool_use 截获 submit_analysis_plan input。
     """
-    msg = MagicMock(spec=ResultMessage)
-    msg.structured_output = structured
+    msg = MagicMock(spec=AssistantMessage)
+    if spec is not None:
+        msg.content = [ToolUseBlock(id="1", name="mcp__plan_capture__submit_analysis_plan", input=spec)]
+    else:
+        msg.content = []
     return msg
 def make_fake_send(events):
     """构造 fake async generator send（替换 _resident.send）。
@@ -58,9 +60,9 @@ def patch_query(monkeypatch):
         patch_query({"task_summary":"...","acceptance_criteria":[],...})
         spec = await governor._parse_requirement("x", context_continuation=False)
     """
-    def _set(structured):
+    def _set(spec):
         async def fake_query(*, prompt, options=None):
-            yield make_fake_result_msg(structured)
+            yield make_fake_assistant_msg(spec)
         monkeypatch.setattr(architect, "query", fake_query)
     return _set
 @pytest.fixture
@@ -83,13 +85,49 @@ async def test_parse_requirement_returns_spec(patch_query):
     patch_query(expected)
     spec = await governor._parse_requirement("x", context_continuation=False)
     assert spec == expected
-# ── 2. _parse_requirement 无 JSON 文本 → RuntimeError ──
+# ── 2. _parse_requirement 无 tool_use -> RuntimeError ──
 async def test_parse_requirement_no_output_raises(patch_query):
-    """query 返回无 structured_output -> _parse_requirement raise RuntimeError"""
+    """query 流无 submit_analysis_plan tool_use -> _parse_requirement raise RuntimeError"""
     governor = make_governor()
-    patch_query(None)  # 无结构化输出
+    patch_query(None)  # 无 tool_use
     with pytest.raises(RuntimeError, match="未返回结构化结果"):
         await governor._parse_requirement("x", context_continuation=False)
+# ── 2b. _parse_requirement 不盲拆:options 含 codegraph MCP + submit_analysis_plan tool ──
+async def test_parse_requirement_explores_project(monkeypatch):
+    """_parse_requirement 配置含 codegraph MCP server + submit_analysis_plan tool(不盲拆)"""
+    governor = make_governor()
+    captured = {}
+    async def fake_query(*, prompt, options=None):
+        captured["options"] = options
+        yield make_fake_assistant_msg({"task_summary": "x"})
+    monkeypatch.setattr(architect, "query", fake_query)
+    await governor._parse_requirement("x", context_continuation=False)
+    opts = captured["options"]
+    # codegraph MCP server 配置(探索工具)
+    assert "codegraph" in opts.mcp_servers
+    codegraph_cfg = opts.mcp_servers["codegraph"]
+    assert codegraph_cfg["command"] == "codegraph"
+    assert codegraph_cfg["args"] == ["serve", "--mcp"]
+    # plan_capture SDK MCP server(submit_analysis_plan 装载于此)
+    assert "plan_capture" in opts.mcp_servers
+    # 读工具 + submit_analysis_plan 在 allowed_tools
+    assert "mcp__codegraph__codegraph_explore" in opts.allowed_tools
+    assert "Read" in opts.allowed_tools
+    assert "Glob" in opts.allowed_tools
+    assert "Grep" in opts.allowed_tools
+    assert "mcp__plan_capture__submit_analysis_plan" in opts.allowed_tools
+    # max_turns=40(探索+拆任务+调用工具需多轮)
+    assert opts.max_turns == 40
+    # 不用 output_format(改用 tool 截获)
+    assert opts.output_format is None
+    # 写工具/任务工具被禁(解析只读不副作用)
+    assert "Bash" in opts.disallowed_tools
+    assert "Edit" in opts.disallowed_tools
+    assert "Write" in opts.disallowed_tools
+    assert "WebSearch" in opts.disallowed_tools
+    assert "TaskCreate" in opts.disallowed_tools
+    assert "AskUserQuestion" in opts.disallowed_tools
+
 # ── 3. _decide_track 全满足(patch+1-5+cross_domain=False) -> interactive ──
 def test_decide_track_all_patch_interactive():
     """spec 全满足交互轨条件 -> interactive"""

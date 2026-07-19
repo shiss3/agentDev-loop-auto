@@ -1,6 +1,6 @@
 """Governor — L0 治理者（Phase 2 Step 3）。
 职责：
-1. 需求解析：独立 stateless query() + output_format，输出标准化任务单，不进常驻 session 历史
+1. 需求解析：独立 stateless query() + submit_analysis_plan tool（带项目探索），输出标准化任务单，不进常驻 session 历史
 2. 双轨调度：纯规则判定交互轨 / 交付轨（任务规模 + 上下文连续性），不调 LLM
 3. 交互轨直执行：经 self._resident.send() 产出 ChatEvent 流（常驻执行体，上下文连续）
 4. 解析异常降级：_parse_requirement 异常 → 降级交互轨直接执行，不阻断用户
@@ -21,10 +21,13 @@ import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from claude_agent_sdk import (
+    AssistantMessage,
     ClaudeAgentOptions,
-    ResultMessage,
     SessionStore,
+    ToolUseBlock,
+    create_sdk_mcp_server,
     query,
+    tool,
 )
 from harness_agent.chat.events import ChatEvent
 from harness_agent.chat.session_store import create_session_store
@@ -109,6 +112,10 @@ TASK_SPEC_SCHEMA = {
 REQUIREMENT_PARSER_PROMPT = """\
 # 角色：L0 需求解析员
 你只做一件事：把用户需求转化为结构化、可验证的标准任务单。你不执行需求，不指导实现细节。
+## 工作流程（不盲拆）
+1. 探索项目：用 codegraph_explore 查符号/文件/调用路径，用 Read/Grep/Glob 读相关模块。
+   先看代码再拆任务，intended_files/scope_hint 才有依据。不探索直接拆=盲拆，禁止。
+2. 调用 submit_analysis_plan 提交结构化任务单（参数=任务单各字段）。
 ## 输出字段
 - task_summary：一句话概括任务核心目标。
 - acceptance_criteria：结构化验收要点列表，每项必须可验证（能跑命令/测试/接口验证），
@@ -133,10 +140,15 @@ REQUIREMENT_PARSER_PROMPT = """\
     同一需求内同一模块用同一 slug；一个模块可含多领域（前端+后端+数据库）。
   - summary：该子任务核心目标。
   - acceptance：该子任务可验证的验收要点。
-  - intended_files：预期改动的文件路径列表（不确定可留空）。
+  - intended_files：预期改动的文件路径列表（探索后填，不确定可留空）。
   - deps：依赖的同批 subtask id 列表（必须先完成的；无依赖留空数组）。
   每项标 module_id（业务模块）+ domain（技术领域）；同 (module_id, domain) 可多 subtask。
   执行器按 (module_id, domain) 聚合领取以减上下文噪音，故 module_id/domain 须规范一致。
+## 调用指引
+- 分析完成后必须调用 submit_analysis_plan 提交任务单，不要只输出文本。
+- submit_analysis_plan 参数 = 任务单各字段（task_summary/acceptance_criteria/.../subtasks），
+  schema 与上述字段约定一致。
+- 调用后工具返回确认字符串，解析结束，不要再输出其他内容。
 ## 纪律
 - 严格锚定原始需求，所有验收项可追溯到需求原文。
 - subtasks 的 prompt/summary 必须自包含（执行器看不到你的上下文）。
@@ -149,7 +161,7 @@ REQUIREMENT_PARSER_PROMPT = """\
 - 不指导实现方案、不指定技术栈、不替模型做执行层决策。
 ## 非开发需求兜底
 若输入不是开发任务（寒暄/闲聊/纯提问/澄清/无明确改动意图），不要拒绝、不要追问、不要留空字段，
-直接按 schema 输出，字段约定：
+直接按 schema 调用 submit_analysis_plan，字段约定：
 - task_summary：摘要用户原话（如"用户提问:xxx"）
 - acceptance_criteria：[]（空数组，无可验收项）
 - risk_level：low
@@ -275,34 +287,68 @@ class Governor:
     async def _parse_requirement(
         self, text: str, *, context_continuation: bool
     ) -> dict:
-        """独立 stateless 需求解析。结构化输出(SDK 强制合规 JSON)。
-        - tools=[](禁内置工具)+ strict_mcp_config=True(禁外部 MCP server,
-          只用传入的 mcp_servers=空)。双隔离防模型看到 MCP 工具(如 codegraph)
-          在复杂需求时调用 -> 耗尽 max_turns(error_max_turns 降级根因)。
-          ⚠️ 不用 setting_sources=[]:它会连带禁 settings.json 的 model/env 块,
-          导致 CLI 丢模型配置回退到不可用代理模型(success error)。
-        - output_format=json_schema:SDK 结构化通道强制合规 JSON(字段转义+enum),
-          比文本自解析可靠(glm-5.2 文本输出常漏转义内引号 -> json.loads 失败)。
-        - max_turns=2(结构化输出实测需 2 turn,留余量防 error_max_turns)。
-        - 不挂 session_store(一次性,用完即弃)/ can_use_tool(判定无工具调用)。
-        读 ResultMessage.structured_output(dict)。None -> RuntimeError(降级交互轨)。
+        """独立 stateless 需求解析（不盲拆 - 带项目探索能力）。
+        - submit_analysis_plan SDK tool:模型探索完项目后调用此工具提交结构化任务单,
+          handler 截获 args 存闭包变量;流 AssistantMessage.tool_use 兜底(handler 未触发时)。
+        - mcp_servers:plan_capture(SDK MCP,装 submit_analysis_plan)+ codegraph(stdio,探索工具)。
+        - allowed_tools:只放读工具(codegraph_explore/Read/Glob/Grep)+ submit_analysis_plan,
+          disallowed_tools 禁一切写工具/任务工具/问答工具,保解析只读不副作用。
+        - strict_mcp_config=True:保留 model/env,禁 settings.json 的外部 MCP server。
+        - max_turns=40:探索+拆任务+调用工具需多轮,4 turn 不够。
+        截获失败 -> RuntimeError(降级交互轨,handle_user_input :363 catch)。
         """
+        captured_spec: dict | None = None
+
+        async def _capture_handler(args: dict) -> dict:
+            nonlocal captured_spec
+            captured_spec = args
+            return {"content": [{"type": "text", "text": "计划已接收，解析结束"}]}
+
+        submit_tool = tool(
+            name="submit_analysis_plan",
+            description="提交结构化任务单(参数=任务单各字段)。分析完项目后调用此工具结束解析。",
+            input_schema=TASK_SPEC_SCHEMA,
+        )(_capture_handler)
+        plan_server = create_sdk_mcp_server(name="plan_capture", tools=[submit_tool])
+
         opts = ClaudeAgentOptions(
             system_prompt=REQUIREMENT_PARSER_PROMPT,
-            tools=[],
             cwd=self.project_dir,
             model=self.model,
-            max_turns=2,
-            strict_mcp_config=True,  # 禁外部 MCP(codegraph 等),保留 model/env
-            output_format={"type": "json_schema", "schema": TASK_SPEC_SCHEMA},
+            max_turns=40,  # 探索+拆任务+调用工具需多轮
+            strict_mcp_config=True,  # 禁外部 MCP(只留传入的 plan_capture/codegraph),保留 model/env
+            mcp_servers={
+                "plan_capture": plan_server,
+                "codegraph": {
+                    "type": "stdio",
+                    "command": "codegraph",
+                    "args": ["serve", "--mcp"],
+                },
+            },
+            allowed_tools=[
+                "mcp__codegraph__codegraph_explore",
+                "Read", "Glob", "Grep",
+                "mcp__plan_capture__submit_analysis_plan",
+            ],
+            disallowed_tools=[
+                "Bash", "Edit", "Write", "WebSearch", "WebFetch",
+                "TaskCreate", "TaskList", "TaskUpdate", "TaskGet",
+                "EnterPlanMode", "ExitPlanMode", "AskUserQuestion",
+            ],
         )
         prefix = "接续修改" if context_continuation else "全新任务"
         prompt = f"[{prefix}] {text}"
         async for msg in query(prompt=prompt, options=opts):
-            if isinstance(msg, ResultMessage):
-                if msg.structured_output:
-                    return msg.structured_output
-        raise RuntimeError("需求解析未返回结构化结果")
+            # 流兜底:handler 未触发时从 AssistantMessage 提取 tool_use input
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if (isinstance(block, ToolUseBlock)
+                            and block.name == "mcp__plan_capture__submit_analysis_plan"
+                            and captured_spec is None):
+                        captured_spec = block.input
+        if captured_spec is None:
+            raise RuntimeError("需求解析未返回结构化结果")
+        return captured_spec
     def _decide_track(self, spec: dict) -> str:
         """双轨调度判定 -- 纯规则消费 LLM 客观字段，不调 LLM。
         risk_level=high -> delivery（高风险必走队列，下游可验收/隔离；本层拦死，常驻不直写）
@@ -503,6 +549,13 @@ class Governor:
                     json.dumps(manifest, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
+                # DRY-RUN:自测看 dispatch 清单用。写完即停,不 spawn claude,不走验证/merge。
+                if os.environ.get("HARNESS_DELIVERY_DRY_RUN"):
+                    yield _build_message(
+                        f"🧪 DRY-RUN: dispatch 清单已写 {manifest_path}\n"
+                        f"   跳过 spawn claude(自测用)。worktree 残留可手动删: {worktree_path}"
+                    )
+                    return
                 yield _build_message(
                     f"▶ 槽 {mod}/{dom} 执行器启动 "
                     f"(attempt {retry + 1}/3, max_turns={max_turns})"

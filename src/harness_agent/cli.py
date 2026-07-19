@@ -11,14 +11,14 @@ import asyncio
 from pathlib import Path
 
 import click
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 
 from harness_agent.core.orchestrator import HarnessOrchestrator
 
-# 加载 .env
-load_dotenv()
+# 从 CWD 向上加载 .env(打包安装后从用户项目目录读;开发模式从仓库根读)
+load_dotenv(find_dotenv(usecwd=True))
 
 console = Console()
 
