@@ -121,6 +121,7 @@ async def test_parse_requirement_logs_usage(tmp_path, patch_query, monkeypatch):
     assert rec["output_tokens"] == 45
     assert rec["tool_calls"] == 1  # submit_analysis_plan
     assert rec["captured"] is True
+    assert rec["duration_s"] >= 0
 # ── 2d. ResultMessage.usage=None 不崩(回归:旧 msg.input_tokens 属性错已修) ──
 async def test_parse_requirement_result_msg_none_usage(tmp_path, monkeypatch):
     """ResultMessage.usage=None -> _usage={} 兜底,不 AttributeError,spec 仍截获"""

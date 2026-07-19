@@ -355,6 +355,7 @@ class Governor:
         prefix = "接续修改" if context_continuation else "全新任务"
         prompt = f"[{prefix}] {text}"
         in_tokens = out_tokens = tool_calls = 0
+        _start = datetime.datetime.now()
         try:
             async for msg in query(prompt=prompt, options=opts):
                 # 流兜底:handler 未触发时从 AssistantMessage 提取 tool_use input
@@ -381,6 +382,9 @@ class Governor:
                 _log_path.parent.mkdir(parents=True, exist_ok=True)
                 _rec = {
                     "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "duration_s": round(
+                        (datetime.datetime.now() - _start).total_seconds(), 2
+                    ),
                     "prefix": prefix,
                     "input_tokens": in_tokens,
                     "output_tokens": out_tokens,
