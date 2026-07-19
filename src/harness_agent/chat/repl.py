@@ -32,6 +32,16 @@ from harness_agent.chat.commands import get_command
 
 logger = logging.getLogger(__name__)
 
+# 屏蔽 claude_agent_sdk logger.error 写 stderr 污染全屏 TUI。
+# ESC 取消 -> SDK interrupt -> claude CLI 子进程退出码1 -> ProcessError ->
+# SDK query.py logger.error("Fatal error in message reader: ...") 经 logging
+# lastResort 写 sys.stderr，文本糊到 TUI 屏幕；resize 触发重绘才被覆盖
+# （即"调整窗口大小后报错消失"）。取消的预期副作用（真错误已由 send() 的
+# error_event 渲染到 ContentBuffer），故吞掉。
+_sdk_logger = logging.getLogger("claude_agent_sdk")
+_sdk_logger.addHandler(logging.NullHandler())
+_sdk_logger.propagate = False
+
 
 class ChatCLI:
     """REPL 聊天主循环（TUI 版）
