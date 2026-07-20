@@ -75,7 +75,7 @@ class TerminalRenderer:
 # ── CLI 命令 ────────────────────────────────────────────
 
 @click.group()
-@click.version_option(version="0.1.0")
+@click.version_option()
 def cli():
     """🐴 Harness Agent — 驾驭工程实践"""
     pass
@@ -236,7 +236,8 @@ def chat(project: str | None, model: str | None, resume: str | None, continue_co
 @cli.command()
 def version():
     """显示版本信息"""
-    console.print("[bold]Harness Agent[/bold] v0.1.0")
+    from harness_agent import __version__
+    console.print(f"[bold]Harness Agent[/bold] v{__version__}")
     console.print("[dim]驾驭工程实践 — Powered by Claude Agent SDK[/dim]")
 
 
