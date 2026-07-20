@@ -1,6 +1,6 @@
 [project]
 name = "harness-agent"
-version = "0.1.4"
+version = "0.2.0"
 description = "驾驭工程实践 — 基于 Claude Agent SDK 的智能开发编排系统"
 requires-python = ">=3.10"
 
