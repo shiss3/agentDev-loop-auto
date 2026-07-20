@@ -394,10 +394,33 @@ async def test_handle_forced_interactive_skips_parse():
     assert "interactive" in dispatch_evs[0].data["text"]
     assert fake_ev in events
     governor._parse_requirement.assert_not_called()
-# ── 9. forced_track="delivery" 跳过解析 ──
-async def test_handle_forced_delivery():
-    """forced_track='delivery' → _parse_requirement 不被调用，events 含 delivery+降级(无子任务)+send 事件"""
+# ── 9. forced_track="delivery" 解析+强制 delivery(subtasks 非空) ──
+async def test_handle_forced_delivery_runs_delivery(monkeypatch):
+    """forced_track='delivery' -> 调 _parse_requirement;subtasks 非空 -> 强制走 _run_delivery"""
     governor = make_governor()
-    governor._parse_requirement = AsyncMock(side_effect=AssertionError("不应调用"))
-    fake_ev = text_event("fake-exec")
-    governor._resident.send = make_fake_send([fake_ev])
+    governor._parse_requirement = AsyncMock(return_value={
+        "task_summary": "x",
+        "subtasks": [{"id": "t1", "domain": "backend", "summary": "s",
+                      "acceptance": [], "module_id": "m", "deps": []}],
+    })
+    delivery_specs = []
+    async def fake_delivery(self, spec):
+        delivery_specs.append(spec)
+        yield text_event("delivery-ev")
+    monkeypatch.setattr(Governor, "_run_delivery", fake_delivery)
+    events = await collect(governor.handle_user_input("x", forced_track="delivery"))
+    governor._parse_requirement.assert_called_once()
+    assert delivery_specs  # 走了 delivery
+    dispatch_evs = _text_events_containing(events, "调度")
+    assert any("delivery" in e.data["text"] for e in dispatch_evs)
+# ── 9b. forced_track="delivery" subtasks=[] -> 拦截不执行 ──
+async def test_handle_forced_delivery_empty_subtasks_blocked(monkeypatch):
+    """forced_track='delivery' + subtasks=[] -> 拦截提示,不走 _run_delivery"""
+    governor = make_governor()
+    governor._parse_requirement = AsyncMock(return_value={"task_summary": "x", "subtasks": []})
+    async def fake_delivery(self, spec):
+        yield text_event("should-not-happen")
+    monkeypatch.setattr(Governor, "_run_delivery", fake_delivery)
+    events = await collect(governor.handle_user_input("x", forced_track="delivery"))
+    assert not _text_events_containing(events, "should-not-happen")
+    assert _text_events_containing(events, "未拆出子任务")

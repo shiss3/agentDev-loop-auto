@@ -425,19 +425,40 @@ class Governor:
         """用户输入 → ChatEvent 流。
         forced_track 语义：
           None             → 自动判定（_parse_requirement + _decide_track）
-          "interactive"    → 跳过解析，直接交互轨执行
-          "delivery"       → 跳过解析，直接交付轨
+          "interactive"    -> 跳过解析，直接交互轨执行（像寒暄直通，占位 spec）
+          "delivery"       -> 解析保字段 + 强制交付轨（跳过 _decide_track；subtasks 空则拦截）
         """
         self._last_text = text
         context_continuation = self._resident.stats.turn_count > 0
-        if forced_track:
-            track = forced_track
+        if forced_track == "interactive":
+            # 场景1:不解析直通(像寒暄),占位 spec
+            track = "interactive"
             spec = {
                 "task_summary": text,
                 "acceptance_criteria": [],
-                "risk_level": "medium",
-                "suggest_track": track,
+                "risk_level": "low",
+                "suggest_track": "interactive",
             }
+        elif forced_track == "delivery":
+            # 场景2:解析保字段 -> 校验 subtasks -> 强制 delivery(跳过 _decide_track)
+            try:
+                spec = await self._parse_requirement(
+                    text, context_continuation=context_continuation
+                )
+            except Exception as e:
+                yield _build_message(
+                    f"⚠️ 需求解析异常({str(e)[:80]}),已降级为交互轨直接执行。"
+                )
+                async for event in self._resident.send(text):
+                    yield event
+                return
+            if not (spec.get("subtasks") or []):
+                yield _build_message(
+                    "⚠️ 强制交付轨但解析未拆出子任务(输入可能非开发任务)。"
+                    "请重述为开发需求,或用 /interactive 直通交互轨。"
+                )
+                return
+            track = "delivery"
         else:
             if self._is_casual_input(text):
                 # 寒暄/确认等非需求输入直接常驻交互,跳过 LLM 解析省 token

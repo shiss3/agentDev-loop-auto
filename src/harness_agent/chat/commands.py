@@ -124,3 +124,21 @@ async def cmd_model(cli: "ChatCLI", args: str) -> None:
     else:
         current = cli.session.model or "default"
         cli.renderer.render_command_result(f"当前模型: {current}")
+
+
+@slash_command("int", "强制交互轨执行（不解析直通，像寒暄）", usage="<需求>")
+async def cmd_interactive(cli: "ChatCLI", args: str) -> None:
+    text = args.strip()
+    if not text:
+        cli.renderer.render_command_result("用法: /int <需求>")
+        return
+    await cli._handle_message(text, forced_track="interactive")
+
+
+@slash_command("del", "强制交付轨执行（解析后必走交付轨）", usage="<需求>")
+async def cmd_delivery(cli: "ChatCLI", args: str) -> None:
+    text = args.strip()
+    if not text:
+        cli.renderer.render_command_result("用法: /del <需求>")
+        return
+    await cli._handle_message(text, forced_track="delivery")

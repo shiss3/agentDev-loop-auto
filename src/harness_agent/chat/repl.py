@@ -185,7 +185,7 @@ class ChatCLI:
                 f"未知命令: /{name}  输入 /help 查看可用命令"
             )
 
-    async def _handle_message(self, prompt: str) -> None:
+    async def _handle_message(self, prompt: str, *, forced_track: str | None = None) -> None:
         """处理普通聊天消息 — 发送给 Agent
 
         使用独立的任务来处理，以便可以取消。
@@ -194,7 +194,9 @@ class ChatCLI:
         await self._cancel_message_task()
 
         # 创建新任务处理消息
-        self._message_task = asyncio.create_task(self._stream_events(prompt))
+        self._message_task = asyncio.create_task(
+            self._stream_events(prompt, forced_track=forced_track)
+        )
 
         try:
             await self._message_task
@@ -216,12 +218,12 @@ class ChatCLI:
         from harness_agent import __version__
         self.renderer.render_welcome(self.project_dir, __version__)
 
-    async def _stream_events(self, prompt: str) -> None:
+    async def _stream_events(self, prompt: str, *, forced_track: str | None = None) -> None:
         """流式处理事件
 
         这是实际处理消息的方法，可以被取消。
         """
-        async for event in self.governor.handle_user_input(prompt):
+        async for event in self.governor.handle_user_input(prompt, forced_track=forced_track):
             # 检查任务是否被取消
             if asyncio.current_task().cancelled():
                 break
