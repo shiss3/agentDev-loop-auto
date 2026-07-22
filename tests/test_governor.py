@@ -395,10 +395,323 @@ async def test_handle_forced_interactive_skips_parse():
     assert "interactive" in dispatch_evs[0].data["text"]
     assert fake_ev in events
     governor._parse_requirement.assert_not_called()
-# ── 9. forced_track="delivery" 跳过解析 ──
-async def test_handle_forced_delivery():
-    """forced_track='delivery' → _parse_requirement 不被调用，events 含 delivery+降级(无子任务)+send 事件"""
+# ── 9. forced_track="delivery" 解析+强制 delivery(subtasks 非空) ──
+async def test_handle_forced_delivery_runs_delivery(monkeypatch):
+    """forced_track='delivery' -> 调 _parse_requirement;subtasks 非空 -> 强制走 _run_delivery"""
     governor = make_governor()
-    governor._parse_requirement = AsyncMock(side_effect=AssertionError("不应调用"))
-    fake_ev = text_event("fake-exec")
-    governor._resident.send = make_fake_send([fake_ev])
+    governor._parse_requirement = AsyncMock(return_value={
+        "task_summary": "x",
+        "subtasks": [{"id": "t1", "domain": "backend", "summary": "s",
+                      "acceptance": [], "module_id": "m", "deps": []}],
+    })
+    delivery_specs = []
+    async def fake_delivery(self, spec):
+        delivery_specs.append(spec)
+        yield text_event("delivery-ev")
+    monkeypatch.setattr(Governor, "_run_delivery", fake_delivery)
+    events = await collect(governor.handle_user_input("x", forced_track="delivery"))
+    governor._parse_requirement.assert_called_once()
+    assert delivery_specs  # 走了 delivery
+    dispatch_evs = _text_events_containing(events, "调度")
+    assert any("delivery" in e.data["text"] for e in dispatch_evs)
+# ── 9b. forced_track="delivery" subtasks=[] -> 拦截不执行 ──
+async def test_handle_forced_delivery_empty_subtasks_blocked(monkeypatch):
+    """forced_track='delivery' + subtasks=[] -> 拦截提示,不走 _run_delivery"""
+    governor = make_governor()
+    governor._parse_requirement = AsyncMock(return_value={"task_summary": "x", "subtasks": []})
+    async def fake_delivery(self, spec):
+        yield text_event("should-not-happen")
+    monkeypatch.setattr(Governor, "_run_delivery", fake_delivery)
+    events = await collect(governor.handle_user_input("x", forced_track="delivery"))
+    assert not _text_events_containing(events, "should-not-happen")
+    assert _text_events_containing(events, "未拆出子任务")
+# ── 10. _run_validation 显式 UTF-8 编码(gbk locale 不炸) ──
+async def test_run_validation_forces_utf8_encoding(monkeypatch):
+    """_run_validation subprocess 必须 encoding='utf-8'+errors='replace'。
+
+    Windows zh-CN text=True 默认 gbk,pytest/ruff 吐 UTF-8 中文 ->
+    _readerthread UnicodeDecodeError。
+    """
+    governor = make_governor()
+    captured: list[dict] = []
+
+    def fake_run(*a, **kw):
+        captured.append(kw)
+        r = MagicMock()
+        r.returncode = 0
+        r.stdout = ""
+        r.stderr = ""
+        return r
+
+    monkeypatch.setattr(architect.subprocess, "run", fake_run)
+    ok, _ = await governor._run_validation(".")
+    assert ok is True
+    assert captured  # 至少 pytest 一次
+    for kw in captured:
+        assert kw.get("encoding") == "utf-8"
+        assert kw.get("errors") == "replace"
+
+
+# ── resident_plan：常驻会话方案生成工具 ──
+def test_resident_session_mounts_plan_tool():
+    """_build_resident_session 挂载 plan_gen SDK server + tool_intercept；未配置 task_queue 也挂载"""
+    governor = make_governor()
+    assert governor._task_queue is None  # 未配置 TASK_SERVICE_DIR/TASK_DB
+    session = governor._resident
+    opts = session._build_options()
+    assert "plan_gen" in opts.mcp_servers
+    assert session.tool_intercept == governor._on_tool_use
+
+
+async def test_capture_plan_handler():
+    """propose_plan handler 截获 args 存 _pending_plan，返回确认文本"""
+    governor = make_governor()
+    spec = {"task_summary": "x", "subtasks": [{"id": "t1"}]}
+    result = await governor._capture_plan(spec)
+    assert governor._pending_plan is spec
+    assert result["content"][0]["type"] == "text"
+
+
+def test_on_tool_use_fallback():
+    """流式兜底：plan 工具名且 _pending_plan 为空 -> 补获；已有方案/其他工具 -> 不动"""
+    governor = make_governor()
+    # 其他工具不截获
+    governor._on_tool_use("Read", {"file_path": "x"})
+    assert governor._pending_plan is None
+    # plan 工具截获
+    spec = {"task_summary": "fallback"}
+    governor._on_tool_use("mcp__plan_gen__propose_plan", spec)
+    assert governor._pending_plan is spec
+    # 已有方案不被兜底覆盖（主通道优先）
+    governor._on_tool_use("mcp__plan_gen__propose_plan", {"task_summary": "other"})
+    assert governor._pending_plan is spec
+
+
+async def test_rebuild_keeps_plan_tool(monkeypatch):
+    """rebuild 后工具仍挂载；_pending_plan 存 Governor 不丢"""
+    monkeypatch.setattr(
+        "harness_agent.core.base_session.BaseAgentSession.start", AsyncMock()
+    )
+    monkeypatch.setattr(
+        "harness_agent.core.base_session.BaseAgentSession.close", AsyncMock()
+    )
+    governor = make_governor()
+    governor._pending_plan = {"task_summary": "keep"}
+    await governor.rebuild(model="other-model")
+    opts = governor._resident._build_options()
+    assert "plan_gen" in opts.mcp_servers
+    assert governor._resident.tool_intercept == governor._on_tool_use
+    assert governor._pending_plan == {"task_summary": "keep"}
+
+
+# ── resident_plan：采纳闭环（采用方案 -> seed 灌队列）──
+def _plan_spec():
+    """带 2 子任务 + deps 的待采纳方案（propose_plan 截获格式）。"""
+    return {
+        "task_summary": "交付用户模块",
+        "subtasks": [
+            {
+                "id": "t1",
+                "domain": "backend",
+                "module_id": "user",
+                "summary": "建用户表",
+                "acceptance": ["迁移可跑"],
+                "deps": [],
+            },
+            {
+                "id": "t2",
+                "domain": "backend",
+                "module_id": "user",
+                "summary": "用户 API",
+                "acceptance": ["测试通过"],
+                "deps": ["t1"],
+            },
+        ],
+    }
+
+
+def _make_governor_with_queue():
+    """Governor + MagicMock task_queue（seed 返回 tasks 数）。"""
+    mq = MagicMock()
+    mq.seed = MagicMock(side_effect=lambda tasks: len(tasks))
+    governor = Governor(
+        project_dir=".", session_store=MagicMock(spec=SessionStore), task_queue=mq
+    )
+    return governor, mq
+
+
+async def test_adopt_plan_seeds_and_clears():
+    """采用方案 + 待采纳方案 -> seed 灌队列（id/deps 映射）-> 反馈 req_id+数量 -> 清空防重复"""
+    governor, mq = _make_governor_with_queue()
+    governor._pending_plan = _plan_spec()
+    events = await collect(governor.handle_user_input("采用方案"))
+    # seed 一次，2 任务，id 带 req_id 前缀，deps 映射到前缀 id
+    assert mq.seed.call_count == 1
+    tasks = mq.seed.call_args.args[0]
+    assert len(tasks) == 2
+    req_id = tasks[0]["req_id"]
+    assert tasks[0]["id"] == f"{req_id}-t1"
+    assert tasks[1]["deps"] == [f"{req_id}-t1"]
+    assert tasks[0]["module_id"] == "user"
+    # 反馈事件含 req_id + 数量
+    text = "\n".join(e.data.get("text", "") for e in events)
+    assert req_id in text
+    assert "已灌入 2 个任务" in text
+    # 方案清空，防重复灌入
+    assert governor._pending_plan is None
+    # 再次采纳 -> 无待采纳提示，不再 seed
+    events2 = await collect(governor.handle_user_input("采用方案"))
+    assert mq.seed.call_count == 1
+    assert "无待采纳方案" in events2[0].data["text"]
+
+
+async def test_adopt_plan_no_pending():
+    """无待采纳方案 -> 明确提示，不 seed"""
+    governor, mq = _make_governor_with_queue()
+    events = await collect(governor.handle_user_input("采用方案"))
+    assert mq.seed.call_count == 0
+    assert "无待采纳方案" in events[0].data["text"]
+
+
+async def test_adopt_plan_no_task_queue():
+    """task_queue=None -> 降级提示不崩溃，方案保留可重试"""
+    governor = make_governor()  # 无 env -> _task_queue None
+    governor._pending_plan = _plan_spec()
+    events = await collect(governor.handle_user_input("采用方案"))
+    assert "未配置任务队列" in events[0].data["text"]
+    assert governor._pending_plan is not None
+
+
+async def test_adopt_plan_empty_subtasks():
+    """方案无子任务 -> 提示不 seed，方案保留"""
+    governor, mq = _make_governor_with_queue()
+    governor._pending_plan = {"task_summary": "x", "subtasks": []}
+    events = await collect(governor.handle_user_input("采用方案"))
+    assert mq.seed.call_count == 0
+    assert "未拆出子任务" in events[0].data["text"]
+    assert governor._pending_plan is not None
+
+
+# ── resident_plan：采纳灌队列端到端（真实 sqlite TASK_DB）──
+# 最小 store stub（契约同 task-service/store.py，仅 init_db+seed；
+# adapter.list_by_req 直查 sqlite 不经 store，无需 stub）。
+# 隔离 sys.path/sys.modules 污染（同 test_task_queue_adapter 套路）。
+_MINI_STORE = '''\
+import json
+import sqlite3
+
+
+def init_db(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS tasks (
+                id TEXT PRIMARY KEY,
+                req_id TEXT,
+                domain TEXT,
+                module_id TEXT,
+                prompt TEXT,
+                intended_files TEXT,
+                deps TEXT,
+                status TEXT DEFAULT 'pending',
+                claimed_at TEXT,
+                done_at TEXT
+            )"""
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def seed(tasks, db_path=None):
+    init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    inserted = 0
+    try:
+        for t in tasks:
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO tasks
+                   (id, req_id, domain, module_id, prompt, intended_files, deps, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')""",
+                (
+                    t["id"],
+                    t["req_id"],
+                    t.get("domain", ""),
+                    t.get("module_id"),
+                    t.get("prompt", ""),
+                    json.dumps(t.get("intended_files") or []),
+                    json.dumps(t.get("deps") or []),
+                ),
+            )
+            inserted += cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return inserted
+'''
+
+
+@pytest.fixture
+def mini_store_dir(tmp_path):
+    """写最小 store.py 到 tmp_path；teardown 清 sys.modules/sys.path 污染。"""
+    import sys
+    from pathlib import Path
+
+    (tmp_path / "store.py").write_text(_MINI_STORE, encoding="utf-8")
+    svc_dir = str(tmp_path)
+    yield svc_dir
+    sys.modules.pop("store", None)
+    resolved = str(Path(svc_dir).resolve())
+    for p in (svc_dir, resolved):
+        while p in sys.path:
+            sys.path.remove(p)
+
+
+def _make_governor_real_db(svc_dir, db_path):
+    """Governor + 真实 TaskQueueAdapter（tmp sqlite TASK_DB）。"""
+    adapter = TaskQueueAdapter(svc_dir, db_path)
+    return Governor(
+        project_dir=".",
+        session_store=MagicMock(spec=SessionStore),
+        task_queue=adapter,
+    ), adapter
+
+
+async def test_capture_then_adopt_real_sqlite(mini_store_dir, tmp_path):
+    """工具调用截获待采纳方案 -> 采用方案 -> sqlite 可 list_by_req 查到，字段/deps 映射正确"""
+    import re
+
+    db_path = str(tmp_path / "task.db")
+    governor, adapter = _make_governor_real_db(mini_store_dir, db_path)
+    # 模拟方案工具调用 -> Governor 暂存待采纳方案
+    await governor._capture_plan(_plan_spec())
+    assert governor._pending_plan is not None
+    assert governor._pending_plan["task_summary"] == "交付用户模块"
+    # 采纳确认
+    events = await collect(governor.handle_user_input("采用方案"))
+    text = "\n".join(e.data.get("text", "") for e in events)
+    m = re.search(r"req_id=([0-9a-f]{8})", text)
+    assert m, f"反馈事件缺 req_id: {text}"
+    req_id = m.group(1)
+    # sqlite 直查：2 任务，字段/deps 映射正确
+    rows = adapter.list_by_req(req_id)
+    assert len(rows) == 2
+    assert [r["id"] for r in rows] == [f"{req_id}-t1", f"{req_id}-t2"]
+    assert all(r["domain"] == "backend" for r in rows)
+    assert all(r["module_id"] == "user" for r in rows)
+    assert all(r["status"] == "pending" for r in rows)
+    assert json.loads(rows[0]["deps"]) == []
+    assert json.loads(rows[1]["deps"]) == [f"{req_id}-t1"]
+    # 方案已清空
+    assert governor._pending_plan is None
+
+
+async def test_adopt_no_pending_no_db_write(mini_store_dir, tmp_path):
+    """无待采纳方案 -> 提示且不写库（DB 文件不创建）"""
+    from pathlib import Path
+
+    db_path = str(tmp_path / "task.db")
+    governor, adapter = _make_governor_real_db(mini_store_dir, db_path)
+    events = await collect(governor.handle_user_input("采用方案"))
+    assert "无待采纳方案" in events[0].data["text"]
+    assert not Path(db_path).exists()

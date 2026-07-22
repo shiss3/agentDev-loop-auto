@@ -23,9 +23,14 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from claude_agent_sdk import (
     AssistantMessage,
+    CanUseTool,
     ClaudeAgentOptions,
+    PermissionResult,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ResultMessage,
     SessionStore,
+    ToolPermissionContext,
     ToolUseBlock,
     create_sdk_mcp_server,
     query,
@@ -202,20 +207,39 @@ L0 可能下发非开发任务（生成需求/文档/方案/示例/问答/分析
 """
 # 明显非需求输入(寒暄/确认/道别)白名单 -- handle_user_input 直接走交互轨跳过 LLM 解析省 token。
 # 仅抓最无歧义词;真任务(含动词/文件名/需求描述)不在此列,走 _parse_requirement。
+# 采纳确认白名单（resident_plan 闭环）：用户回复这些短语时消费 _pending_plan 灌队列。
+# 与寒暄一样走归一化精确匹配，避免误吞真任务文本。
+_ADOPTION_INPUTS = frozenset({
+    "采用方案", "采纳方案", "采用该方案", "采纳该方案",
+    "按方案执行", "确认采用", "确认采纳",
+})
 _CASUAL_INPUTS = frozenset({
     "你好", "您好", "嗨", "在吗", "在不在",
     "谢谢", "感谢", "收到", "明白", "了解", "好的", "嗯", "哦", "ok",
     "早", "早上好", "下午好", "晚上好",
     "再见", "拜拜", "hi", "hello", "hey", "thanks", "thx", "bye",
 })
+async def _default_can_use_tool(
+    tool_name: str, tool_input: dict, context: ToolPermissionContext
+) -> PermissionResult:
+    """常驻执行体默认权限回调：非 AskUserQuestion 直接放行，无用户交互。
+    AskUserQuestion 默认拒绝（TUI 问答卡由 chat 层注入回调处理；未注入时无法向用户提问）。
+    """
+    if tool_name == "AskUserQuestion":
+        return PermissionResultDeny(
+            message="当前会话未接入交互问答通道，无法向用户提问"
+        )
+    return PermissionResultAllow()
 # ── Governor ──────────────────────────────────────────────────────────
 class Governor:
     """L0 治理者 — 需求解析 + 双轨调度。验收/修复闭环 Step 4-6 接入。
     - 需求解析走 query() 顶层 API（stateless，不进常驻执行体历史，不持久化）
     - 交互轨经 self._resident.send(text) 产出 ChatEvent 流（text 首次进常驻执行体）
     - 交付轨灌队列本步实装，执行器属后续层
-    - 判定与执行物理分离：执行体 permission_mode="acceptEdits" + 业务写进 allowed_tools，
-      不挂 can_use_tool；判定 session tools=[] 天然只读。无需 lane guard。
+    - 判定与执行物理分离：执行体 permission_mode="default" + can_use_tool 回调
+      （ask 态必触发回调：非 AskUserQuestion 直接放行，chat 层可注入自定义回调处理
+      AskUserQuestion；bypassPermissions 下回调不触发，故不用）；判定 session
+      tools=[] 天然只读。无需 lane guard。
     """
     def __init__(
         self,
@@ -224,12 +248,21 @@ class Governor:
         *,
         session_store: SessionStore | None = None,
         task_queue: TaskQueueAdapter | None = None,
+        can_use_tool: CanUseTool | None = None,
     ) -> None:
         self.project_dir = project_dir
         self.model = model
         self._session_store = (
             session_store if session_store is not None else create_session_store()
         )
+        # chat 层注入的权限回调（None 时用默认：非 AskUserQuestion 直接放行）。
+        # rebuild 经 _build_resident_session 复读本字段，重建后仍生效。
+        self._can_use_tool = (
+            can_use_tool if can_use_tool is not None else _default_can_use_tool
+        )
+        # resident_plan：常驻会话方案生成工具截获的待采纳方案（Governor 持有，rebuild 不丢）。
+        # 用户回复"采用方案"时消费（灌 task.db，后续任务实装）。
+        self._pending_plan: dict | None = None
         self._resident = self._build_resident_session()
         self._task_queue = (
             task_queue if task_queue is not None else self._build_task_queue()
@@ -243,19 +276,51 @@ class Governor:
         """构造交互轨常驻执行体（__init__ 与 rebuild 共用）。
         执行层配置（非 L0 判定 session）：
         - system_prompt=EXECUTOR_PROMPT（极简执行契约，不写领域指导）
-        - permission_mode="acceptEdits"（执行体可写）
-        - allowed_tools=["Read","Write","Edit","Bash","Glob","Grep"]（业务写进白名单）
-        - 不挂 can_use_tool（判定与执行分离，无需 lane guard）
+        - permission_mode="default"（ask 态走 can_use_tool 回调；可用工具集不裁剪，
+          原生+自定义+MCP+skills 全可用）
+        - allowed_tools=[]（不预放行任何工具，全部经回调/CLI 规则判定）
+        - can_use_tool=self._can_use_tool（chat 层可注入；默认非 AskUserQuestion 直接放行）
         - session_store=self._session_store（持久化，跨进程可 resume）
+        - mcp_servers={"plan_gen": 方案生成 SDK server}（resident_plan：input_schema 复用
+          TASK_SPEC_SCHEMA，输出与计划格式一致；与 task_queue 配置无关，恒挂载）
+        - tool_intercept=self._on_tool_use（流式 tool_use 兜底，参照 _parse_requirement 模式）
+        __init__ 与 rebuild 共用本方法 -> 每次重建重新建 server，工具恒挂载。
         """
         return BaseAgentSession(
             project_dir=self.project_dir,
             model=self.model,
             system_prompt=EXECUTOR_PROMPT,
-            allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
-            permission_mode="acceptEdits",
+            allowed_tools=[],
+            permission_mode="default",
+            can_use_tool=self._can_use_tool,
             session_store=self._session_store,
+            mcp_servers={"plan_gen": self._build_plan_server()},
+            tool_intercept=self._on_tool_use,
         )
+    # ── resident_plan：方案生成工具（常驻会话挂载）──
+    def _build_plan_server(self):
+        """构造方案生成 SDK MCP server（plan_gen.propose_plan）。
+
+        input_schema 复用 TASK_SPEC_SCHEMA -> 工具输出与计划格式一致。
+        handler 截获 args 存 self._pending_plan（待采纳方案状态）。
+        """
+        propose_tool = tool(
+            name="propose_plan",
+            description=(
+                "生成实施方案（参数=任务单各字段，与标准化任务单 schema 一致）。"
+                "产出实施计划时调用此工具；方案被记录为待采纳，用户回复\"采用方案\"后灌入交付队列。"
+            ),
+            input_schema=TASK_SPEC_SCHEMA,
+        )(self._capture_plan)
+        return create_sdk_mcp_server(name="plan_gen", tools=[propose_tool])
+    async def _capture_plan(self, args: dict) -> dict:
+        """propose_plan handler：截获工具参数为待采纳方案（主通道）。"""
+        self._pending_plan = args
+        return {"content": [{"type": "text", "text": "方案已记录为待采纳，等待用户确认"}]}
+    def _on_tool_use(self, tool_name: str, tool_input: dict) -> None:
+        """常驻会话流式 tool_use 兜底（handler 未触发时从 raw block 补获，参照 _parse_requirement）。"""
+        if tool_name == "mcp__plan_gen__propose_plan" and self._pending_plan is None:
+            self._pending_plan = tool_input
     async def start(self) -> None:
         await self._resident.start()
     async def close(self) -> None:
@@ -415,6 +480,24 @@ class Governor:
                 and spec.get("cross_domain") is False):
             return "interactive"
         return "delivery"
+    def _spec_to_tasks(self, spec: dict) -> tuple[str, list[dict]]:
+        """spec.subtasks -> task_queue tasks（req_id 前缀 id + deps 映射）。
+        交付轨（_run_delivery）与采纳闭环（_adopt_plan）共用。"""
+        subtasks = spec.get("subtasks") or []
+        req_id = self._new_req_id()
+        id_map = {st["id"]: f"{req_id}-{st['id']}" for st in subtasks}
+        tasks = []
+        for st in subtasks:
+            tasks.append({
+                "id": id_map[st["id"]],
+                "req_id": req_id,
+                "domain": st.get("domain", "default"),
+                "module_id": normalize_module_id(st.get("module_id", "default")),
+                "prompt": self._build_task_prompt(st, spec),
+                "intended_files": st.get("intended_files") or [],
+                "deps": [id_map[d] for d in st.get("deps", []) if d in id_map],
+            })
+        return req_id, tasks
     @staticmethod
     def _is_casual_input(text: str) -> bool:
         """明显非需求输入(寒暄/确认/道别)直接走交互轨,跳过 LLM 解析省 token。
@@ -423,25 +506,87 @@ class Governor:
         """
         s = text.strip().rstrip("？！?!.。,，~~").lower()
         return s in _CASUAL_INPUTS
+    @staticmethod
+    def _is_adoption_input(text: str) -> bool:
+        """采纳确认（"采用方案"等）—— 归一化精确匹配 _ADOPTION_INPUTS，不误吞真任务。"""
+        s = text.strip().rstrip("？！?!.。,，~~").lower()
+        return s in _ADOPTION_INPUTS
+    async def _adopt_plan(self) -> AsyncIterator[ChatEvent]:
+        """采纳闭环：待采纳方案 -> tasks -> seed 灌队列（供执行器 claim，不 spawn 执行器）。
+        成功 seed 后清空 _pending_plan 防重复灌入；失败/降级路径保留方案可重试。"""
+        plan = self._pending_plan
+        if plan is None:
+            yield _build_message(
+                "⚠️ 无待采纳方案。请先在对话中让常驻执行体生成方案（propose_plan）。"
+            )
+            return
+        if self._task_queue is None:
+            yield _build_message(
+                "⚠️ 未配置任务队列，方案无法灌入（方案保留，配置队列后可重试采纳）。"
+            )
+            return
+        req_id, tasks = self._spec_to_tasks(plan)
+        if not tasks:
+            yield _build_message(
+                "⚠️ 方案未拆出子任务，无法灌入队列（方案保留，可要求常驻执行体重新生成）。"
+            )
+            return
+        try:
+            n = self._task_queue.seed(tasks)
+        except Exception as e:
+            yield _build_message(
+                f"⚠️ 灌队列失败({str(e)[:80]})，方案保留，可重试采纳。"
+            )
+            return
+        self._pending_plan = None
+        yield _build_message(
+            f"✅ 方案已采纳 req_id={req_id}：已灌入 {n} 个任务到队列，供执行器 claim"
+        )
     async def handle_user_input(
         self, text: str, *, forced_track: str | None = None
     ) -> AsyncIterator[ChatEvent]:
         """用户输入 → ChatEvent 流。
         forced_track 语义：
           None             → 自动判定（_parse_requirement + _decide_track）
-          "interactive"    → 跳过解析，直接交互轨执行
-          "delivery"       → 跳过解析，直接交付轨
+          "interactive"    -> 跳过解析，直接交互轨执行（像寒暄直通，占位 spec）
+          "delivery"       -> 解析保字段 + 强制交付轨（跳过 _decide_track；subtasks 空则拦截）
         """
         self._last_text = text
         context_continuation = self._resident.stats.turn_count > 0
-        if forced_track:
-            track = forced_track
+        if self._is_adoption_input(text):
+            # 采纳闭环：消费待采纳方案灌队列，优先于一切解析/调度
+            async for event in self._adopt_plan():
+                yield event
+            return
+        if forced_track == "interactive":
+            # 场景1:不解析直通(像寒暄),占位 spec
+            track = "interactive"
             spec = {
                 "task_summary": text,
                 "acceptance_criteria": [],
-                "risk_level": "medium",
-                "suggest_track": track,
+                "risk_level": "low",
+                "suggest_track": "interactive",
             }
+        elif forced_track == "delivery":
+            # 场景2:解析保字段 -> 校验 subtasks -> 强制 delivery(跳过 _decide_track)
+            try:
+                spec = await self._parse_requirement(
+                    text, context_continuation=context_continuation
+                )
+            except Exception as e:
+                yield _build_message(
+                    f"⚠️ 需求解析异常({str(e)[:80]}),已降级为交互轨直接执行。"
+                )
+                async for event in self._resident.send(text):
+                    yield event
+                return
+            if not (spec.get("subtasks") or []):
+                yield _build_message(
+                    "⚠️ 强制交付轨但解析未拆出子任务(输入可能非开发任务)。"
+                    "请重述为开发需求,或用 /interactive 直通交互轨。"
+                )
+                return
+            track = "delivery"
         else:
             if self._is_casual_input(text):
                 # 寒暄/确认等非需求输入直接常驻交互,跳过 LLM 解析省 token
@@ -501,19 +646,7 @@ class Governor:
             async for event in self._resident.send(self._last_text):
                 yield event
             return
-        req_id = self._new_req_id()
-        id_map = {st["id"]: f"{req_id}-{st['id']}" for st in subtasks}
-        tasks = []
-        for st in subtasks:
-            tasks.append({
-                "id": id_map[st["id"]],
-                "req_id": req_id,
-                "domain": st.get("domain", "default"),
-                "module_id": normalize_module_id(st.get("module_id", "default")),
-                "prompt": self._build_task_prompt(st, spec),
-                "intended_files": st.get("intended_files") or [],
-                "deps": [id_map[d] for d in st.get("deps", []) if d in id_map],
-            })
+        req_id, tasks = self._spec_to_tasks(spec)
         try:
             n = self._task_queue.seed(tasks)
         except Exception as e:
@@ -677,6 +810,8 @@ class Governor:
                     cwd=repo_root,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",  # zh-CN 默认 gbk,子进程吐 UTF-8 中文会炸 readerthread
+                    errors="replace",
                     timeout=300,
                 )
             except FileNotFoundError:

@@ -152,6 +152,24 @@ class ContentBuffer:
         )
         self._notify()
 
+    def append_question_card(self, question: str, options: list[str]) -> None:
+        """追加 Agent 提问卡片（AskUserQuestion）：问题 + 编号选项，进滚动历史。
+
+        options 为已格式化的展示字符串（调用方拼 label/description）。
+        """
+        self._lines.append(
+            FormattedText([("ansicyan", "┌ Agent 提问 ──────────────────")])
+        )
+        self._lines.append(
+            FormattedText([("bold", f"│ {question}")])
+        )
+        for i, opt in enumerate(options, 1):
+            self._lines.append(FormattedText([("", f"│  {i}. {opt}")]))
+        self._lines.append(
+            FormattedText([("ansicyan", "└ 输入编号选择，或直接输入自定义答案")])
+        )
+        self._notify()
+
     def append_blank_line(self) -> None:
         """追加空行"""
         self._lines.append(FormattedText([("", "")]))
