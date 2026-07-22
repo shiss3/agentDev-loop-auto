@@ -46,9 +46,11 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from claude_agent_sdk import (
+    AssistantMessage,
     ClaudeSDKClient,
     ClaudeAgentOptions,
     SessionStore,
+    ToolUseBlock,
 )
 
 from harness_agent.chat.events import (
@@ -144,12 +146,20 @@ class BaseAgentSession:
         system_prompt: SystemPromptType | None = None,
         permission_mode: str = "acceptEdits",
         can_use_tool: Callable[..., Any] | None = None,
+        # ── resident_plan：注入自定义 SDK MCP server（如方案生成工具），None=不挂载 ──
+        mcp_servers: dict[str, Any] | None = None,
+        # ── resident_plan：raw tool_use 截获回调（流式兜底用），None=不截获 ──
+        tool_intercept: Callable[[str, dict], None] | None = None,
     ) -> None:
         self.project_dir = project_dir
         self.model = model  # 用户指定的模型（可能为 None，表示使用全局配置）
         self.max_turns = max_turns
         self.context_provider = context_provider or DefaultContextProvider()
-        self.allowed_tools = allowed_tools or ["Read", "Write", "Edit", "Bash"]
+        # SDK 语义：allowed_tools=自动放行列表（不裁剪可用工具集；裁剪用 tools 选项）。
+        # None=旧默认放行 4 工具（ChatSession 依赖）；显式 []=不挂自动放行列表。
+        self.allowed_tools = (
+            ["Read", "Write", "Edit", "Bash"] if allowed_tools is None else allowed_tools
+        )
 
         # 会话模式选择
         # - enable_undo=True: 开启检查点模式（支持 /undo，但禁用会话恢复）
@@ -163,6 +173,8 @@ class BaseAgentSession:
         self.system_prompt = system_prompt
         self.permission_mode = permission_mode
         self.can_use_tool = can_use_tool
+        self.mcp_servers = mcp_servers
+        self.tool_intercept = tool_intercept
 
         self._client: ClaudeSDKClient | None = None
         self.stats = SessionStats()
@@ -348,6 +360,10 @@ class BaseAgentSession:
         if self.can_use_tool is not None:
             opts.can_use_tool = self.can_use_tool
 
+        # ── resident_plan：自定义 SDK MCP server（仅当传入时挂载）──
+        if self.mcp_servers is not None:
+            opts.mcp_servers = self.mcp_servers
+
         # 注意：session_store 和 enable_file_checkpointing 不能同时使用
         # 如果启用了 enable_undo，跳过 session_store
         if self.enable_undo:
@@ -530,6 +546,12 @@ class BaseAgentSession:
                         pass
                     yield cancelled_event("用户取消了请求")
                     break
+
+                # ── raw tool_use 截获（流式兜底：handler 未触发时由注入方补获 args）──
+                if self.tool_intercept is not None and isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, ToolUseBlock):
+                            self.tool_intercept(block.name, block.input)
 
                 # ── 转换 SDK 消息为 ChatEvent（无状态转换器）──
                 result = self._translator.translate(message, self.actual_model)

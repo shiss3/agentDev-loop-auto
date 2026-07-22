@@ -174,9 +174,10 @@ async def test_result_message_structure():
 
 # ─── 测试 6：harness_agent 包自身可导入 ───
 def test_package_import():
-    """验证 harness_agent 包可以正确导入"""
+    """验证 harness_agent 包可以正确导入，且 __version__ 与包元数据一致"""
+    from importlib.metadata import version
     from harness_agent import __version__
-    assert __version__ == "0.1.2"
+    assert __version__ == version("harness-agent")
 
 
 def test_config_import():

@@ -106,6 +106,66 @@ def test_merge_conflict_returns_false_with_output(git_repo):
     remove_worktree(root, "r3")
 
 
+# ── 编码:子进程 UTF-8 输出在 gbk locale 下不炸 ──────
+
+
+def test_git_forces_utf8_encoding(monkeypatch):
+    """worktree._git 必须显式 encoding='utf-8' + errors='replace'。
+
+    Windows zh-CN text=True 默认 gbk,git/pytest 吐 UTF-8 中文 ->
+    communicate 的 _readerthread UnicodeDecodeError,结果丢失。
+    """
+    from harness_agent.core import worktree as wt
+
+    captured: dict = {}
+
+    def fake_run(*a, **kw):
+        captured.update(kw)
+        r = MagicMock()
+        r.returncode = 0
+        r.stdout = ""
+        r.stderr = ""
+        return r
+
+    monkeypatch.setattr(wt.subprocess, "run", fake_run)
+    wt._git(["status"], cwd=".")
+    assert captured.get("encoding") == "utf-8"
+    assert captured.get("errors") == "replace"
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_utf8_child_output_under_gbk_locale():
+    """真复现:locale 伪装 gbk,子进程写裸 UTF-8 中文。
+
+    未指定 encoding -> gbk 解码炸在 communicate 的 _readerthread(异常不回传,
+    stdout 数据丢失);指定 encoding='utf-8' -> 正常解码。
+    """
+    import locale
+    import sys
+
+    monkey_locale = locale.getpreferredencoding
+    locale.getpreferredencoding = lambda *a, **kw: "gbk"  # type: ignore[assignment]
+    try:
+        # 未指定 encoding -> 复现 bug:reader 线程炸,输出丢失
+        r_bad = subprocess.run(
+            [sys.executable, "-c", "import sys;sys.stdout.buffer.write('中文'.encode('utf-8'))"],
+            capture_output=True,
+            text=True,
+        )
+        assert r_bad.stdout != "中文"  # 数据丢失(gbk 解码失败)
+        # 指定 encoding/errors -> 修复
+        r = subprocess.run(
+            [sys.executable, "-c", "import sys;sys.stdout.buffer.write('中文'.encode('utf-8'))"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        assert r.stdout == "中文"
+    finally:
+        locale.getpreferredencoding = monkey_locale  # type: ignore[assignment]
+
+
 # ── worktree add 失败不被吞 ──────────────────────────
 
 

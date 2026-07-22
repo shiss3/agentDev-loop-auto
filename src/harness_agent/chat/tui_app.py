@@ -68,6 +68,8 @@ class TuiApp:
         # ── 输入回调 ──
         self._on_submit: Callable[[str], Awaitable[None]] | None = None
         self._on_cancel: Callable[[], None] | None = None  # 取消回调
+        # ── answer 模式（AskUserQuestion 待回答）：输入前缀 'You > ' ↔ '回答> ' ──
+        self._answer_mode: bool = False
         # ── Spinner 定时器 ──
         self._spinner_task: asyncio.Task | None = None
         # ── Application（延迟创建，run() 时构建）──
@@ -162,9 +164,20 @@ class TuiApp:
     def set_on_submit(self, handler: Callable[[str], Awaitable[None]]) -> None:
         """设置用户输入回调"""
         self._on_submit = handler
-    def set_on_cancel(self, handler: Callable[[], None]) -> None:
+    def set_on_cancel(self, handler: Callable[[], None] | None) -> None:
         """设置取消回调"""
         self._on_cancel = handler
+    def set_answer_mode(self, on: bool) -> None:
+        """切换 answer 模式：输入前缀 'You > ' ↔ '回答> '（Renderer 每帧读 lambda）"""
+        self._answer_mode = on
+        self._invalidate()
+    @property
+    def answer_mode(self) -> bool:
+        return self._answer_mode
+    def _get_input_prefix(self) -> FormattedText:
+        """输入行前缀（answer 模式显示 '回答> '）"""
+        prefix = "回答> " if self._answer_mode else "You > "
+        return FormattedText([("class:status.input-prefix", prefix)])
     def focus_input(self) -> None:
         """聚焦输入框"""
         if self._app and self._input_buffer:
@@ -224,9 +237,7 @@ class TuiApp:
         input_window = Window(
             content=input_ctrl,
             height=1,
-            get_line_prefix=lambda lineno, wrap_count: FormattedText(
-                [("class:status.input-prefix", "You > ")]
-            ),
+            get_line_prefix=lambda lineno, wrap_count: self._get_input_prefix(),
         )
         # 状态栏
         status_ctrl = FormattedTextControl(

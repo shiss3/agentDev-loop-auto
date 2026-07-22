@@ -100,6 +100,22 @@ def test_resolve_system_prompt_subclass_override():
     assert session._resolve_system_prompt() == {"type": "preset", "preset": "claude_code"}
 
 
+# ── 5b. mcp_servers 接线（resident_plan）──
+
+
+def test_mcp_servers_propagated():
+    """传 mcp_servers=dict → opts.mcp_servers is dict；不传 → SDK 默认（空 dict）"""
+    servers = {"plan_gen": {"type": "sdk", "instance": object()}}
+
+    session_with = BaseAgentSession(mcp_servers=servers)
+    opts_with = session_with._build_options()
+    assert opts_with.mcp_servers is servers
+
+    session_without = BaseAgentSession()
+    opts_without = session_without._build_options()
+    assert opts_without.mcp_servers == {}
+
+
 # ── 6. send() 用 AsyncIterable prompt（非字符串）──
 
 

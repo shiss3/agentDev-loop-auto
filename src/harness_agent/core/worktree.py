@@ -7,8 +7,19 @@ WORKTREE_DIR = ".claude/worktrees"  # 相对 repo_root
 
 
 def _git(args: list[str], cwd: str) -> subprocess.CompletedProcess:
-    """跑 git,返回 CompletedProcess(capture_output=True, text=True)。失败不抛(调用方判 returncode)。"""
-    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    """跑 git,返回 CompletedProcess(capture_output=True, text=True)。失败不抛(调用方判 returncode)。
+
+    显式 utf-8:Windows zh-CN text=True 默认 gbk,git 本地化中文输出是 UTF-8,
+    gbk 解 -> communicate _readerthread UnicodeDecodeError。errors=replace 兜底非 UTF-8 字节。
+    """
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 def create_delivery_worktree(repo_root: str, req_id: str) -> str:

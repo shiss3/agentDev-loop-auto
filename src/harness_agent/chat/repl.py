@@ -19,6 +19,13 @@ import asyncio
 import logging
 from pathlib import Path
 
+from claude_agent_sdk import (
+    PermissionResult,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ToolPermissionContext,
+)
+
 from harness_agent.chat.content_buffer import ContentBuffer
 from harness_agent.chat.session_store import FileSessionStore, create_session_store
 from harness_agent.chat.session_selector import SessionSelector, NEW_SESSION
@@ -93,13 +100,73 @@ class ChatCLI:
         self._should_exit = False
         # 当前消息处理的任务引用（用于取消）
         self._message_task: asyncio.Task | None = None
+        # ── AskUserQuestion 待回答状态 ──
+        # 非 None 时用户输入路由给该 Future（answer 模式），而非发新消息。
+        self._pending_answer: asyncio.Future | None = None
+        self._pending_options: list[str] = []  # 当前问题选项（数字映射用）
 
     def _create_session(self) -> Governor:
         return Governor(
             project_dir=self.project_dir,
             model=self.model,
             session_store=self.session_store,
+            can_use_tool=self._can_use_tool,
         )
+
+    # ── 权限回调（注入常驻执行体；ask 态触发）──
+
+    async def _can_use_tool(
+        self, tool_name: str, tool_input: dict, context: ToolPermissionContext
+    ) -> PermissionResult:
+        """常驻执行体权限回调（跑在 prompt_toolkit 同一事件循环）。
+        非 AskUserQuestion 直接放行不问用户；AskUserQuestion 渲染问题卡 +
+        切 answer 模式，逐问题等用户输入（数字=选编号选项，文字=自定义答案）。
+        """
+        if tool_name != "AskUserQuestion":
+            return PermissionResultAllow()
+        answers: dict[str, str] = {}
+        for q in tool_input.get("questions", []):
+            question_text = q.get("question", "")
+            labels = [o.get("label", "") for o in q.get("options", [])]
+            display = [
+                f"{o.get('label', '')} — {o.get('description')}"
+                if o.get("description") else o.get("label", "")
+                for o in q.get("options", [])
+            ]
+            self.content_buffer.append_question_card(question_text, display)
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+            self._pending_answer = fut
+            # 数字映射用纯 label（answers 值）；display 仅供卡片展示
+            self._pending_options = labels
+            self.tui.set_answer_mode(True)
+            try:
+                answer = await fut
+            except asyncio.CancelledError:
+                # ESC 取消整个消息：Future 被取消，拒绝本次提问（不悬挂）
+                return PermissionResultDeny(message="用户取消了提问")
+            finally:
+                self._pending_answer = None
+                self._pending_options = []
+                self.tui.set_answer_mode(False)
+            answers[question_text] = answer
+        return PermissionResultAllow(
+            updated_input={**tool_input, "answers": answers}
+        )
+
+    def _resolve_answer(self, text: str) -> None:
+        """answer 模式输入 → 兑现 pending Future（纯数字=选编号选项，其余=自定义答案）。"""
+        fut = self._pending_answer
+        if fut is None or fut.done():
+            return
+        answer = text
+        # isascii 守卫：isdigit 收 Unicode 数字（如 '²'）但 int() 拒收
+        if text.isascii() and text.isdigit():
+            idx = int(text)
+            if 1 <= idx <= len(self._pending_options):
+                answer = self._pending_options[idx - 1]
+        self.content_buffer.append_plain(f"回答> {answer}")
+        fut.set_result(answer)
 
     @property
     def session(self):
@@ -163,6 +230,11 @@ class ChatCLI:
         可以安全地 await SDK 调用。
         """
         if self._should_exit:
+            return
+
+        # answer 模式：pending Future 非空时输入路由给 Future，而非发新消息
+        if self._pending_answer is not None and not self._pending_answer.done():
+            self._resolve_answer(text)
             return
 
         # 判断是斜杠命令还是普通消息
@@ -232,8 +304,13 @@ class ChatCLI:
     def _cancel_current_request(self) -> None:
         """取消当前请求
 
-        由 TUI 的 ESC 键触发。
+        由 TUI 的 ESC 键触发。answer 模式同样取消整个消息：
+        pending Future 一并取消（不悬挂），回调 finally 恢复输入路由与前缀。
         """
+        # 0. answer 模式：取消 pending Future（回调内 await 抛 CancelledError → Deny）
+        if self._pending_answer is not None and not self._pending_answer.done():
+            self._pending_answer.cancel()
+
         # 1. 先设置 session 的取消标志（在异步迭代中会检查）
         if self.session.is_processing:
             self.session.cancel()
