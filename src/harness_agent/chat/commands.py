@@ -126,19 +126,18 @@ async def cmd_model(cli: "ChatCLI", args: str) -> None:
         cli.renderer.render_command_result(f"当前模型: {current}")
 
 
-@slash_command("int", "强制交互轨执行（不解析直通，像寒暄）", usage="<需求>")
-async def cmd_interactive(cli: "ChatCLI", args: str) -> None:
-    text = args.strip()
-    if not text:
-        cli.renderer.render_command_result("用法: /int <需求>")
-        return
-    await cli._handle_message(text, forced_track="interactive")
+@slash_command("auto", "切换到自动模式（解析需求后判轨，默认）")
+async def cmd_auto(cli: "ChatCLI", args: str) -> None:
+    cli.mode = "auto"
+    cli.renderer.render_command_result(
+        "已切换到自动模式：解析需求后判轨（interactive/delivery）"
+    )
 
 
-@slash_command("del", "强制交付轨执行（解析后必走交付轨）", usage="<需求>")
-async def cmd_delivery(cli: "ChatCLI", args: str) -> None:
-    text = args.strip()
-    if not text:
-        cli.renderer.render_command_result("用法: /del <需求>")
-        return
-    await cli._handle_message(text, forced_track="delivery")
+@slash_command("semi", "切换到半自动模式（输入直通交互轨，常驻理解+propose_plan+采纳走交付）")
+async def cmd_semi(cli: "ChatCLI", args: str) -> None:
+    cli.mode = "semi"
+    cli.renderer.render_command_result(
+        "已切换到半自动模式：输入直通交互轨，常驻执行体理解需求并生成方案；"
+        "回复“采用方案”灌队列走交付轨，或直接对话在本轨执行"
+    )

@@ -599,7 +599,7 @@ class Governor:
             if not (spec.get("subtasks") or []):
                 yield _build_message(
                     "⚠️ 强制交付轨但解析未拆出子任务(输入可能非开发任务)。"
-                    "请重述为开发需求,或用 /interactive 直通交互轨。"
+                    "请重述为开发需求,或用 /semi 切换半自动模式直通交互轨。"
                 )
                 return
             track = "delivery"

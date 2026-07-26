@@ -98,6 +98,8 @@ class ChatCLI:
 
         # 状态
         self._should_exit = False
+        # 调度模式：auto=解析需求后判轨（默认）；semi=输入直通交互轨（=原 /int）
+        self.mode: str = "auto"
         # 当前消息处理的任务引用（用于取消）
         self._message_task: asyncio.Task | None = None
         # ── AskUserQuestion 待回答状态 ──
@@ -261,7 +263,13 @@ class ChatCLI:
         """处理普通聊天消息 — 发送给 Agent
 
         使用独立的任务来处理，以便可以取消。
+
+        semi 模式下非命令强制的普通输入直通交互轨（forced_track="interactive"），
+        由常驻执行体在对话中理解需求 + propose_plan 生成方案 + "采用方案"走交付轨。
         """
+        # semi 模式：非命令强制的普通输入直通交互轨（命令层 forced_track 优先）
+        if forced_track is None and self.mode == "semi":
+            forced_track = "interactive"
         # 如果已有任务在运行，先取消它
         await self._cancel_message_task()
 
