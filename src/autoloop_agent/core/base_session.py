@@ -53,7 +53,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from harness_agent.chat.events import (
+from autoloop_agent.chat.events import (
     ChatEvent,
     turn_start_event,
     turn_end_event,
@@ -61,8 +61,8 @@ from harness_agent.chat.events import (
     cancelled_event,
     retry_event,
 )
-from harness_agent.chat.translator import MessageTranslator
-from harness_agent.context.provider import (
+from autoloop_agent.chat.translator import MessageTranslator
+from autoloop_agent.context.provider import (
     ContextProvider,
     DefaultContextProvider,
     SystemPromptType,

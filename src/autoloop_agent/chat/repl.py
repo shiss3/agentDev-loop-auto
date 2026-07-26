@@ -26,16 +26,16 @@ from claude_agent_sdk import (
     ToolPermissionContext,
 )
 
-from harness_agent.chat.content_buffer import ContentBuffer
-from harness_agent.chat.session_store import FileSessionStore, create_session_store
-from harness_agent.chat.session_selector import SessionSelector, NEW_SESSION
-from harness_agent.chat.tui_app import TuiApp
-from harness_agent.chat.renderer import ChatRenderer
-from harness_agent.core.architect import Governor
+from autoloop_agent.chat.content_buffer import ContentBuffer
+from autoloop_agent.chat.session_store import FileSessionStore, create_session_store
+from autoloop_agent.chat.session_selector import SessionSelector, NEW_SESSION
+from autoloop_agent.chat.tui_app import TuiApp
+from autoloop_agent.chat.renderer import ChatRenderer
+from autoloop_agent.core.architect import Governor
 
 # 导入 commands 以注册所有内置斜杠命令（必须保留此 import）
-from harness_agent.chat import commands as _commands  # noqa: F401
-from harness_agent.chat.commands import get_command
+from autoloop_agent.chat import commands as _commands  # noqa: F401
+from autoloop_agent.chat.commands import get_command
 
 logger = logging.getLogger(__name__)
 
@@ -295,7 +295,7 @@ class ChatCLI:
 
     def _render_welcome(self) -> None:
         """渲染欢迎信息"""
-        from harness_agent import __version__
+        from autoloop_agent import __version__
         self.renderer.render_welcome(self.project_dir, __version__)
 
     async def _stream_events(self, prompt: str, *, forced_track: str | None = None) -> None:

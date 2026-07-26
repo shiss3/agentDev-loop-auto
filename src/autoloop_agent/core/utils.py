@@ -1,6 +1,6 @@
 """Governor 共用消息构造工具。"""
 
-from harness_agent.chat.events import ChatEvent, text_event
+from autoloop_agent.chat.events import ChatEvent, text_event
 
 
 def _build_message(text: str, agent: str = "default") -> ChatEvent:

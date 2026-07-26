@@ -22,8 +22,8 @@ from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import BufferControl, Dimension, FormattedTextControl, HSplit, Layout, Window
 from prompt_toolkit.styles import Style
-from harness_agent.chat.content_buffer import ContentBuffer
-from harness_agent.chat.scroll_controller import ScrollController, _ScrollableWindow
+from autoloop_agent.chat.content_buffer import ContentBuffer
+from autoloop_agent.chat.scroll_controller import ScrollController, _ScrollableWindow
 # ── 样式定义 ──
 _TUI_STYLE = Style.from_dict(
     {
@@ -39,7 +39,7 @@ _TUI_STYLE = Style.from_dict(
 # Spinner 帧刷新间隔（秒）
 _SPINNER_INTERVAL = 0.08
 # 输入历史文件路径
-_DEFAULT_HISTORY_PATH = str(Path.home() / ".harness" / "chat_history")
+_DEFAULT_HISTORY_PATH = str(Path.home() / ".autoloop" / "chat_history")
 class TuiApp:
     """全屏 TUI 应用
     Layout 结构:

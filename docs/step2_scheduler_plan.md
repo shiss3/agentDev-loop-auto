@@ -306,7 +306,7 @@ def _build_task_queue(self) -> "TaskQueueAdapter | None":
 
 ```python
 # repl.py 改动点
-from harness_agent.core.architect import Governor
+from autoloop_agent.core.architect import Governor
 
 class ChatCLI:
     def __init__(self, ...):
@@ -394,7 +394,7 @@ mock `TaskQueueAdapter`（注入 fake），不依赖真实 task-service/DB：
 
 ### 4.3 REPL 接入（手动冒烟，交用户验证）
 
-`harness chat` 实跑：
+`autoloop chat` 实跑：
 - 简单需求（「改个颜色」）-> 交互轨常驻执行（流式渲染正常）。
 - 复杂需求（「重构支付链路」）-> 交付轨：TUI 显示 req_id + 任务清单；查 `TASK_DB` 见 N 行 pending。
 - `/clear` `/project` `/model` `/stats` `/context` 命令仍可用。
@@ -408,7 +408,7 @@ mock `TaskQueueAdapter`（注入 fake），不依赖真实 task-service/DB：
 ### Task A：schema + prompt + `_run_delivery` + adapter
 - 改 `core/architect.py`：扩展 `TASK_SPEC_SCHEMA`（§3.1）、改 `REQUIREMENT_PARSER_PROMPT`（§3.2）、`__init__` 加 `task_queue` 参数 + `_build_task_queue` + `_last_text` + `_new_req_id`、实装 `_run_delivery` + `_build_task_prompt`（§3.4/3.5）、`handle_user_input` 入口存 `_last_text`。
 - 新建 `core/task_queue_adapter.py`（§3.3）。
-- 自审 + `ruff check` + `python -c "from harness_agent.core import Governor"`。
+- 自审 + `ruff check` + `python -c "from autoloop_agent.core import Governor"`。
 
 ### Task B：测试（依赖 Task A 契约，可并行）
 - 扩展 `tests/test_governor.py`（§4.1，改 placeholder 测试 + 加 5 测试）。

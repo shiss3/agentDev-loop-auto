@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from harness_agent.core.worktree import (
+from autoloop_agent.core.worktree import (
     commit_worktree,
     create_delivery_worktree,
     merge_worktree_branch,
@@ -115,7 +115,7 @@ def test_git_forces_utf8_encoding(monkeypatch):
     Windows zh-CN text=True 默认 gbk,git/pytest 吐 UTF-8 中文 ->
     communicate 的 _readerthread UnicodeDecodeError,结果丢失。
     """
-    from harness_agent.core import worktree as wt
+    from autoloop_agent.core import worktree as wt
 
     captured: dict = {}
 
@@ -171,7 +171,7 @@ def test_utf8_child_output_under_gbk_locale():
 
 def test_create_delivery_worktree_add_fail_raises(monkeypatch, git_repo):
     """worktree add returncode!=0 -> raise RuntimeError(不被吞,caller 接到'创建失败')。"""
-    from harness_agent.core import worktree as wt
+    from autoloop_agent.core import worktree as wt
 
     def fake_git(args, cwd):
         r = MagicMock()

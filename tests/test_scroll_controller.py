@@ -6,7 +6,7 @@
 from dataclasses import dataclass, field
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.layout import Dimension, FormattedTextControl
-from harness_agent.chat.scroll_controller import ScrollController, _ScrollableWindow
+from autoloop_agent.chat.scroll_controller import ScrollController, _ScrollableWindow
 
 
 def _make_ctl(fragments=None, invalidate=None) -> ScrollController:

@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import time
 
-from harness_agent.chat.events import ChatEvent, EventType
-from harness_agent.chat.content_buffer import ContentBuffer
-from harness_agent.chat.tui_app import TuiApp
+from autoloop_agent.chat.events import ChatEvent, EventType
+from autoloop_agent.chat.content_buffer import ContentBuffer
+from autoloop_agent.chat.tui_app import TuiApp
 
 
 # 工具名 → 图标
@@ -193,7 +193,7 @@ class ChatRenderer:
 
     def render_welcome(self, project_dir: str, version: str = "0.1.0") -> None:
         """渲染欢迎信息"""
-        self.buf.append_plain(f" harness Agent v{version} · 工作区: {project_dir}")
+        self.buf.append_plain(f" AutoLoop v{version} · 工作区: {project_dir}")
         self.buf.append_blank_line()
         self.tui.set_status_text(f"{self.tui.model_name} · 就绪")
 

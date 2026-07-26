@@ -6,7 +6,7 @@
 - _build_resident_session: 执行层配置接线（可写 / 不挂 can_use_tool）
 - session property / rebuild
 所有测试不拉真实 SDK/CLI/文件系统：
-- session_store 用 MagicMock(spec=SessionStore) 避免 ~/.harness/sessions 真实 mkdir
+- session_store 用 MagicMock(spec=SessionStore) 避免 ~/.autoloop/sessions 真实 mkdir
 - query / _resident.send / _parse_requirement 用 fake 替换
 - BaseAgentSession.start/close 在 rebuild 测试中 patch 为 AsyncMock
 """
@@ -15,10 +15,10 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, SessionStore, ToolUseBlock
-from harness_agent.chat.events import EventType, text_event
-from harness_agent.core import architect
-from harness_agent.core.architect import Governor
-from harness_agent.core.task_queue_adapter import TaskQueueAdapter
+from autoloop_agent.chat.events import EventType, text_event
+from autoloop_agent.core import architect
+from autoloop_agent.core.architect import Governor
+from autoloop_agent.core.task_queue_adapter import TaskQueueAdapter
 # ── 辅助 ──────────────────────────────────────────────
 def make_fake_assistant_msg(spec=None, usage=None):
     """构造能通过 isinstance(msg, AssistantMessage) 检查的 fake 消息。
@@ -106,8 +106,8 @@ async def test_parse_requirement_no_output_raises(patch_query):
         await governor._parse_requirement("x", context_continuation=False)
 # ── 2c. _parse_requirement 日志:记录 ResultMessage.usage tokens + 工具调用数 ──
 async def test_parse_requirement_logs_usage(tmp_path, patch_query, monkeypatch):
-    """设 HARNESS_PARSE_LOG=1 -> 解析后写 usage.jsonl,含 in/out tokens + tool_calls"""
-    monkeypatch.setenv("HARNESS_PARSE_LOG", "1")
+    """设 AUTOLOOP_PARSE_LOG=1 -> 解析后写 usage.jsonl,含 in/out tokens + tool_calls"""
+    monkeypatch.setenv("AUTOLOOP_PARSE_LOG", "1")
     governor = Governor(
         project_dir=str(tmp_path), session_store=MagicMock(spec=SessionStore)
     )
@@ -126,8 +126,8 @@ async def test_parse_requirement_logs_usage(tmp_path, patch_query, monkeypatch):
     assert rec["duration_s"] >= 0
 # ── 2e. 逐轮 token 分布日志(AssistantMessage.usage -> turns) ──
 async def test_parse_requirement_logs_turns(tmp_path, monkeypatch):
-    """HARNESS_PARSE_LOG=1 -> turns 记录每轮 in/out/cache + 本轮工具名"""
-    monkeypatch.setenv("HARNESS_PARSE_LOG", "1")
+    """AUTOLOOP_PARSE_LOG=1 -> turns 记录每轮 in/out/cache + 本轮工具名"""
+    monkeypatch.setenv("AUTOLOOP_PARSE_LOG", "1")
     governor = Governor(
         project_dir=str(tmp_path), session_store=MagicMock(spec=SessionStore)
     )
@@ -154,7 +154,7 @@ async def test_parse_requirement_logs_turns(tmp_path, monkeypatch):
 # ── 2d. ResultMessage.usage=None 不崩(回归:旧 msg.input_tokens 属性错已修) ──
 async def test_parse_requirement_result_msg_none_usage(tmp_path, monkeypatch):
     """ResultMessage.usage=None -> _usage={} 兜底,不 AttributeError,spec 仍截获"""
-    monkeypatch.delenv("HARNESS_PARSE_LOG", raising=False)
+    monkeypatch.delenv("AUTOLOOP_PARSE_LOG", raising=False)
     governor = Governor(
         project_dir=str(tmp_path), session_store=MagicMock(spec=SessionStore)
     )
@@ -519,10 +519,10 @@ def test_on_tool_use_fallback():
 async def test_rebuild_keeps_plan_tool(monkeypatch):
     """rebuild 后工具仍挂载；_pending_plan 存 Governor 不丢"""
     monkeypatch.setattr(
-        "harness_agent.core.base_session.BaseAgentSession.start", AsyncMock()
+        "autoloop_agent.core.base_session.BaseAgentSession.start", AsyncMock()
     )
     monkeypatch.setattr(
-        "harness_agent.core.base_session.BaseAgentSession.close", AsyncMock()
+        "autoloop_agent.core.base_session.BaseAgentSession.close", AsyncMock()
     )
     governor = make_governor()
     governor._pending_plan = {"task_summary": "keep"}

@@ -1,6 +1,6 @@
 """ChatSession.send() 回归测试 — 重构前的行为基准
 
-锁定 ChatSession (src/harness_agent/chat/session.py) 的当前行为，
+锁定 ChatSession (src/autoloop_agent/chat/session.py) 的当前行为，
 作为 Phase 2 Step 1（抽离 BaseAgentSession + send() 改流式）重构的回归网。
 
 测试策略：
@@ -28,8 +28,8 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from harness_agent.chat.events import EventType
-from harness_agent.chat.session import ChatSession
+from autoloop_agent.chat.events import EventType
+from autoloop_agent.chat.session import ChatSession
 
 
 # ── 辅助 ──────────────────────────────────────────────
@@ -68,7 +68,7 @@ async def started_session():
 
     ClaudeSDKClient 被 patch，不拉真实 CLI 子进程。
     """
-    with patch("harness_agent.core.base_session.ClaudeSDKClient") as MockClient:
+    with patch("autoloop_agent.core.base_session.ClaudeSDKClient") as MockClient:
         client = _make_mock_client()
         MockClient.return_value = client
         session = ChatSession(project_dir=".")

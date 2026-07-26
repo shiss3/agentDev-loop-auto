@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from harness_agent.core.task_queue_adapter import TaskQueueAdapter
+from autoloop_agent.core.task_queue_adapter import TaskQueueAdapter
 
 
 # ── 最小 store stub（模拟跨项目 task-service/store.py 的契约）──────────

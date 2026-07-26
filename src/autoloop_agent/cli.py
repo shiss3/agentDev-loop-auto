@@ -15,7 +15,7 @@ from dotenv import find_dotenv, load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 
-from harness_agent.core.orchestrator import HarnessOrchestrator
+from autoloop_agent.core.orchestrator import AutoLoopOrchestrator
 
 # 从 CWD 向上加载 .env(打包安装后从用户项目目录读;开发模式从仓库根读)
 load_dotenv(find_dotenv(usecwd=True))
@@ -77,7 +77,7 @@ class TerminalRenderer:
 @click.group()
 @click.version_option()
 def cli():
-    """🐴 Harness Agent — 驾驭工程实践"""
+    """🐴 AutoLoop - 自动循环开发"""
     pass
 
 
@@ -115,7 +115,7 @@ def _detect_project_root(start: Path) -> Path:
 def run(prompt: str, project: str | None, model: str):
     """执行一个开发任务
 
-    示例: harness run "创建一个 hello_world.py"
+    示例: autoloop run "创建一个 hello_world.py"
     """
     # 未指定 project 时自动探测项目根
     if project is None:
@@ -127,7 +127,7 @@ def run(prompt: str, project: str | None, model: str):
         Panel(
             f"[bold cyan]任务:[/] {prompt}\n[bold cyan]项目:[/] {project_dir}"
             + (f"\n[bold cyan]模型:[/] {model}" if model else ""),
-            title="🐴 Harness Agent",
+            title="🐴 AutoLoop",
             border_style="cyan",
         )
     )
@@ -137,7 +137,7 @@ def run(prompt: str, project: str | None, model: str):
 
 async def _run_streaming(prompt: str, project_dir: str, model: str | None = None):
     """核心流式渲染循环"""
-    orchestrator = HarnessOrchestrator(project_dir=project_dir, model=model)
+    orchestrator = AutoLoopOrchestrator(project_dir=project_dir, model=model)
     renderer = TerminalRenderer()
 
     console.print("\n[dim]Agent 正在工作...[/dim]\n")
@@ -201,16 +201,16 @@ def chat(project: str | None, model: str | None, resume: str | None, continue_co
     """启动交互式聊天模式（多轮对话 REPL）
 
     示例:
-        harness chat                       # 新会话（显示历史选择）
-        harness chat -p ./my-app          # 指定项目
-        harness chat -m claude-sonnet-4-6 # 指定模型
-        harness chat --continue           # 恢复最近会话
-        harness chat --resume <session_id> # 恢复指定会话
-        harness chat --undo               # 检查点模式（支持 /undo）
+        autoloop chat                       # 新会话（显示历史选择）
+        autoloop chat -p ./my-app          # 指定项目
+        autoloop chat -m claude-sonnet-4-6 # 指定模型
+        autoloop chat --continue           # 恢复最近会话
+        autoloop chat --resume <session_id> # 恢复指定会话
+        autoloop chat --undo               # 检查点模式（支持 /undo）
 
     注意：--undo 和 --continue/--resume 互斥
     """
-    from harness_agent.chat.repl import ChatCLI
+    from autoloop_agent.chat.repl import ChatCLI
 
     # 检查互斥
     if undo and (continue_conversation or resume):
@@ -236,9 +236,9 @@ def chat(project: str | None, model: str | None, resume: str | None, continue_co
 @cli.command()
 def version():
     """显示版本信息"""
-    from harness_agent import __version__
-    console.print(f"[bold]Harness Agent[/bold] v{__version__}")
-    console.print("[dim]驾驭工程实践 — Powered by Claude Agent SDK[/dim]")
+    from autoloop_agent import __version__
+    console.print(f"[bold]AutoLoop[/bold] v{__version__}")
+    console.print("[dim]自动循环开发 - Powered by Claude Agent SDK[/dim]")
 
 
 if __name__ == "__main__":

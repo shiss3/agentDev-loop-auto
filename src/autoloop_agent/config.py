@@ -1,4 +1,4 @@
-"""Harness Agent 配置管理"""
+"""AutoLoop 配置管理"""
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,7 +10,7 @@ class ChatConfig:
 
     Attributes:
         max_turns:    单轮对话最大 Agent 交互轮次
-        history_file: 输入历史文件路径（None 表示用默认 ~/.harness/chat_history）
+        history_file: 输入历史文件路径（None 表示用默认 ~/.autoloop/chat_history）
         show_usage:   是否显示 Token 用量
         show_timing:  是否显示耗时
     """
@@ -22,7 +22,7 @@ class ChatConfig:
 
 
 @dataclass
-class HarnessConfig:
+class AutoLoopConfig:
     """全局配置
 
     Attributes:

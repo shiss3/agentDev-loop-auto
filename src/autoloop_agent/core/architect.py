@@ -36,20 +36,20 @@ from claude_agent_sdk import (
     query,
     tool,
 )
-from harness_agent.chat.events import ChatEvent
-from harness_agent.chat.session_store import create_session_store
-from harness_agent.core.base_session import BaseAgentSession
-from harness_agent.core.executor import (
+from autoloop_agent.chat.events import ChatEvent
+from autoloop_agent.chat.session_store import create_session_store
+from autoloop_agent.core.base_session import BaseAgentSession
+from autoloop_agent.core.executor import (
     build_dispatch_manifest,
     build_executor_args,
     build_loop_prompt,
     spawn_executor,
     write_mcp_config,
 )
-from harness_agent.core.module_affinity import normalize_module_id, sanitize_module_id
-from harness_agent.core.task_queue_adapter import TaskQueueAdapter
-from harness_agent.core.utils import _build_message
-from harness_agent.core.worktree import (
+from autoloop_agent.core.module_affinity import normalize_module_id, sanitize_module_id
+from autoloop_agent.core.task_queue_adapter import TaskQueueAdapter
+from autoloop_agent.core.utils import _build_message
+from autoloop_agent.core.worktree import (
     commit_worktree,
     create_delivery_worktree,
     merge_worktree_branch,
@@ -452,10 +452,10 @@ class Governor:
                     in_tokens += _usage.get("input_tokens", 0) or 0
                     out_tokens += _usage.get("output_tokens", 0) or 0
         finally:
-            # 自测日志(默认关,设 HARNESS_PARSE_LOG=1 开):解析阶段 in/out tokens + 工具调用数
+            # 自测日志(默认关,设 AUTOLOOP_PARSE_LOG=1 开):解析阶段 in/out tokens + 工具调用数
             # + turns 逐轮分布(i/in/out/cr=cache_read/cc=cache_create/tools)
             # -> .claude/parse-logs/usage.jsonl。finally 兜底:解析异常也写部分值供排查。
-            if os.environ.get("HARNESS_PARSE_LOG"):
+            if os.environ.get("AUTOLOOP_PARSE_LOG"):
                 _log_path = (
                     Path(self.project_dir) / ".claude" / "parse-logs" / "usage.jsonl"
                 )
@@ -750,7 +750,7 @@ class Governor:
                     encoding="utf-8",
                 )
                 # DRY-RUN:自测看 dispatch 清单用。写完即停,不 spawn claude,不走验证/merge。
-                if os.environ.get("HARNESS_DELIVERY_DRY_RUN"):
+                if os.environ.get("AUTOLOOP_DELIVERY_DRY_RUN"):
                     yield _build_message(
                         f"🧪 DRY-RUN: dispatch 清单已写 {manifest_path}\n"
                         f"   跳过 spawn claude(自测用)。worktree 残留可手动删: {worktree_path}"

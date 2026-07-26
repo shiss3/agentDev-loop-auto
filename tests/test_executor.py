@@ -13,7 +13,7 @@ import json
 import os
 from unittest.mock import MagicMock
 
-from harness_agent.core.executor import (
+from autoloop_agent.core.executor import (
     EXECUTOR_ALLOWED_TOOLS,
     EXECUTOR_MODEL,
     EXECUTOR_SYSTEM_PROMPT,
@@ -164,7 +164,7 @@ def test_write_mcp_config_creates_parent_dir(tmp_path):
 
 async def test_spawn_executor_closes_log_handle(monkeypatch, tmp_path):
     """spawn_executor:子进程 spawn 后关闭父侧 log_file 句柄(防长驻 L0 跨 delivery 累积)。"""
-    from harness_agent.core import executor as ex
+    from autoloop_agent.core import executor as ex
 
     captured = {}
 

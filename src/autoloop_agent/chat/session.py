@@ -11,11 +11,11 @@ from __future__ import annotations
 
 from claude_agent_sdk import SessionStore
 
-from harness_agent.context.provider import ContextProvider, SystemPromptType
-from harness_agent.core.base_session import BaseAgentSession
+from autoloop_agent.context.provider import ContextProvider, SystemPromptType
+from autoloop_agent.core.base_session import BaseAgentSession
 
 
-_BASE_SYSTEM_PROMPT = """你是 Harness Agent 系统中的通用开发助手。
+_BASE_SYSTEM_PROMPT = """你是 AutoLoop 系统中的通用开发助手。
 你可以读写文件、执行命令来完成用户的开发任务。
 请直接动手完成任务，不要只给建议。
 

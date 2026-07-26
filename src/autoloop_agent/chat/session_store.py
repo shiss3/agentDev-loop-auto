@@ -6,7 +6,7 @@
 3. 提供 list_sessions/get_session 等查询接口
 
 存储结构：
-├── ~/.harness/sessions/
+├── ~/.autoloop/sessions/
 │   ├── .summary.json          # 每个命名的会话摘要文件
 │   └── .transcript.jsonl      # 会话原始对话记录
 """
@@ -41,7 +41,7 @@ class FileSessionStore(SessionStore):
     - 检查会话是否存在
 
     目录结构：
-        ~/.harness/sessions/
+        ~/.autoloop/sessions/
             ├── .summary.json          # 会话摘要（title, created_at, mtime）
             ├── .transcript.jsonl      # 会话原始记录（每行一个 SessionStoreEntry）
             └── .metadata.json         # 会话元数据（可选扩展）
@@ -51,10 +51,10 @@ class FileSessionStore(SessionStore):
         """初始化文件存储
 
         Args:
-            base_dir: 会话存储基础目录，默认 ~/.harness/sessions
+            base_dir: 会话存储基础目录，默认 ~/.autoloop/sessions
         """
         if base_dir is None:
-            base_dir = Path.home() / ".harness" / "sessions"
+            base_dir = Path.home() / ".autoloop" / "sessions"
 
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -436,7 +436,7 @@ def create_session_store(base_dir: str | Path | None = None) -> SessionStore:
     """创建 FileSessionStore 实例
 
     Args:
-        base_dir: 会话存储目录，默认 ~/.harness/sessions
+        base_dir: 会话存储目录，默认 ~/.autoloop/sessions
 
     Returns:
         SessionStore 实例

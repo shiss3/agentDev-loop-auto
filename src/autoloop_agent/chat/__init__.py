@@ -1,6 +1,6 @@
-"""Harness Agent — Chat 模块
+"""AutoLoop — Chat 模块
 
-提供多轮交互式聊天能力 (`harness chat`)。
+提供多轮交互式聊天能力 (`autoloop chat`)。
 
 模块结构：
     events.py        — ChatEvent 事件类型定义（Session ↔ Renderer 协议）

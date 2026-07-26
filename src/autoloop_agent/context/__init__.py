@@ -1,4 +1,4 @@
-"""Harness Agent — 共享上下文层
+"""AutoLoop — 共享上下文层
 
 为多 Agent / 多终端协作提供可插拔上下文接口。
 

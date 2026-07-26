@@ -172,22 +172,22 @@ async def test_result_message_structure():
                     print(f"\n[model_dump 失败] {e}")
 
 
-# ─── 测试 6：harness_agent 包自身可导入 ───
+# ─── 测试 6：autoloop_agent 包自身可导入 ───
 def test_package_import():
-    """验证 harness_agent 包可以正确导入，且 __version__ 与包元数据一致"""
+    """验证 autoloop_agent 包可以正确导入，且 __version__ 与包元数据一致"""
     from importlib.metadata import version
-    from harness_agent import __version__
-    assert __version__ == version("harness-agent")
+    from autoloop_agent import __version__
+    assert __version__ == version("autoloop-agent")
 
 
 def test_config_import():
     """验证配置模块可以正确导入"""
-    from harness_agent.config import HarnessConfig
-    config = HarnessConfig(project_dir=".")
+    from autoloop_agent.config import AutoLoopConfig
+    config = AutoLoopConfig(project_dir=".")
     assert config.max_turns == 15
 
 
 def test_state_import():
-    """验证编排器模块可以正确导入（替代废弃的 HarnessState）"""
-    from harness_agent.core.orchestrator import HarnessOrchestrator
-    assert HarnessOrchestrator is not None
+    """验证编排器模块可以正确导入（替代废弃的 AutoLoopState）"""
+    from autoloop_agent.core.orchestrator import AutoLoopOrchestrator
+    assert AutoLoopOrchestrator is not None

@@ -5,10 +5,10 @@
 产出与 astream_events v2 兼容的事件 dict（保证 cli.py 不改）。
 """
 
-from harness_agent.core.agents.base_agent import run_agent
+from autoloop_agent.core.agents.base_agent import run_agent
 
 
-class HarnessOrchestrator:
+class AutoLoopOrchestrator:
     """编排器封装 — 纯 async Python，无 LangGraph 依赖
 
     保持与 Phase 1 完全相同的公开接口：

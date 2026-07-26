@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from harness_agent.chat.events import ChatEvent, EventType
-from harness_agent.core.utils import _build_message
+from autoloop_agent.chat.events import ChatEvent, EventType
+from autoloop_agent.core.utils import _build_message
 
 
 def test_build_message():

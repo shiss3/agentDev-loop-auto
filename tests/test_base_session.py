@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from claude_agent_sdk import ResultMessage
 
-from harness_agent.core.base_session import BaseAgentSession
+from autoloop_agent.core.base_session import BaseAgentSession
 
 
 # ── 辅助 ──────────────────────────────────────────────
@@ -121,7 +121,7 @@ def test_mcp_servers_propagated():
 
 async def test_send_uses_asynciterable_prompt():
     """send('hi') → client.query 收到的是 async generator，迭代出标准 user 消息 dict"""
-    with patch("harness_agent.core.base_session.ClaudeSDKClient") as MockClient:
+    with patch("autoloop_agent.core.base_session.ClaudeSDKClient") as MockClient:
         client = _make_mock_client()
         MockClient.return_value = client
         session = BaseAgentSession()
@@ -163,7 +163,7 @@ async def test_send_uses_asynciterable_prompt():
 
 async def test_total_cost_usd_accumulated():
     """ResultMessage(total_cost_usd=0.5) → session.stats.total_cost_usd == 0.5"""
-    with patch("harness_agent.core.base_session.ClaudeSDKClient") as MockClient:
+    with patch("autoloop_agent.core.base_session.ClaudeSDKClient") as MockClient:
         client = _make_mock_client()
         MockClient.return_value = client
         session = BaseAgentSession()

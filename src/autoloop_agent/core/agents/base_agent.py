@@ -27,7 +27,7 @@ from claude_agent_sdk import (
 
 
 # 基础系统提示词（当不使用 Claude Code preset 时使用）
-_BASE_SYSTEM_PROMPT = """你是 Harness Agent 系统中的通用开发助手。
+_BASE_SYSTEM_PROMPT = """你是 AutoLoop 系统中的通用开发助手。
 你可以读写文件、执行命令来完成用户的开发任务。
 请直接动手完成任务，不要只给建议。
 

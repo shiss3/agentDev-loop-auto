@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from harness_agent.chat.repl import ChatCLI
+    from autoloop_agent.chat.repl import ChatCLI
 
 
 @dataclass

@@ -1,6 +1,6 @@
 """斜杠命令测试"""
 
-from harness_agent.chat.commands import get_command, all_commands
+from autoloop_agent.chat.commands import get_command, all_commands
 
 
 def test_builtin_commands_registered():

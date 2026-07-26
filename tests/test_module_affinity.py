@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from harness_agent.core.module_affinity import (
+from autoloop_agent.core.module_affinity import (
     SYNONYMS,
     affinity_key,
     normalize_module_id,

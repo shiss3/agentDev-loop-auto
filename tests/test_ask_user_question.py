@@ -22,11 +22,11 @@ from claude_agent_sdk import (
     SessionStore,
 )
 
-from harness_agent.chat.content_buffer import ContentBuffer
-from harness_agent.chat.repl import ChatCLI
-from harness_agent.chat.tui_app import TuiApp
-from harness_agent.core.architect import Governor, _default_can_use_tool
-from harness_agent.core.base_session import BaseAgentSession
+from autoloop_agent.chat.content_buffer import ContentBuffer
+from autoloop_agent.chat.repl import ChatCLI
+from autoloop_agent.chat.tui_app import TuiApp
+from autoloop_agent.core.architect import Governor, _default_can_use_tool
+from autoloop_agent.core.base_session import BaseAgentSession
 
 
 # ── 辅助 ──────────────────────────────────────────────

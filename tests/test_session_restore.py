@@ -7,7 +7,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 from claude_agent_sdk import SessionKey, SessionStoreEntry, fold_session_summary
 
-from harness_agent.chat.session_store import FileSessionStore
+from autoloop_agent.chat.session_store import FileSessionStore
 
 
 class TestFileSessionStore:
@@ -16,7 +16,7 @@ class TestFileSessionStore:
     @pytest.fixture
     async def store(self):
         """创建 SessionStore 实例"""
-        store = FileSessionStore(base_dir="/tmp/test_harness_sessions")
+        store = FileSessionStore(base_dir="/tmp/test_autoloop_sessions")
         # 清理测试数据
         yield store
         # 清理完成后的清理
@@ -185,11 +185,11 @@ class TestChatSessionIntegration:
     async def test_session_store_usage(self):
         """测试 ChatSession 使用 SessionStore"""
         # 创建会话存储
-        store = FileSessionStore(base_dir="/tmp/test_harness_sessions/session-test")
+        store = FileSessionStore(base_dir="/tmp/test_autoloop_sessions/session-test")
 
         # 创建会话（不传 session_store，使用默认）
         # 验证：ChatSession 内部应该有自己的 session_store
-        with patch("harness_agent.chat.session.ChatSession._build_options") as mock_build:
+        with patch("autoloop_agent.chat.session.ChatSession._build_options") as mock_build:
             # Mock 返回的 options
             mock_options = MagicMock()
             mock_options.session_store = store
@@ -207,7 +207,7 @@ class TestChatSessionIntegration:
         """测试创建新会话"""
 
         # 直接创建一个会话
-        from harness_agent.chat.session import ChatSession
+        from autoloop_agent.chat.session import ChatSession
 
         session = ChatSession(
             project_dir=".",

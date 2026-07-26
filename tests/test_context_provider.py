@@ -1,6 +1,6 @@
 """ContextProvider 接口测试"""
 
-from harness_agent.context.provider import (
+from autoloop_agent.context.provider import (
     ContextProvider,
     DefaultContextProvider,
     SystemPromptType,

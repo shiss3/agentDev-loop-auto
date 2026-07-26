@@ -1,7 +1,7 @@
-"""Harness Agent - 驾驭工程实践"""
+"""AutoLoop - 自动循环开发"""
 from importlib.metadata import PackageNotFoundError, version
 
 try:
-    __version__ = version("harness-agent")
+    __version__ = version("autoloop-agent")
 except PackageNotFoundError:
     __version__ = "0.0.0"
