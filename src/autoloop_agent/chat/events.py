@@ -61,6 +61,32 @@ class ChatEvent:
     timestamp: datetime = field(default_factory=datetime.now)
     request_id: str | None = None
 
+    def to_dict(self) -> dict[str, Any]:
+        """序列化为 JSON 友好 dict（SSE/HTTP 协议层使用）。
+
+        - type -> EventType.value（str）
+        - data -> 直传（已是 JSON 友好标量/list/dict）
+        - timestamp -> datetime.isoformat()
+        """
+        return {
+            "type": self.type.value,
+            "data": dict(self.data),
+            "agent": self.agent,
+            "request_id": self.request_id,
+            "timestamp": self.timestamp.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ChatEvent:
+        """从 to_dict 产出还原（往返对称）。"""
+        return cls(
+            type=EventType(d["type"]),
+            data=dict(d.get("data") or {}),
+            agent=d.get("agent", "default"),
+            request_id=d.get("request_id"),
+            timestamp=datetime.fromisoformat(d["timestamp"]),
+        )
+
 
 # ── 便捷工厂函数 ──────────────────────────────────────
 

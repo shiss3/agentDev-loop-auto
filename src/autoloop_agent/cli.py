@@ -234,6 +234,73 @@ def chat(project: str | None, model: str | None, resume: str | None, continue_co
 
 
 @cli.command()
+@click.option(
+    "--project", "-p",
+    default=None,
+    type=click.Path(exists=True),
+    help="项目工作目录（默认自动探测最近的项目根：pyproject.toml / .git / package.json）",
+)
+@click.option(
+    "--model", "-m",
+    default=None,
+    help="模型名称，如 glm-5.1（默认走全局 settings.json 配置）",
+)
+@click.option(
+    "--host",
+    default="127.0.0.1",
+    help="监听地址（默认 127.0.0.1；手机/模拟器连主机需 0.0.0.0）",
+)
+@click.option(
+    "--port",
+    default=8000,
+    type=int,
+    help="监听端口（默认 8000）",
+)
+def serve(project: str | None, model: str | None, host: str, port: int):
+    """启动 FastAPI + SSE server（Flutter 客户端协议层）
+
+    复用 ChatSession.send() 的 ChatEvent 事件流：
+      POST /chat    触发 send()，立即返回 ack（不阻塞）
+      GET  /events  SSE 实时推送序列化 ChatEvent
+      POST /cancel  中断进行中请求
+      GET  /status  暴露 SessionStats（轮次/token/成本）
+
+    单会话模型，asyncio.Lock 串行化并发请求。
+    与 chat 命令进程级隔离，不共享 session 状态。
+
+    示例:
+        autoloop serve                        # 当前目录，127.0.0.1:8000
+        autoloop serve -p ./my-app            # 指定项目
+        autoloop serve -m glm-5.1 --port 9000
+        autoloop serve --host 0.0.0.0         # 供手机/模拟器连接
+    """
+    import uvicorn
+    from autoloop_agent.server import create_app
+
+    # 未指定 project 时自动探测项目根
+    if project is None:
+        project_dir = str(_detect_project_root(Path.cwd()))
+    else:
+        project_dir = str(Path(project).resolve())
+
+    console.print(
+        Panel(
+            f"[bold cyan]项目:[/] {project_dir}\n"
+            f"[bold cyan]监听:[/] http://{host}:{port}"
+            + (f"\n[bold cyan]模型:[/] {model}" if model else ""),
+            title="🐴 AutoLoop serve",
+            border_style="cyan",
+        )
+    )
+
+    uvicorn.run(
+        create_app(project_dir=project_dir, model=model),
+        host=host,
+        port=port,
+    )
+
+
+@cli.command()
 def version():
     """显示版本信息"""
     from autoloop_agent import __version__

@@ -1,6 +1,9 @@
 """ChatEvent 事件类型测试"""
 
+from datetime import datetime
+
 from autoloop_agent.chat.events import (
+    ChatEvent,
     EventType,
     text_event,
     tool_use_event,
@@ -154,3 +157,102 @@ def test_cancelled_event():
     event = cancelled_event("用户取消了请求")
     assert event.type == EventType.CANCELLED
     assert event.data["reason"] == "用户取消了请求"
+
+
+# ── 序列化 / 反序列化往返测试 ──
+
+def _assert_roundtrip(event):
+    d = event.to_dict()
+    # 协议字段齐全
+    assert set(d.keys()) == {"type", "data", "agent", "request_id", "timestamp"}
+    # type 走 str value，非 Enum
+    assert d["type"] == event.type.value
+    assert isinstance(d["type"], str)
+    # timestamp isoformat
+    assert d["timestamp"] == event.timestamp.isoformat()
+    # data 直传
+    assert d["data"] == event.data
+    # 往返对称
+    restored = type(event).from_dict(d) if False else event.from_dict(d)
+    assert restored.type == event.type
+    assert restored.data == event.data
+    assert restored.agent == event.agent
+    assert restored.request_id == event.request_id
+    assert restored.timestamp == event.timestamp
+
+
+def test_roundtrip_text():
+    _assert_roundtrip(text_event("hi", agent="a", request_id="r1"))
+
+
+def test_roundtrip_tool_use():
+    _assert_roundtrip(tool_use_event("Read", "id-1", "f.py", request_id="r1"))
+
+
+def test_roundtrip_tool_result():
+    _assert_roundtrip(tool_result_event("id-1", "content", is_error=True, request_id="r1"))
+
+
+def test_roundtrip_usage():
+    _assert_roundtrip(
+        usage_event(input_tokens=10, output_tokens=5, model_name="m", request_id="r1")
+    )
+
+
+def test_roundtrip_retry():
+    _assert_roundtrip(retry_event(attempt=2, reason="timeout", max_attempts=5, request_id="r1"))
+
+
+def test_roundtrip_rate_limit():
+    _assert_roundtrip(
+        rate_limit_event(status="rejected", rate_limit_type="five_hour", resets_at=123, request_id="r1")
+    )
+
+
+def test_roundtrip_stream_error():
+    _assert_roundtrip(stream_error_event(error="boom", stream_event_type="error", request_id="r1"))
+
+
+def test_roundtrip_turn_lifecycle():
+    _assert_roundtrip(turn_start_event(1, "prompt", request_id="r1"))
+    _assert_roundtrip(turn_end_event(1, tool_count=3, duration_ms=1500, request_id="r1"))
+
+
+def test_roundtrip_misc():
+    _assert_roundtrip(error_event("err", agent="a", request_id="r1"))
+    _assert_roundtrip(thinking_event(agent="a", request_id="r1"))
+    _assert_roundtrip(cancelled_event(reason="取消", request_id="r1"))
+
+
+def test_roundtrip_covers_all_event_types():
+    """每个 EventType 至少有一个工厂产出，并完成往返。"""
+    covered: set[EventType] = set()
+    events = [
+        text_event("x"),
+        tool_use_event("t", "id", "in"),
+        tool_result_event("id", "out"),
+        turn_start_event(1, "p"),
+        turn_end_event(1, 0, 0),
+        cancelled_event(),
+        thinking_event(),
+        error_event("e"),
+        usage_event(),
+        retry_event(1, "r"),
+        rate_limit_event(status="allowed"),
+        stream_error_event("e"),
+    ]
+    for ev in events:
+        _assert_roundtrip(ev)
+        covered.add(ev.type)
+    missing = set(EventType) - covered
+    assert not missing, f"未覆盖 EventType: {missing}"
+
+
+def test_timestamp_isoformat_roundtrip():
+    """显式时间戳经 to_dict/from_dict 不丢精度。"""
+    ts = datetime(2026, 7, 26, 12, 34, 56, 789000)
+    ev = ChatEvent(type=EventType.TEXT, data={"x": 1}, agent="a", timestamp=ts, request_id="r")
+    d = ev.to_dict()
+    assert d["timestamp"] == "2026-07-26T12:34:56.789000"
+    assert ChatEvent.from_dict(d).timestamp == ts
+
