@@ -20,13 +20,15 @@ from harness_agent.core import architect
 from harness_agent.core.architect import Governor
 from harness_agent.core.task_queue_adapter import TaskQueueAdapter
 # ── 辅助 ──────────────────────────────────────────────
-def make_fake_assistant_msg(spec=None):
+def make_fake_assistant_msg(spec=None, usage=None):
     """构造能通过 isinstance(msg, AssistantMessage) 检查的 fake 消息。
     MagicMock(spec=AssistantMessage) —— spec 让 isinstance 返回 True。
     spec: 填 tool_use block 的 input(任务单 dict;None 表示无 tool_use)。
+    usage: 填 msg.usage(dict|None);_parse_requirement 按轮记录进 turns 日志。
     _parse_requirement 从流 AssistantMessage.tool_use 截获 submit_analysis_plan input。
     """
     msg = MagicMock(spec=AssistantMessage)
+    msg.usage = usage
     if spec is not None:
         msg.content = [ToolUseBlock(id="1", name="mcp__plan_capture__submit_analysis_plan", input=spec)]
     else:
@@ -122,6 +124,33 @@ async def test_parse_requirement_logs_usage(tmp_path, patch_query, monkeypatch):
     assert rec["tool_calls"] == 1  # submit_analysis_plan
     assert rec["captured"] is True
     assert rec["duration_s"] >= 0
+# ── 2e. 逐轮 token 分布日志(AssistantMessage.usage -> turns) ──
+async def test_parse_requirement_logs_turns(tmp_path, monkeypatch):
+    """HARNESS_PARSE_LOG=1 -> turns 记录每轮 in/out/cache + 本轮工具名"""
+    monkeypatch.setenv("HARNESS_PARSE_LOG", "1")
+    governor = Governor(
+        project_dir=str(tmp_path), session_store=MagicMock(spec=SessionStore)
+    )
+    async def fake_query(*, prompt, options=None):
+        yield make_fake_assistant_msg(
+            usage={"input_tokens": 100, "output_tokens": 10,
+                   "cache_read_input_tokens": 5, "cache_creation_input_tokens": 3}
+        )
+        yield make_fake_assistant_msg(
+            {"task_summary": "x"},
+            usage={"input_tokens": 260, "output_tokens": 20},
+        )
+    monkeypatch.setattr(architect, "query", fake_query)
+    await governor._parse_requirement("x", context_continuation=False)
+    rec = json.loads(
+        (tmp_path / ".claude" / "parse-logs" / "usage.jsonl")
+        .read_text(encoding="utf-8").strip()
+    )
+    assert rec["turns"] == [
+        {"i": 0, "in": 100, "out": 10, "cr": 5, "cc": 3, "tools": []},
+        {"i": 1, "in": 260, "out": 20, "cr": 0, "cc": 0,
+         "tools": ["mcp__plan_capture__submit_analysis_plan"]},
+    ]
 # ── 2d. ResultMessage.usage=None 不崩(回归:旧 msg.input_tokens 属性错已修) ──
 async def test_parse_requirement_result_msg_none_usage(tmp_path, monkeypatch):
     """ResultMessage.usage=None -> _usage={} 兜底,不 AttributeError,spec 仍截获"""

@@ -420,18 +420,32 @@ class Governor:
         prefix = "接续修改" if context_continuation else "全新任务"
         prompt = f"[{prefix}] {text}"
         in_tokens = out_tokens = tool_calls = 0
+        _turns: list[dict] = []  # 逐轮 token 分布(判定冷启动大头:盲探 vs 定向探索)
         _start = datetime.datetime.now()
         try:
             async for msg in query(prompt=prompt, options=opts):
                 # 流兜底:handler 未触发时从 AssistantMessage 提取 tool_use input
                 if isinstance(msg, AssistantMessage):
+                    _tools: list[str] = []
                     for block in msg.content:
                         if not isinstance(block, ToolUseBlock):
                             continue
                         tool_calls += 1
+                        _tools.append(block.name)
                         if (block.name == "mcp__plan_capture__submit_analysis_plan"
                                 and captured_spec is None):
                             captured_spec = block.input
+                    # AssistantMessage.usage = 单次 API 调用 token(dict)
+                    # in 增量≈上轮工具结果 token -> 归因到 tools 列出的调用
+                    if _usage := getattr(msg, "usage", None):
+                        _turns.append({
+                            "i": len(_turns),
+                            "in": _usage.get("input_tokens", 0) or 0,
+                            "out": _usage.get("output_tokens", 0) or 0,
+                            "cr": _usage.get("cache_read_input_tokens", 0) or 0,
+                            "cc": _usage.get("cache_creation_input_tokens", 0) or 0,
+                            "tools": _tools,
+                        })
                 elif isinstance(msg, ResultMessage):
                     # ResultMessage.usage 是 dict(SDK 不平铺 input_tokens)
                     _usage = msg.usage or {}
@@ -439,6 +453,7 @@ class Governor:
                     out_tokens += _usage.get("output_tokens", 0) or 0
         finally:
             # 自测日志(默认关,设 HARNESS_PARSE_LOG=1 开):解析阶段 in/out tokens + 工具调用数
+            # + turns 逐轮分布(i/in/out/cr=cache_read/cc=cache_create/tools)
             # -> .claude/parse-logs/usage.jsonl。finally 兜底:解析异常也写部分值供排查。
             if os.environ.get("HARNESS_PARSE_LOG"):
                 _log_path = (
@@ -454,6 +469,7 @@ class Governor:
                     "input_tokens": in_tokens,
                     "output_tokens": out_tokens,
                     "tool_calls": tool_calls,
+                    "turns": _turns,
                     "captured": captured_spec is not None,
                 }
                 with _log_path.open("a", encoding="utf-8") as _f:
