@@ -885,3 +885,32 @@ async def test_executors_overlap_forces_serial_layers(orch_env, monkeypatch):
     events = await collect(governor._run_executors(modules, "r1", {"task_summary": "x"}))
     assert timeline == ["create:a", "slot:a", "merge:a", "create:b", "slot:b", "merge:b"]
     assert _text_events_containing(events, "执行分层")
+
+
+async def test_executors_writes_module_graph_json(orch_env, monkeypatch, tmp_path):
+    """依赖图持久化:modules-<req_id>.json 含 layers/edges/模块详情(DRY-RUN 外也写)"""
+    import json as _json
+
+    governor = Governor(
+        project_dir=str(tmp_path), session_store=MagicMock(spec=SessionStore)
+    )
+
+    async def fake_slot(self, module, req_id, spec, wt, logs_dir, evq):
+        return True
+
+    monkeypatch.setattr(Governor, "_run_module_slot", fake_slot)
+    modules = [
+        _orch_module("a", ["a1.py"]),
+        _orch_module("b", ["b1.py"], deps=["a"]),
+    ]
+    await collect(governor._run_executors(modules, "r1", {"task_summary": "做设置页"}))
+    graph_path = tmp_path / ".claude" / "delivery-logs" / "r1" / "modules-r1.json"
+    graph = _json.loads(graph_path.read_text(encoding="utf-8"))
+    assert graph["req_id"] == "r1"
+    assert graph["task_summary"] == "做设置页"
+    assert graph["layers"] == [["a"], ["b"]]  # dep 提示边 -> 串行两层
+    assert graph["edges"] == [["a", "b"]]
+    by_id = {m["module_id"]: m for m in graph["modules"]}
+    assert by_id["b"]["deps"] == ["a"]
+    assert by_id["a"]["file_set"] == ["a1.py"]
+    assert by_id["a"]["subtasks"][0]["id"] == "t1"

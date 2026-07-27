@@ -693,6 +693,27 @@ class Governor:
         by_id = {m["module_id"]: m for m in modules}
         logs_dir = Path(self.project_dir) / ".claude" / "delivery-logs" / req_id
         logs_dir.mkdir(parents=True, exist_ok=True)
+        # 模块依赖图持久化:DRY-RUN/真跑都写,供事后查看模块划分/边/分层。
+        graph = {
+            "req_id": req_id,
+            "task_summary": spec.get("task_summary", ""),
+            "layers": layers,
+            "edges": sorted([a, b] for a, b in edges),
+            "modules": [
+                {
+                    "module_id": m["module_id"],
+                    "summary": m.get("summary", ""),
+                    "acceptance": m.get("acceptance", []),
+                    "deps": m.get("deps", []),
+                    "file_set": sorted(module_file_set(m)),
+                    "subtasks": m["subtasks"],
+                }
+                for m in modules
+            ],
+        }
+        (logs_dir / f"modules-{req_id}.json").write_text(
+            json.dumps(graph, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         if len(layers) > 1 or any(len(layer) > 1 for layer in layers):
             shape = " -> ".join(f"[{'|'.join(layer)}]" for layer in layers)
             yield _build_message(f"🧭 执行分层: {shape}")
