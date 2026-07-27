@@ -1,5 +1,7 @@
 # Step 2 实施计划 - 调度器（Governor 交付轨灌队列）
 
+> ⚠️ **已废弃（0.5.0）**：task_queue MCP 灌队列方案已被「模块粒度 all-at-once 派发 + worktree 摘要文件恢复」取代（subtask DAG/domain/task_queue_adapter 全删）。本文仅作历史存档。
+
 > **范围**：把 `Governor._run_delivery` 从占位实装为「拆任务 -> `store.seed` 灌队列 -> 返回 req_id」，并把 `Governor` 接入 REPL。**不 spawn 执行器**（后续层解耦）。
 >
 > **三步定位**：①取任务 MCP（`task-service/`，已完成✅）②**调度器（本步）**③记忆系统（后置）。

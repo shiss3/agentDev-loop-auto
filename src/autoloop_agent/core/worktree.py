@@ -22,18 +22,16 @@ def _git(args: list[str], cwd: str) -> subprocess.CompletedProcess:
     )
 
 
-def _delivery_ref(repo_root: str, req_id: str, module_id: str | None = None) -> tuple[str, str]:
-    """(worktree 绝对路径, 分支名)。module_id 为 None 走旧单 worktree 形状(过渡兼容)。"""
+def _delivery_ref(repo_root: str, req_id: str, module_id: str) -> tuple[str, str]:
+    """(worktree 绝对路径, 分支名)。每模块独立:路径 deliver-<req>-<mod>,分支 deliver/<req>/<mod>。"""
     from pathlib import Path
 
-    suffix = req_id if module_id is None else f"{req_id}-{module_id}"
-    wt_path = str(Path(repo_root) / WORKTREE_DIR / f"deliver-{suffix}")
-    branch = f"deliver/{req_id}" if module_id is None else f"deliver/{req_id}/{module_id}"
-    return wt_path, branch
+    wt_path = str(Path(repo_root) / WORKTREE_DIR / f"deliver-{req_id}-{module_id}")
+    return wt_path, f"deliver/{req_id}/{module_id}"
 
 
-def create_delivery_worktree(repo_root: str, req_id: str, module_id: str | None = None) -> str:
-    """git worktree add <repo_root>/.claude/worktrees/deliver-<req_id>[-<module_id>] -b deliver/<req_id>[/<module_id>]
+def create_delivery_worktree(repo_root: str, req_id: str, module_id: str) -> str:
+    """git worktree add <repo_root>/.claude/worktrees/deliver-<req_id>-<module_id> -b deliver/<req_id>/<module_id>
 
     若 worktree 路径已存在先 remove --force。返回 worktree 绝对路径。
     """
@@ -58,8 +56,8 @@ def commit_worktree(worktree_path: str, msg: str) -> bool:
     return res.returncode == 0
 
 
-def merge_worktree_branch(repo_root: str, req_id: str, module_id: str | None = None) -> tuple[bool, str]:
-    """cwd=repo_root: git merge --no-ff deliver/<req_id>[/<module_id>]。
+def merge_worktree_branch(repo_root: str, req_id: str, module_id: str) -> tuple[bool, str]:
+    """cwd=repo_root: git merge --no-ff deliver/<req_id>/<module_id>。
 
     returncode==0 -> (True, '')。!=0(冲突) -> (False, stdout+stderr)。
     """
@@ -70,7 +68,7 @@ def merge_worktree_branch(repo_root: str, req_id: str, module_id: str | None = N
     return (False, res.stdout + res.stderr)
 
 
-def remove_worktree(repo_root: str, req_id: str, module_id: str | None = None) -> None:
+def remove_worktree(repo_root: str, req_id: str, module_id: str) -> None:
     """git worktree remove --force <path>。忽略错误(清理尽力)。"""
     wt_path, _ = _delivery_ref(repo_root, req_id, module_id)
     _git(["worktree", "remove", "--force", wt_path], cwd=repo_root)

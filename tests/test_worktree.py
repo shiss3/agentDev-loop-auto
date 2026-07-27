@@ -45,7 +45,7 @@ def git_repo(tmp_path):
 
 def test_create_commit_merge_remove(git_repo):
     root = git_repo
-    wt = create_delivery_worktree(root, "r1")
+    wt = create_delivery_worktree(root, "r1", "m1")
     assert Path(wt).exists()
     assert Path(wt).is_dir()
 
@@ -54,7 +54,7 @@ def test_create_commit_merge_remove(git_repo):
     assert commit_worktree(wt, "feat r1") is True
 
     # 主分支无改动 -> merge 成功
-    ok, err = merge_worktree_branch(root, "r1")
+    ok, err = merge_worktree_branch(root, "r1", "m1")
     assert ok is True
     assert err == ""
     # merge 后主分支能看到 feat.py
@@ -64,19 +64,19 @@ def test_create_commit_merge_remove(git_repo):
     assert commit_worktree(wt, "empty") is False
 
     # remove
-    remove_worktree(root, "r1")
+    remove_worktree(root, "r1", "m1")
     assert not Path(wt).exists()
 
 
 def test_create_worktree_replaces_existing(git_repo):
     """路径残留时 create 先 remove --force 再 add。"""
     root = git_repo
-    wt = create_delivery_worktree(root, "r2")
+    wt = create_delivery_worktree(root, "r2", "m1")
     (Path(wt) / "a.txt").write_text("a", encoding="utf-8")
     commit_worktree(wt, "first")
 
     # 再次 create 同 req_id(模拟重试/残留)
-    wt2 = create_delivery_worktree(root, "r2")
+    wt2 = create_delivery_worktree(root, "r2", "m1")
     assert wt2 == wt
     assert Path(wt2).exists()
 
@@ -117,9 +117,6 @@ def test_module_worktree_ref_shape(git_repo):
     path, branch = _delivery_ref(git_repo, "r9", "mod_a")
     assert path.endswith("deliver-r9-mod_a")
     assert branch == "deliver/r9/mod_a"
-    path, branch = _delivery_ref(git_repo, "r9")
-    assert path.endswith("deliver-r9")
-    assert branch == "deliver/r9"
 
 
 # ── merge 冲突 ───────────────────────────────────────
@@ -127,7 +124,7 @@ def test_module_worktree_ref_shape(git_repo):
 
 def test_merge_conflict_returns_false_with_output(git_repo):
     root = git_repo
-    wt = create_delivery_worktree(root, "r3")
+    wt = create_delivery_worktree(root, "r3", "m1")
 
     # 双方改同一文件不同内容
     (Path(wt) / "README.md").write_text("worktree side\n", encoding="utf-8")
@@ -137,14 +134,14 @@ def test_merge_conflict_returns_false_with_output(git_repo):
     _git(["add", "-A"], cwd=root)
     _git(["commit", "-m", "main side"], cwd=root)
 
-    ok, err = merge_worktree_branch(root, "r3")
+    ok, err = merge_worktree_branch(root, "r3", "m1")
     assert ok is False
     assert err != ""
     assert "conflict" in err.lower() or "merge" in err.lower()
 
     # 清理冲突状态,便于后续
     _git(["merge", "--abort"], cwd=root)
-    remove_worktree(root, "r3")
+    remove_worktree(root, "r3", "m1")
 
 
 # ── 编码:子进程 UTF-8 输出在 gbk locale 下不炸 ──────
@@ -226,4 +223,4 @@ def test_create_delivery_worktree_add_fail_raises(monkeypatch, git_repo):
 
     monkeypatch.setattr(wt, "_git", fake_git)
     with pytest.raises(RuntimeError, match="worktree add 失败"):
-        create_delivery_worktree(git_repo, "rfail")
+        create_delivery_worktree(git_repo, "rfail", "m1")
