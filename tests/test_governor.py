@@ -11,14 +11,15 @@
 - BaseAgentSession.start/close 在 rebuild 测试中 patch 为 AsyncMock
 """
 from __future__ import annotations
+import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, SessionStore, ToolUseBlock
 from autoloop_agent.chat.events import EventType, text_event
 from autoloop_agent.core import architect
-from autoloop_agent.core.architect import Governor
-from autoloop_agent.core.task_queue_adapter import TaskQueueAdapter
+from autoloop_agent.core.architect import Governor, validate_modules
 # ── 辅助 ──────────────────────────────────────────────
 def make_fake_assistant_msg(spec=None, usage=None):
     """构造能通过 isinstance(msg, AssistantMessage) 检查的 fake 消息。
@@ -79,8 +80,8 @@ def patch_query(monkeypatch):
     return _set
 @pytest.fixture
 def stub_executors(monkeypatch):
-    """stub _run_executors 为空 async gen(测 seed/降级/拦截时不真 spawn claude/git)。"""
-    async def _stub(self, tasks, req_id):
+    """stub _run_executors 为空 async gen(测调度/降级/拦截时不真 spawn claude/git)。"""
+    async def _stub(self, modules, req_id, spec):
         if False:
             yield  # 标记 async generator,实际空跑
     monkeypatch.setattr(Governor, "_run_executors", _stub)
@@ -308,16 +309,19 @@ async def test_handle_interactive_auto():
     assert len(dispatch_evs) == 1
     assert "interactive" in dispatch_evs[0].data["text"]
     assert fake_ev in events
-# ── 7. handle_user_input 交付轨灌队列 ──
-async def test_handle_delivery_placeholder(stub_executors):
-    """mock 解析→delivery+subtasks + mock task_queue → events 含 req_id + seed 被调"""
-    task_queue = MagicMock(spec=TaskQueueAdapter)
-    task_queue.seed.return_value = 2
-    governor = Governor(
-        project_dir=".",
-        session_store=MagicMock(spec=SessionStore),
-        task_queue=task_queue,
-    )
+# ── 7. handle_user_input 交付轨:modules 规范化送 _run_executors ──
+async def test_handle_delivery_placeholder(monkeypatch):
+    """mock 解析→delivery+modules → events 含 req_id;_run_executors 收规范化模块"""
+    captured: dict = {}
+
+    async def fake_executors(self, modules, req_id, spec):
+        captured["modules"] = modules
+        captured["req_id"] = req_id
+        if False:
+            yield
+
+    monkeypatch.setattr(Governor, "_run_executors", fake_executors)
+    governor = make_governor()
     governor._parse_requirement = AsyncMock(
         return_value={
             "task_summary": "重构支付",
@@ -327,24 +331,17 @@ async def test_handle_delivery_placeholder(stub_executors):
             "change_type": "feature",
             "file_count_bucket": "6+",
             "cross_domain": True,
-            "subtasks": [
+            "modules": [
                 {
-                    "id": "t1",
-                    "domain": "backend",
-                    "module_id": "payment",
-                    "summary": "建表",
-                    "acceptance": ["表存在"],
-                    "intended_files": ["db.sql"],
-                    "deps": [],
-                },
-                {
-                    "id": "t2",
-                    "domain": "frontend",
-                    "module_id": "payment",
-                    "summary": "支付页",
-                    "acceptance": ["页面渲染"],
-                    "intended_files": ["pay.vue"],
-                    "deps": ["t1"],
+                    "module_id": "Payment",
+                    "summary": "支付模块",
+                    "acceptance": ["链路全通"],
+                    "subtasks": [
+                        {"id": "t1", "summary": "建表", "acceptance": ["表存在"],
+                         "intended_files": ["db.sql"]},
+                        {"id": "t2", "summary": "支付页", "acceptance": ["渲染"],
+                         "intended_files": ["pay.vue"]},
+                    ],
                 },
             ],
         }
@@ -353,32 +350,17 @@ async def test_handle_delivery_placeholder(stub_executors):
     dispatch_evs = _text_events_containing(events, "调度")
     assert len(dispatch_evs) == 1
     assert "delivery" in dispatch_evs[0].data["text"]
-    # 含 req_id 的结果行
     req_id_evs = _text_events_containing(events, "req_id=")
     assert len(req_id_evs) == 1
-    # seed 被调用，收到 2 个任务
-    assert task_queue.seed.call_count == 1
-    seeded = task_queue.seed.call_args.args[0]
-    assert len(seeded) == 2
-    # 全 id = {req_id}-{short_id}
-    t1 = seeded[0]
-    assert t1["id"].endswith("-t1")
-    assert t1["module_id"] == "payment"
-    # deps 短 id -> 全 id 映射：t2.deps == [t1 全 id]
-    t2 = seeded[1]
-    assert t2["deps"] == [t1["id"]]
-    assert t2["module_id"] == "payment"
-# ── 7b. high+patch+1-5+单领域+subtasks 非空 -> delivery 灌队列不降级 ──
+    # _run_executors 收到规范化模块(module_id normalize 小写)
+    assert captured["modules"][0]["module_id"] == "payment"
+    assert len(captured["modules"][0]["subtasks"]) == 2
+    assert captured["req_id"]
+# ── 7b. high+patch+1-5+单领域+modules 非空 -> delivery 不降级 ──
 async def test_handle_high_patch_no_degrade(stub_executors):
     """high 风险小补丁(patch+1-5+单领域)但 risk_level=high -> delivery；
-    subtasks 非空 -> 灌队列不降级常驻（risk_level 拦截不被降级路径架空）"""
-    task_queue = MagicMock(spec=TaskQueueAdapter)
-    task_queue.seed.return_value = 1
-    governor = Governor(
-        project_dir=".",
-        session_store=MagicMock(spec=SessionStore),
-        task_queue=task_queue,
-    )
+    modules 非空 -> 走交付不降级常驻（risk_level 拦截不被降级路径架空）"""
+    governor = make_governor()
     governor._parse_requirement = AsyncMock(
         return_value={
             "task_summary": "改支付回调签名校验",
@@ -388,15 +370,15 @@ async def test_handle_high_patch_no_degrade(stub_executors):
             "change_type": "patch",
             "file_count_bucket": "1-5",
             "cross_domain": False,
-            "subtasks": [
+            "modules": [
                 {
-                    "id": "t1",
-                    "domain": "backend",
                     "module_id": "payment",
-                    "summary": "改签名校验",
+                    "summary": "签名校验",
                     "acceptance": ["用 HMAC-SHA256"],
-                    "intended_files": ["callback.py"],
-                    "deps": [],
+                    "subtasks": [
+                        {"id": "t1", "summary": "改签名校验", "acceptance": ["HMAC"],
+                         "intended_files": ["callback.py"]},
+                    ],
                 },
             ],
         }
@@ -406,8 +388,7 @@ async def test_handle_high_patch_no_degrade(stub_executors):
     events = await collect(governor.handle_user_input("改支付回调签名校验"))
     dispatch_evs = _text_events_containing(events, "调度")
     assert "delivery" in dispatch_evs[0].data["text"]
-    # 灌队列（seed 被调），不降级常驻（send 不被调，无降级事件）
-    assert task_queue.seed.call_count == 1
+    # 走交付轨,不降级常驻（send 不被调，无降级事件）
     degrade_evs = _text_events_containing(events, "降级")
     assert len(degrade_evs) == 0
     assert fake_ev not in events
@@ -424,14 +405,14 @@ async def test_handle_forced_interactive_skips_parse():
     assert "interactive" in dispatch_evs[0].data["text"]
     assert fake_ev in events
     governor._parse_requirement.assert_not_called()
-# ── 9. forced_track="delivery" 解析+强制 delivery(subtasks 非空) ──
+# ── 9. forced_track="delivery" 解析+强制 delivery(modules 非空) ──
 async def test_handle_forced_delivery_runs_delivery(monkeypatch):
-    """forced_track='delivery' -> 调 _parse_requirement;subtasks 非空 -> 强制走 _run_delivery"""
+    """forced_track='delivery' -> 调 _parse_requirement;modules 非空 -> 强制走 _run_delivery"""
     governor = make_governor()
     governor._parse_requirement = AsyncMock(return_value={
         "task_summary": "x",
-        "subtasks": [{"id": "t1", "domain": "backend", "summary": "s",
-                      "acceptance": [], "module_id": "m", "deps": []}],
+        "modules": [{"module_id": "m", "summary": "s", "acceptance": [],
+                     "subtasks": [{"id": "t1", "summary": "s", "acceptance": []}]}],
     })
     delivery_specs = []
     async def fake_delivery(self, spec):
@@ -443,17 +424,17 @@ async def test_handle_forced_delivery_runs_delivery(monkeypatch):
     assert delivery_specs  # 走了 delivery
     dispatch_evs = _text_events_containing(events, "调度")
     assert any("delivery" in e.data["text"] for e in dispatch_evs)
-# ── 9b. forced_track="delivery" subtasks=[] -> 拦截不执行 ──
+# ── 9b. forced_track="delivery" modules=[] -> 拦截不执行 ──
 async def test_handle_forced_delivery_empty_subtasks_blocked(monkeypatch):
-    """forced_track='delivery' + subtasks=[] -> 拦截提示,不走 _run_delivery"""
+    """forced_track='delivery' + modules=[] -> 拦截提示,不走 _run_delivery"""
     governor = make_governor()
-    governor._parse_requirement = AsyncMock(return_value={"task_summary": "x", "subtasks": []})
+    governor._parse_requirement = AsyncMock(return_value={"task_summary": "x", "modules": []})
     async def fake_delivery(self, spec):
         yield text_event("should-not-happen")
     monkeypatch.setattr(Governor, "_run_delivery", fake_delivery)
     events = await collect(governor.handle_user_input("x", forced_track="delivery"))
     assert not _text_events_containing(events, "should-not-happen")
-    assert _text_events_containing(events, "未拆出子任务")
+    assert _text_events_containing(events, "未拆出模块")
 # ── 10. _run_validation 显式 UTF-8 编码(gbk locale 不炸) ──
 async def test_run_validation_forces_utf8_encoding(monkeypatch):
     """_run_validation subprocess 必须 encoding='utf-8'+errors='replace'。
@@ -483,9 +464,8 @@ async def test_run_validation_forces_utf8_encoding(monkeypatch):
 
 # ── resident_plan：常驻会话方案生成工具 ──
 def test_resident_session_mounts_plan_tool():
-    """_build_resident_session 挂载 plan_gen SDK server + tool_intercept；未配置 task_queue 也挂载"""
+    """_build_resident_session 挂载 plan_gen SDK server + tool_intercept"""
     governor = make_governor()
-    assert governor._task_queue is None  # 未配置 TASK_SERVICE_DIR/TASK_DB
     session = governor._resident
     opts = session._build_options()
     assert "plan_gen" in opts.mcp_servers
@@ -495,7 +475,7 @@ def test_resident_session_mounts_plan_tool():
 async def test_capture_plan_handler():
     """propose_plan handler 截获 args 存 _pending_plan，返回确认文本"""
     governor = make_governor()
-    spec = {"task_summary": "x", "subtasks": [{"id": "t1"}]}
+    spec = {"task_summary": "x", "modules": [{"module_id": "m"}]}
     result = await governor._capture_plan(spec)
     assert governor._pending_plan is spec
     assert result["content"][0]["type"] == "text"
@@ -533,214 +513,375 @@ async def test_rebuild_keeps_plan_tool(monkeypatch):
     assert governor._pending_plan == {"task_summary": "keep"}
 
 
-# ── resident_plan：采纳闭环（采用方案 -> seed 灌队列）──
+# ── resident_plan：采纳闭环（采用方案 -> 直接走完整交付流程）──
 def _plan_spec():
-    """带 2 子任务 + deps 的待采纳方案（propose_plan 截获格式）。"""
+    """带 1 模块 2 子任务的待采纳方案（propose_plan 截获格式）。"""
     return {
         "task_summary": "交付用户模块",
-        "subtasks": [
+        "modules": [
             {
-                "id": "t1",
-                "domain": "backend",
                 "module_id": "user",
-                "summary": "建用户表",
-                "acceptance": ["迁移可跑"],
-                "deps": [],
-            },
-            {
-                "id": "t2",
-                "domain": "backend",
-                "module_id": "user",
-                "summary": "用户 API",
-                "acceptance": ["测试通过"],
-                "deps": ["t1"],
+                "summary": "用户模块",
+                "acceptance": ["迁移可跑", "测试通过"],
+                "subtasks": [
+                    {"id": "t1", "summary": "建用户表", "acceptance": ["迁移可跑"]},
+                    {"id": "t2", "summary": "用户 API", "acceptance": ["测试通过"]},
+                ],
             },
         ],
     }
 
 
-def _make_governor_with_queue():
-    """Governor + MagicMock task_queue（seed 返回 tasks 数）。"""
-    mq = MagicMock()
-    mq.seed = MagicMock(side_effect=lambda tasks: len(tasks))
-    governor = Governor(
-        project_dir=".", session_store=MagicMock(spec=SessionStore), task_queue=mq
-    )
-    return governor, mq
-
-
-async def test_adopt_plan_seeds_and_clears():
-    """采用方案 + 待采纳方案 -> seed 灌队列（id/deps 映射）-> 反馈 req_id+数量 -> 清空防重复"""
-    governor, mq = _make_governor_with_queue()
+async def test_adopt_plan_runs_delivery_and_clears(monkeypatch):
+    """采用方案 + 待采纳方案 -> _run_delivery 被调(完整交付流程) -> 走完清空防重复"""
+    governor = make_governor()
     governor._pending_plan = _plan_spec()
+    delivered = []
+
+    async def fake_delivery(self, spec):
+        delivered.append(spec)
+        yield text_event("delivery-done")
+
+    monkeypatch.setattr(Governor, "_run_delivery", fake_delivery)
     events = await collect(governor.handle_user_input("采用方案"))
-    # seed 一次，2 任务，id 带 req_id 前缀，deps 映射到前缀 id
-    assert mq.seed.call_count == 1
-    tasks = mq.seed.call_args.args[0]
-    assert len(tasks) == 2
-    req_id = tasks[0]["req_id"]
-    assert tasks[0]["id"] == f"{req_id}-t1"
-    assert tasks[1]["deps"] == [f"{req_id}-t1"]
-    assert tasks[0]["module_id"] == "user"
-    # 反馈事件含 req_id + 数量
-    text = "\n".join(e.data.get("text", "") for e in events)
-    assert req_id in text
-    assert "已灌入 2 个任务" in text
-    # 方案清空，防重复灌入
+    assert len(delivered) == 1
+    assert delivered[0] is governor._pending_plan or delivered[0]["task_summary"] == "交付用户模块"
+    assert _text_events_containing(events, "delivery-done")
+    # 走完清空,防重复交付
     assert governor._pending_plan is None
-    # 再次采纳 -> 无待采纳提示，不再 seed
+    # 再次采纳 -> 无待采纳提示,不再交付
     events2 = await collect(governor.handle_user_input("采用方案"))
-    assert mq.seed.call_count == 1
+    assert len(delivered) == 1
     assert "无待采纳方案" in events2[0].data["text"]
 
 
-async def test_adopt_plan_no_pending():
-    """无待采纳方案 -> 明确提示，不 seed"""
-    governor, mq = _make_governor_with_queue()
+async def test_adopt_plan_no_pending(monkeypatch):
+    """无待采纳方案 -> 明确提示,不走交付"""
+    governor = make_governor()
+
+    async def fake_delivery(self, spec):
+        yield text_event("should-not-happen")
+
+    monkeypatch.setattr(Governor, "_run_delivery", fake_delivery)
     events = await collect(governor.handle_user_input("采用方案"))
-    assert mq.seed.call_count == 0
     assert "无待采纳方案" in events[0].data["text"]
+    assert not _text_events_containing(events, "should-not-happen")
 
 
-async def test_adopt_plan_no_task_queue():
-    """task_queue=None -> 降级提示不崩溃，方案保留可重试"""
-    governor = make_governor()  # 无 env -> _task_queue None
-    governor._pending_plan = _plan_spec()
+async def test_adopt_plan_empty_modules(monkeypatch):
+    """方案无模块 -> 提示不交付,方案保留"""
+    governor = make_governor()
+    governor._pending_plan = {"task_summary": "x", "modules": []}
+
+    async def fake_delivery(self, spec):
+        yield text_event("should-not-happen")
+
+    monkeypatch.setattr(Governor, "_run_delivery", fake_delivery)
     events = await collect(governor.handle_user_input("采用方案"))
-    assert "未配置任务队列" in events[0].data["text"]
+    assert "未拆出模块" in events[0].data["text"]
+    assert not _text_events_containing(events, "should-not-happen")
     assert governor._pending_plan is not None
 
 
-async def test_adopt_plan_empty_subtasks():
-    """方案无子任务 -> 提示不 seed，方案保留"""
-    governor, mq = _make_governor_with_queue()
-    governor._pending_plan = {"task_summary": "x", "subtasks": []}
-    events = await collect(governor.handle_user_input("采用方案"))
-    assert mq.seed.call_count == 0
-    assert "未拆出子任务" in events[0].data["text"]
-    assert governor._pending_plan is not None
+# ── _spec_to_modules:规范化(merge 重复 module_id + deps 去未知/自引用)──
+def test_spec_to_modules_normalizes_and_merges():
+    governor = make_governor()
+    spec = {
+        "modules": [
+            {"module_id": "user-auth", "summary": "s1", "acceptance": ["a1"],
+             "subtasks": [{"id": "t1", "summary": "x", "acceptance": []}],
+             "deps": ["ghost", "user-auth"]},
+            {"module_id": "user_auth", "summary": "s2", "acceptance": ["a2"],
+             "subtasks": [{"id": "t2", "summary": "y", "acceptance": []}]},
+            {"module_id": "order", "summary": "s3", "acceptance": [],
+             "subtasks": [], "deps": ["user_auth"]},
+        ]
+    }
+    req_id, modules = governor._spec_to_modules(spec)
+    assert req_id
+    assert [m["module_id"] for m in modules] == ["user_auth", "order"]
+    ua = modules[0]
+    # 重复 module_id 合并:子任务拼接,验收并集
+    assert [st["id"] for st in ua["subtasks"]] == ["t1", "t2"]
+    assert ua["acceptance"] == ["a1", "a2"]
+    # 未知/自引用 dep 被丢
+    assert ua["deps"] == []
+    assert modules[1]["deps"] == ["user_auth"]
 
 
-# ── resident_plan：采纳灌队列端到端（真实 sqlite TASK_DB）──
-# 最小 store stub（契约同 task-service/store.py，仅 init_db+seed；
-# adapter.list_by_req 直查 sqlite 不经 store，无需 stub）。
-# 隔离 sys.path/sys.modules 污染（同 test_task_queue_adapter 套路）。
-_MINI_STORE = '''\
-import json
-import sqlite3
+# ── validate_modules:拆分机械校验告警 ──
+def _vm_module(mid, files, sub_ids=("t1",)):
+    return {
+        "module_id": mid,
+        "summary": "s",
+        "acceptance": [],
+        "subtasks": [
+            {"id": sid, "summary": "x", "acceptance": [], "intended_files": files}
+            for sid in sub_ids
+        ],
+    }
 
 
-def init_db(db_path):
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS tasks (
-                id TEXT PRIMARY KEY,
-                req_id TEXT,
-                domain TEXT,
-                module_id TEXT,
-                prompt TEXT,
-                intended_files TEXT,
-                deps TEXT,
-                status TEXT DEFAULT 'pending',
-                claimed_at TEXT,
-                done_at TEXT
-            )"""
-        )
-        conn.commit()
-    finally:
-        conn.close()
+def test_validate_modules_in_bounds_silent():
+    files = [f"f{i}.py" for i in range(8)]
+    assert validate_modules([_vm_module("m", files)]) == []
 
 
-def seed(tasks, db_path=None):
-    init_db(db_path)
-    conn = sqlite3.connect(db_path)
-    inserted = 0
-    try:
-        for t in tasks:
-            cur = conn.execute(
-                """INSERT OR IGNORE INTO tasks
-                   (id, req_id, domain, module_id, prompt, intended_files, deps, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')""",
-                (
-                    t["id"],
-                    t["req_id"],
-                    t.get("domain", ""),
-                    t.get("module_id"),
-                    t.get("prompt", ""),
-                    json.dumps(t.get("intended_files") or []),
-                    json.dumps(t.get("deps") or []),
-                ),
-            )
-            inserted += cur.rowcount
-        conn.commit()
-    finally:
-        conn.close()
-    return inserted
-'''
+def test_validate_modules_too_small_warns():
+    warns = validate_modules([_vm_module("m", ["a.py", "b.py"])])
+    assert len(warns) == 1 and "过碎" in warns[0]
+
+
+def test_validate_modules_too_large_warns():
+    files = [f"f{i}.py" for i in range(20)]
+    warns = validate_modules([_vm_module("m", files)])
+    assert len(warns) == 1 and "过大" in warns[0]
+
+
+def test_validate_modules_empty_files_warns_serial():
+    warns = validate_modules([_vm_module("m", [])])
+    assert len(warns) == 1 and "强制串行" in warns[0]
+
+
+def test_validate_modules_dup_subtask_id_warns():
+    files = [f"f{i}.py" for i in range(6)]
+    warns = validate_modules([_vm_module("m", files, sub_ids=("t1", "t1"))])
+    assert any("重复" in w for w in warns)
+
+
+# ── _run_module_slot:摘要文件续跑 + commit/验证门 ──
+
+
+class _FakeProc:
+    async def wait(self):
+        return 0
+
+
+def _slot_module(mid="m", sub_ids=("t1", "t2")):
+    return {
+        "module_id": mid,
+        "summary": "s",
+        "acceptance": [],
+        "subtasks": [
+            {"id": sid, "summary": "x", "acceptance": [], "intended_files": [f"{sid}.py"]}
+            for sid in sub_ids
+        ],
+    }
+
+
+def _write_summary(wt: str, mid: str, done: list[str]):
+    d = Path(wt) / ".autoloop"
+    d.mkdir(parents=True, exist_ok=True)
+    lines = [f"- [x] {t}: done" for t in done]
+    (d / f"summary-{mid}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+async def test_module_slot_resume_across_attempts(monkeypatch, tmp_path):
+    """第 1 次 spawn 只完成 t1,第 2 次补完 t2 -> True,spawn 2 次,commit+验证各 1 次,摘要被删"""
+    governor = make_governor()
+    calls = {"spawn": 0, "commit": 0}
+
+    async def fake_spawn(args, cwd, log_path):
+        calls["spawn"] += 1
+        done = ["t1"] if calls["spawn"] == 1 else ["t1", "t2"]
+        _write_summary(cwd, "m", done)
+        return _FakeProc()
+
+    monkeypatch.setattr(architect, "spawn_executor", fake_spawn)
+    monkeypatch.setattr(
+        architect, "commit_worktree",
+        lambda wt, msg: calls.__setitem__("commit", calls["commit"] + 1) or True,
+    )
+    governor._run_validation = AsyncMock(return_value=(True, ""))
+
+    ok = await governor._run_module_slot(
+        _slot_module(), "r1", {"task_summary": "x"}, str(tmp_path), tmp_path, asyncio.Queue()
+    )
+    assert ok is True
+    assert calls["spawn"] == 2
+    assert calls["commit"] == 1
+    governor._run_validation.assert_called_once()
+    # 摘要不进主分支:commit 前已删
+    assert not (tmp_path / ".autoloop" / "summary-m.md").exists()
+
+
+async def test_module_slot_three_attempts_incomplete_returns_false(monkeypatch, tmp_path):
+    """3 次 spawn 都未完成 -> False,不 commit 不验证"""
+    governor = make_governor()
+    calls = {"spawn": 0}
+
+    async def fake_spawn(args, cwd, log_path):
+        calls["spawn"] += 1
+        return _FakeProc()
+
+    monkeypatch.setattr(architect, "spawn_executor", fake_spawn)
+    commit_mock = MagicMock()
+    monkeypatch.setattr(architect, "commit_worktree", commit_mock)
+    governor._run_validation = AsyncMock(return_value=(True, ""))
+
+    ok = await governor._run_module_slot(
+        _slot_module(), "r1", {"task_summary": "x"}, str(tmp_path), tmp_path, asyncio.Queue()
+    )
+    assert ok is False
+    assert calls["spawn"] == 3
+    commit_mock.assert_not_called()
+    governor._run_validation.assert_not_called()
+
+
+async def test_module_slot_validation_failure_returns_false(monkeypatch, tmp_path):
+    """摘要全完成但验证失败 -> False,worktree 保留"""
+    governor = make_governor()
+
+    async def fake_spawn(args, cwd, log_path):
+        _write_summary(cwd, "m", ["t1", "t2"])
+        return _FakeProc()
+
+    monkeypatch.setattr(architect, "spawn_executor", fake_spawn)
+    monkeypatch.setattr(architect, "commit_worktree", lambda wt, msg: True)
+    governor._run_validation = AsyncMock(return_value=(False, "pytest failed"))
+
+    ok = await governor._run_module_slot(
+        _slot_module(), "r1", {"task_summary": "x"}, str(tmp_path), tmp_path, asyncio.Queue()
+    )
+    assert ok is False
+
+
+async def test_module_slot_skip_respawn_when_already_done(monkeypatch, tmp_path):
+    """摘要已全 [x](崩溃后残留) -> 不再 spawn,直接 commit+验证"""
+    governor = make_governor()
+    _write_summary(str(tmp_path), "m", ["t1", "t2"])
+    spawn_mock = AsyncMock()
+    monkeypatch.setattr(architect, "spawn_executor", spawn_mock)
+    monkeypatch.setattr(architect, "commit_worktree", lambda wt, msg: True)
+    governor._run_validation = AsyncMock(return_value=(True, ""))
+
+    ok = await governor._run_module_slot(
+        _slot_module(), "r1", {"task_summary": "x"}, str(tmp_path), tmp_path, asyncio.Queue()
+    )
+    assert ok is True
+    spawn_mock.assert_not_called()
+
+
+# ── _run_executors 编排:分层/并行门/失败传播/merge 冲突中止 ──
+
+
+def _orch_module(mid, files, deps=None):
+    m = {
+        "module_id": mid,
+        "summary": "s",
+        "acceptance": [],
+        "subtasks": [
+            {"id": "t1", "summary": "x", "acceptance": [], "intended_files": files}
+        ],
+    }
+    if deps:
+        m["deps"] = deps
+    return m
 
 
 @pytest.fixture
-def mini_store_dir(tmp_path):
-    """写最小 store.py 到 tmp_path；teardown 清 sys.modules/sys.path 污染。"""
-    import sys
-    from pathlib import Path
+def orch_env(monkeypatch, tmp_path):
+    """_run_executors 编排测试环境:假 claude on PATH + 假 worktree 函数 + 关 DRY-RUN。"""
+    monkeypatch.setattr(architect.shutil, "which", lambda c: "claude")
+    monkeypatch.delenv("AUTOLOOP_DELIVERY_DRY_RUN", raising=False)
+    calls = {"create": [], "merge": [], "remove": []}
 
-    (tmp_path / "store.py").write_text(_MINI_STORE, encoding="utf-8")
-    svc_dir = str(tmp_path)
-    yield svc_dir
-    sys.modules.pop("store", None)
-    resolved = str(Path(svc_dir).resolve())
-    for p in (svc_dir, resolved):
-        while p in sys.path:
-            sys.path.remove(p)
+    def fake_create(repo, req_id, mid=None):
+        calls["create"].append(mid)
+        return str(tmp_path / f"wt-{mid}")
 
+    def fake_merge(repo, req_id, mid=None):
+        calls["merge"].append(mid)
+        return (True, "")
 
-def _make_governor_real_db(svc_dir, db_path):
-    """Governor + 真实 TaskQueueAdapter（tmp sqlite TASK_DB）。"""
-    adapter = TaskQueueAdapter(svc_dir, db_path)
-    return Governor(
-        project_dir=".",
-        session_store=MagicMock(spec=SessionStore),
-        task_queue=adapter,
-    ), adapter
+    def fake_remove(repo, req_id, mid=None):
+        calls["remove"].append(mid)
+
+    monkeypatch.setattr(architect, "create_delivery_worktree", fake_create)
+    monkeypatch.setattr(architect, "merge_worktree_branch", fake_merge)
+    monkeypatch.setattr(architect, "remove_worktree", fake_remove)
+    return calls
 
 
-async def test_capture_then_adopt_real_sqlite(mini_store_dir, tmp_path):
-    """工具调用截获待采纳方案 -> 采用方案 -> sqlite 可 list_by_req 查到，字段/deps 映射正确"""
-    import re
+async def test_executors_parallel_layer_both_merge(orch_env, monkeypatch):
+    """文件隔离两模块同层并行:都跑都 merge(声明序),都 remove"""
+    governor = make_governor()
 
-    db_path = str(tmp_path / "task.db")
-    governor, adapter = _make_governor_real_db(mini_store_dir, db_path)
-    # 模拟方案工具调用 -> Governor 暂存待采纳方案
-    await governor._capture_plan(_plan_spec())
-    assert governor._pending_plan is not None
-    assert governor._pending_plan["task_summary"] == "交付用户模块"
-    # 采纳确认
-    events = await collect(governor.handle_user_input("采用方案"))
-    text = "\n".join(e.data.get("text", "") for e in events)
-    m = re.search(r"req_id=([0-9a-f]{8})", text)
-    assert m, f"反馈事件缺 req_id: {text}"
-    req_id = m.group(1)
-    # sqlite 直查：2 任务，字段/deps 映射正确
-    rows = adapter.list_by_req(req_id)
-    assert len(rows) == 2
-    assert [r["id"] for r in rows] == [f"{req_id}-t1", f"{req_id}-t2"]
-    assert all(r["domain"] == "backend" for r in rows)
-    assert all(r["module_id"] == "user" for r in rows)
-    assert all(r["status"] == "pending" for r in rows)
-    assert json.loads(rows[0]["deps"]) == []
-    assert json.loads(rows[1]["deps"]) == [f"{req_id}-t1"]
-    # 方案已清空
-    assert governor._pending_plan is None
+    async def fake_slot(self, module, req_id, spec, wt, logs_dir, evq):
+        return True
+
+    monkeypatch.setattr(Governor, "_run_module_slot", fake_slot)
+    modules = [_orch_module("a", ["a1.py"]), _orch_module("b", ["b1.py"])]
+    events = await collect(governor._run_executors(modules, "r1", {"task_summary": "x"}))
+    assert sorted(orch_env["create"]) == ["a", "b"]
+    assert orch_env["merge"] == ["a", "b"]  # 声明序
+    assert sorted(orch_env["remove"]) == ["a", "b"]
+    assert _text_events_containing(events, "已 merge 2/2")
 
 
-async def test_adopt_no_pending_no_db_write(mini_store_dir, tmp_path):
-    """无待采纳方案 -> 提示且不写库（DB 文件不创建）"""
-    from pathlib import Path
+async def test_executors_failed_pred_skips_dependent(orch_env, monkeypatch):
+    """a 失败 -> 依赖 a 的 b 跳过;独立的 c 照常 merge(部分交付)"""
+    governor = make_governor()
 
-    db_path = str(tmp_path / "task.db")
-    governor, adapter = _make_governor_real_db(mini_store_dir, db_path)
-    events = await collect(governor.handle_user_input("采用方案"))
-    assert "无待采纳方案" in events[0].data["text"]
-    assert not Path(db_path).exists()
+    async def fake_slot(self, module, req_id, spec, wt, logs_dir, evq):
+        return module["module_id"] != "a"  # a 失败
+
+    monkeypatch.setattr(Governor, "_run_module_slot", fake_slot)
+    modules = [
+        _orch_module("a", ["a1.py"]),
+        _orch_module("b", ["b1.py"], deps=["a"]),
+        _orch_module("c", ["c1.py"]),
+    ]
+    events = await collect(governor._run_executors(modules, "r1", {"task_summary": "x"}))
+    assert orch_env["merge"] == ["c"]
+    assert _text_events_containing(events, "跳过")
+    assert _text_events_containing(events, "已 merge 1/3")
+
+
+async def test_executors_merge_conflict_aborts(orch_env, monkeypatch):
+    """同层 a merge 冲突 -> 整轮中止,b 不 merge,worktree 保留"""
+    governor = make_governor()
+
+    async def fake_slot(self, module, req_id, spec, wt, logs_dir, evq):
+        return True
+
+    monkeypatch.setattr(Governor, "_run_module_slot", fake_slot)
+
+    def conflict_merge(repo, req_id, mid=None):
+        orch_env["merge"].append(mid)
+        return (False, "CONFLICT") if mid == "a" else (True, "")
+
+    monkeypatch.setattr(architect, "merge_worktree_branch", conflict_merge)
+    modules = [_orch_module("a", ["a1.py"]), _orch_module("b", ["b1.py"])]
+    events = await collect(governor._run_executors(modules, "r1", {"task_summary": "x"}))
+    assert orch_env["merge"] == ["a"]  # b 未 merge
+    assert orch_env["remove"] == []  # 现场保留
+    assert _text_events_containing(events, "merge 冲突")
+    assert _text_events_containing(events, "已 merge 0/2")
+
+
+async def test_executors_overlap_forces_serial_layers(orch_env, monkeypatch):
+    """文件重叠两模块强制串行:b 的 worktree 在 a merge 后建"""
+    governor = make_governor()
+    timeline: list[str] = []
+
+    async def fake_slot(self, module, req_id, spec, wt, logs_dir, evq):
+        timeline.append(f"slot:{module['module_id']}")
+        return True
+
+    monkeypatch.setattr(Governor, "_run_module_slot", fake_slot)
+
+    def tracked_create(repo, req_id, mid=None):
+        timeline.append(f"create:{mid}")
+        return "wt"
+
+    def tracked_merge(repo, req_id, mid=None):
+        timeline.append(f"merge:{mid}")
+        return (True, "")
+
+    monkeypatch.setattr(architect, "create_delivery_worktree", tracked_create)
+    monkeypatch.setattr(architect, "merge_worktree_branch", tracked_merge)
+    modules = [_orch_module("a", ["same.py"]), _orch_module("b", ["same.py"])]
+    events = await collect(governor._run_executors(modules, "r1", {"task_summary": "x"}))
+    assert timeline == ["create:a", "slot:a", "merge:a", "create:b", "slot:b", "merge:b"]
+    assert _text_events_containing(events, "执行分层")

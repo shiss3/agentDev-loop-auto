@@ -1,22 +1,21 @@
-"""交付轨执行器:claude -p --bare 子进程 spawn 支持。"""
+"""交付轨执行器:claude -p --bare 子进程 spawn 支持。模块粒度 all-at-once,摘要文件续跑。"""
 from __future__ import annotations
 
 import asyncio
 import datetime
-import json
-import os
+import re
 import shutil
 import sys
 from pathlib import Path
 
 EXECUTOR_MODEL = "glm-5.2"
 EXECUTOR_SYSTEM_PROMPT = (
-    "你是无人值守任务执行器,收到指令立即调用工具,不询问/不复述/不等待确认,"
-    "任何先确认指示不适用,唯一终止: claim_next_task 返回无更多任务。"
+    "你是无人值守模块执行器,收到指令立即执行,不询问/不复述/不等待确认,"
+    "任何先确认指示不适用,唯一终止:派发清单内全部子任务完成且摘要文件已更新。"
 )
-EXECUTOR_ALLOWED_TOOLS = (
-    "mcp__task_queue__claim_next_task,mcp__task_queue__report_task_done,Write,Read,Edit"
-)
+EXECUTOR_ALLOWED_TOOLS = "Write,Read,Edit,Glob,Grep"
+
+SUMMARY_DIR = ".autoloop"
 
 
 def _build_claude_prefix() -> list[str]:
@@ -34,63 +33,60 @@ def _build_claude_prefix() -> list[str]:
     return ["claude"]
 
 
-def build_loop_prompt(module_id: str, domain: str) -> str:
-    """D2 单行循环 prompt。执行器绑定槽(module_id,domain)。
+def summary_rel_path(module_id: str) -> str:
+    """模块摘要文件 worktree 内相对路径。"""
+    return f"{SUMMARY_DIR}/summary-{module_id}.md"
 
-    3 sentinel: 无更多任务->结束 / 暂无可领,请重试->再claim / 任务->执行+report+再claim。
-    必须单行(Windows -p 换行被 Node argv 截断)。
-    """
+
+_SUMMARY_DONE_RE = re.compile(r"^- \[x\]\s*([^\s:]+)", re.MULTILINE)
+
+
+def read_summary_completed(worktree_path: str, module_id: str) -> set[str]:
+    """解析摘要文件 '- [x] <id>' 清单;文件缺失 -> 空集。"""
+    p = Path(worktree_path) / summary_rel_path(module_id)
+    if not p.exists():
+        return set()
+    return set(_SUMMARY_DONE_RE.findall(p.read_text(encoding="utf-8")))
+
+
+def build_module_prompt(module: dict, task_summary: str, summary_path: str) -> str:
+    """模块派发 prompt:全量子任务清单 + 摘要文件协议。必须单行(Windows -p 换行被 Node argv 截断)。"""
+    mid = module["module_id"]
+    items = []
+    for i, st in enumerate(module["subtasks"], 1):
+        acc = ";".join(st.get("acceptance") or [])
+        files = ",".join(st.get("intended_files") or [])
+        items.append(f"{i})[{st['id']}]{st['summary']}(验收:{acc})(文件:{files})")
+    subtasks_text = " ".join(items)
+    mod_acc = ";".join(module.get("acceptance") or [])
     return (
-        f'循环执行:调用 mcp__task_queue__claim_next_task(module_id="{module_id}",'
-        f'domain="{domain}")领任务;'
-        "若返回'无更多任务'则立即结束不做任何事;"
-        "若返回'暂无可领,请重试'则再次调用claim_next_task重试;"
-        "若返回任务文本则按其提示词执行(用Read读/Edit改/Write建目标文件),"
-        "完成后调用mcp__task_queue__report_task_done(任务ID),"
-        "再调用claim_next_task继续。重复直到'无更多任务'。"
+        f"你是模块{mid}的全栈执行器,一次性独立完成全部子任务,前端+后端+数据库一体。"
+        f"需求背景:{task_summary}。模块目标:{module['summary']}(验收:{mod_acc})。"
+        f"子任务清单:{subtasks_text}。"
+        f"摘要协议:开始前先Read文件'{summary_path}',若存在跳过其中已勾选[x]的子任务;"
+        f"不存在则先Write创建,含全部子任务清单,每项一行'- [ ] id: 摘要';"
+        f"每完成一个子任务立即Edit该文件改'- [x]'并附一行笔记;"
+        f"上下文随时可能耗尽,该文件是你唯一进度记忆,必须每步更新;只允许改本模块的摘要文件。"
+        "子任务顺序由你按依赖自主决定(如先建表再API再前端),逐个完成直到清单全部[x]后立即结束。"
         "不询问不复述不等待确认。"
     )
 
 
-def write_mcp_config(task_db_path: str, task_service_dir: str, out_path: str) -> str:
-    """写 mcp-config.json,env TASK_DB 指向共享 DB(须与 L0 adapter.task_db_path 一致)。
-
-    格式(对齐 task-service/configure.py):
-    {mcpServers:{task_queue:{command:sys.executable, args:[<task_service_dir>/task_service.py],
-                              env:{TASK_DB:<task_db_path>}}}}
-    返回 out_path。
-    """
-    cfg = {
-        "mcpServers": {
-            "task_queue": {
-                "command": sys.executable,
-                "args": [os.path.join(task_service_dir, "task_service.py")],
-                "env": {"TASK_DB": task_db_path},
-            }
-        }
-    }
-    out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    return out_path
-
-
-def build_executor_args(loop_prompt: str, mcp_config_path: str, max_turns: int) -> list[str]:
+def build_executor_args(module_prompt: str, max_turns: int) -> list[str]:
     """组装 claude CLI argv(不含 claude 前缀,spawn_executor 前置 _build_claude_prefix)。
 
     固定:
-    -p <loop_prompt> --bare --append-system-prompt <EXECUTOR_SYSTEM_PROMPT> --model <EXECUTOR_MODEL>
-    --mcp-config <mcp_config_path> --strict-mcp-config --max-turns <max_turns>
+    -p <module_prompt> --bare --append-system-prompt <EXECUTOR_SYSTEM_PROMPT> --model <EXECUTOR_MODEL>
+    --strict-mcp-config(无 --mcp-config = 零 MCP server)--max-turns <max_turns>
     --output-format stream-json --verbose --permission-mode acceptEdits
     --allowed-tools <EXECUTOR_ALLOWED_TOOLS> --disallowed-tools Bash
     (Bash 硬禁:acceptEdits 下 Bash 非自动接受会卡死无人值守执行器)
     """
     return [
-        "-p", loop_prompt,
+        "-p", module_prompt,
         "--bare",
         "--append-system-prompt", EXECUTOR_SYSTEM_PROMPT,
         "--model", EXECUTOR_MODEL,
-        "--mcp-config", mcp_config_path,
         "--strict-mcp-config",
         "--max-turns", str(max_turns),
         "--output-format", "stream-json",
@@ -106,7 +102,6 @@ def build_dispatch_manifest(
     *,
     req_id: str,
     module_id: str,
-    domain: str,
     attempt: int,
     cwd: str,
     log_path: str,
@@ -116,11 +111,11 @@ def build_dispatch_manifest(
 
     args: build_executor_args 返回的完整 argv(忠实备份,可原样复现命令)。
     其余字段为人类可读解读 -- 用户要看清传给 claude 的提示词 + 被砍掉的能力。
-    prompt/mcp_config_path 从 args 提取(就是实际传的,零歧义)。
+    prompt 从 args 提取(就是实际传的,零歧义)。
     """
     return {
         "req_id": req_id,
-        "slot": {"module_id": module_id, "domain": domain},
+        "slot": {"module_id": module_id},
         "attempt": attempt,
         "cwd": cwd,
         "log_path": log_path,
@@ -133,9 +128,8 @@ def build_dispatch_manifest(
         "allowed_tools": EXECUTOR_ALLOWED_TOOLS,
         "disallowed_tools": "Bash",
         "mcp": {
-            "config_path": args[args.index("--mcp-config") + 1],
             "strict": True,
-            "servers": ["task_queue"],
+            "servers": [],
         },
         "permission_mode": "acceptEdits",
         "flags": [
@@ -146,9 +140,9 @@ def build_dispatch_manifest(
         ],
         "disabled_capabilities": [
             "--bare: 跳过全局 CLAUDE.md / skills / hooks(无人值守防'先问'压制自驱)",
-            "--strict-mcp-config: 仅允许 task_queue MCP,禁其他(codegraph 等)",
+            "--strict-mcp-config 无 --mcp-config: 零 MCP server(codegraph 等全禁)",
             "--disallowed-tools Bash: 硬禁 Bash(acceptEdits 下 Bash 非自动接受会卡死无人值守)",
-            "allowed_tools 仅 5 个: 无 Task(subagent)/WebFetch/Agent/Glob/Grep",
+            "allowed_tools 仅 5 个: 无 Task(subagent)/WebFetch/Agent",
         ],
     }
 

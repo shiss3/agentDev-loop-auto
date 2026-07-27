@@ -1,8 +1,4 @@
-"""module_id 归一化 - L0 灌队列前防同模块任务散多进程致 affinity 失效。
-
-LLM 产的 module_id slug 可能脏（UserAuth/user-auth/userauth），致同模块亲和键不一致。
-灌队列前经 normalize_module_id 统一。
-"""
+"""module_id 归一化 - 防 LLM 产的脏 slug(UserAuth/user-auth/userauth)散成多模块。"""
 
 from __future__ import annotations
 
@@ -28,8 +24,3 @@ def normalize_module_id(slug: str | None) -> str:
     sanitized = sanitize_module_id(slug)
     mapped = SYNONYMS.get(sanitized, sanitized)
     return sanitize_module_id(mapped)
-
-
-def affinity_key(module_id: str, domain: str) -> str:
-    """亲和键：normalize_module_id(module_id)/domain。"""
-    return f"{normalize_module_id(module_id)}/{domain}"

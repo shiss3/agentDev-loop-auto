@@ -76,7 +76,7 @@ async def test_non_ask_tool_direct_allow():
 async def test_non_ask_tool_direct_allow_write_edit():
     """写工具（Write/Edit）同样直接 allow（交互轨权限放开，不问用户）。"""
     cli = make_cli()
-    for tool_name in ("Write", "Edit", "mcp__task_queue__report_task_done"):
+    for tool_name in ("Write", "Edit", "Glob"):
         result = await cli._can_use_tool(tool_name, {}, None)
         assert isinstance(result, PermissionResultAllow)
 
