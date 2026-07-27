@@ -81,6 +81,47 @@ def test_create_worktree_replaces_existing(git_repo):
     assert Path(wt2).exists()
 
 
+# ── 双模块 worktree 共存 ──────────────────────────────
+
+
+def test_two_module_worktrees_coexist(git_repo):
+    """同 req_id 两模块:路径/分支互不相同,可同时存在,顺序 merge 互不干扰。"""
+    root = git_repo
+    wt_a = create_delivery_worktree(root, "r9", "mod_a")
+    wt_b = create_delivery_worktree(root, "r9", "mod_b")
+    assert wt_a != wt_b
+    assert Path(wt_a).exists() and Path(wt_b).exists()
+
+    (Path(wt_a) / "a.py").write_text("a = 1\n", encoding="utf-8")
+    commit_worktree(wt_a, "mod_a")
+    (Path(wt_b) / "b.py").write_text("b = 1\n", encoding="utf-8")
+    commit_worktree(wt_b, "mod_b")
+
+    ok, _ = merge_worktree_branch(root, "r9", "mod_a")
+    assert ok is True
+    ok, _ = merge_worktree_branch(root, "r9", "mod_b")
+    assert ok is True
+    assert (Path(root) / "a.py").exists()
+    assert (Path(root) / "b.py").exists()
+
+    remove_worktree(root, "r9", "mod_a")
+    remove_worktree(root, "r9", "mod_b")
+    assert not Path(wt_a).exists()
+    assert not Path(wt_b).exists()
+
+
+def test_module_worktree_ref_shape(git_repo):
+    """模块 worktree 路径 deliver-<req>-<mod>,分支 deliver/<req>/<mod>。"""
+    from autoloop_agent.core.worktree import _delivery_ref
+
+    path, branch = _delivery_ref(git_repo, "r9", "mod_a")
+    assert path.endswith("deliver-r9-mod_a")
+    assert branch == "deliver/r9/mod_a"
+    path, branch = _delivery_ref(git_repo, "r9")
+    assert path.endswith("deliver-r9")
+    assert branch == "deliver/r9"
+
+
 # ── merge 冲突 ───────────────────────────────────────
 
 
