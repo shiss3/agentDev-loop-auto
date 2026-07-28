@@ -141,6 +141,17 @@ TASK_SPEC_SCHEMA = {
         "cross_domain",
     ],
 }
+# 模块拆分规则(共享常量) —— propose_plan description 注入,供交互轨常驻执行体对齐;
+# 与 REQUIREMENT_PARSER_PROMPT modules 节规则同源,改动须两处同步。
+MODULE_SPLIT_RULES = (
+    "模块拆分规则:先探索代码再拆(禁盲拆);按【业务功能域】垂直聚合"
+    "(数据表+接口+前端同模块,一个执行器端到端完成,模块内依赖执行器内部消化);"
+    "粒度硬约束:每模块全部子任务 intended_files 并集 5~15 个源码文件,"
+    "<5 向上归并,>15 按子能力再拆(两半文件无交集即可拆,逻辑硬依赖填 deps 串行,勿为躲依赖合一);"
+    "依赖三类处理:文件重叠必须合一(调度层对重叠强制串行,拆开只有 merge 开销);"
+    "逻辑硬依赖但文件不重叠拆成独立模块并显式填 deps(必填,漏填=并行起跑看不到上游产物直接失败);"
+    "软偏好拆且不填 deps;intended_files 探索后填,禁空(空=无法判定隔离=被强制串行)。"
+)
 REQUIREMENT_PARSER_PROMPT = """\
 # 角色：L0 需求解析员
 你只做一件事：把用户需求转化为结构化、可验证的标准任务单。你不执行需求，不指导实现细节。
@@ -366,6 +377,7 @@ class Governor:
             description=(
                 "生成实施方案（参数=任务单各字段，与标准化任务单 schema 一致）。"
                 "产出实施计划时调用此工具；方案被记录为待采纳，用户回复\"采用方案\"后进入交付流程。"
+                + MODULE_SPLIT_RULES
             ),
             input_schema=TASK_SPEC_SCHEMA,
         )(self._capture_plan)
