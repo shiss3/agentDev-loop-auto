@@ -7,12 +7,12 @@ from autoloop_agent.core.utils import _build_message
 
 
 def test_build_message():
-    """_build_message('hi') → ChatEvent, type=TEXT, data={'text':'hi'}, agent='default'"""
+    """_build_message('hi') → ChatEvent, type=TEXT, data={'text':'hi'}, agent='governor'"""
     ev = _build_message("hi")
     assert isinstance(ev, ChatEvent)
     assert ev.type == EventType.TEXT
     assert ev.data == {"text": "hi"}
-    assert ev.agent == "default"
+    assert ev.agent == "governor"
 
 
 def test_build_message_agent():

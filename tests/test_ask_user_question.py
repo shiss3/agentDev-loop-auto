@@ -250,6 +250,7 @@ async def test_esc_cancels_message_and_future_not_dangling():
 async def test_routing_restored_after_esc():
     """ESC 取消后后续输入路由恢复正常（不再喂 Future，走普通消息路径）。"""
     cli = make_cli()
+    cli.mode = "semi"  # auto 模式普通输入进交付队列(双轨),本测试走交互轨路径
     cli._handle_message = AsyncMock()  # 防真发 SDK
     task = asyncio.create_task(
         cli._can_use_tool("AskUserQuestion", make_question_input(), None)

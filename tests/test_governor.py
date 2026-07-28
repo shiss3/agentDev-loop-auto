@@ -914,3 +914,82 @@ async def test_executors_writes_module_graph_json(orch_env, monkeypatch, tmp_pat
     assert by_id["b"]["deps"] == ["a"]
     assert by_id["a"]["file_set"] == ["a1.py"]
     assert by_id["a"]["subtasks"][0]["id"] == "t1"
+
+
+# ── 双轨队列公开入口(parse_flow/deliver_flow/adopt_flow/is_adoption_input) ──
+async def test_parse_flow_sets_track_and_yields_markers():
+    """parse_flow: 🔍 开始 + 🔀 调度;last_spec/last_track 落属性供 DeliveryRunner 消费"""
+    governor = make_governor()
+    governor._parse_requirement = AsyncMock(
+        return_value={
+            "task_summary": "重构支付",
+            "acceptance_criteria": [],
+            "risk_level": "high",
+            "suggest_track": "delivery",
+            "change_type": "feature",
+            "file_count_bucket": "6+",
+            "cross_domain": True,
+        }
+    )
+    events = await collect(governor.parse_flow("重构支付链路"))
+    assert _text_events_containing(events, "🔍 解析需求")
+    assert _text_events_containing(events, "🔀 调度: delivery")
+    assert governor.last_track == "delivery"
+    assert governor.last_spec["task_summary"] == "重构支付"
+
+
+async def test_parse_flow_parse_error_falls_back_interactive():
+    """解析异常:告警 + last_track=interactive,不抛异常(路由由调用方定)"""
+    governor = make_governor()
+    governor._parse_requirement = AsyncMock(side_effect=RuntimeError("boom"))
+    events = await collect(governor.parse_flow("x"))
+    assert _text_events_containing(events, "降级")
+    assert governor.last_track == "interactive"
+    assert governor.last_spec is None
+
+
+async def test_parse_flow_casual_short_circuit():
+    """寒暄:跳过 _parse_requirement,last_track=interactive,仍有 🔀 调度消息"""
+    governor = make_governor()
+    governor._parse_requirement = AsyncMock(side_effect=AssertionError("不应调用"))
+    events = await collect(governor.parse_flow("你好"))
+    assert _text_events_containing(events, "🔀 调度: interactive")
+    assert governor.last_track == "interactive"
+    governor._parse_requirement.assert_not_called()
+
+
+async def test_adopt_flow_delegates_adopt_plan(monkeypatch):
+    """adopt_flow 透传 _adopt_plan(保留 monkeypatch 点)"""
+    called = []
+
+    async def fake_adopt(self):
+        called.append(1)
+        yield text_event("adopt-ev")
+
+    monkeypatch.setattr(Governor, "_adopt_plan", fake_adopt)
+    governor = make_governor()
+    events = await collect(governor.adopt_flow())
+    assert called == [1]
+    assert _text_events_containing(events, "adopt-ev")
+
+
+async def test_deliver_flow_delegates_run_delivery(monkeypatch):
+    """deliver_flow 透传 _run_delivery(保留 monkeypatch 点)"""
+    got = []
+
+    async def fake_delivery(self, spec):
+        got.append(spec)
+        yield text_event("delivery-ev")
+
+    monkeypatch.setattr(Governor, "_run_delivery", fake_delivery)
+    governor = make_governor()
+    events = await collect(governor.deliver_flow({"task_summary": "s"}))
+    assert got == [{"task_summary": "s"}]
+    assert _text_events_containing(events, "delivery-ev")
+
+
+def test_is_adoption_input_public():
+    governor = make_governor()
+    assert governor.is_adoption_input("采用方案") is True
+    assert governor.is_adoption_input("采用方案。") is True  # 末尾标点归一化
+    assert governor.is_adoption_input("请采用方案重构") is False  # 精确匹配不误吞

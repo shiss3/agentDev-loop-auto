@@ -1,7 +1,7 @@
 """模块执行分层:同层并行、层间串行。纯函数,无 I/O。
 
 边规则(a 先于 b):
-- deps 提示:b.deps 含 a -> (a, b)。LLM 声明,仅提示。
+- deps 硬依赖:b.deps 含 a -> (a, b)。LLM 声明的逻辑硬依赖(文件不重叠时唯一串行依据)。
 - 文件重叠硬门:intended_files 并集相交,或任一方为空(未知足迹)-> (低 index, 高 index)。
   重叠边恒低 index -> 高 index,天然无环;环只能来自 deps 提示。
 """

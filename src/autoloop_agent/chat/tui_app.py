@@ -20,9 +20,19 @@ from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import FormattedText, StyleAndTextTuples
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import BufferControl, Dimension, FormattedTextControl, HSplit, Layout, Window
+from prompt_toolkit.layout import (
+    BufferControl,
+    ConditionalContainer,
+    Dimension,
+    FormattedTextControl,
+    HSplit,
+    Layout,
+    VSplit,
+    Window,
+)
 from prompt_toolkit.styles import Style
 from autoloop_agent.chat.content_buffer import ContentBuffer
+from autoloop_agent.chat.drawer import DrawerPanel
 from autoloop_agent.chat.scroll_controller import ScrollController, _ScrollableWindow
 # ── 样式定义 ──
 _TUI_STYLE = Style.from_dict(
@@ -59,8 +69,11 @@ class TuiApp:
         model_name: str = "default",
         history_file: str | None = None,
         mouse_default: bool = True,
+        drawer: DrawerPanel | None = None,
     ) -> None:
         self.content_buffer = content_buffer
+        self.drawer = drawer
+        self._drawer_scroll: ScrollController | None = None
         self.model_name = model_name
         self._history_file = history_file or _DEFAULT_HISTORY_PATH
         # ── 状态栏 ──
@@ -249,8 +262,31 @@ class TuiApp:
             height=1,
             style="class:statusbar",
         )
+        # 交付轨右侧抽屉:有 drawer 且非空时显示(ConditionalContainer 动态显隐)
+        if self.drawer is not None:
+            self._drawer_scroll = ScrollController(
+                get_fragments=self.drawer.get_formatted_text,
+                invalidate=self._invalidate,
+            )
+            drawer_window = _ScrollableWindow(
+                content=FormattedTextControl(
+                    text=self._drawer_scroll.get_content_fragments,
+                    focusable=False,
+                ),
+                wrap_lines=True,
+                width=Dimension(preferred=self.drawer.WIDTH),
+                scroll_ctl=self._drawer_scroll,
+            )
+            main_area = VSplit([
+                content_window,
+                ConditionalContainer(
+                    drawer_window, Condition(lambda: self.drawer.visible)
+                ),
+            ])
+        else:
+            main_area = content_window
         # 整体布局
-        root = HSplit([content_window, input_window, status_window])
+        root = HSplit([main_area, input_window, status_window])
         layout = Layout(root)
         # 初始焦点：输入框
         layout.focus(self._input_buffer)
@@ -346,3 +382,6 @@ class TuiApp:
                 self._app.invalidate()
             except Exception:
                 pass
+    def invalidate(self) -> None:
+        """公开重绘入口(交付队列状态变更由 ChatCLI 触发)"""
+        self._invalidate()

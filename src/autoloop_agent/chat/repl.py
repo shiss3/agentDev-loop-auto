@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from pathlib import Path
 
 from claude_agent_sdk import (
@@ -27,6 +28,7 @@ from claude_agent_sdk import (
 )
 
 from autoloop_agent.chat.content_buffer import ContentBuffer
+from autoloop_agent.chat.drawer import DeliveryItem, DrawerPanel
 from autoloop_agent.chat.session_store import FileSessionStore, create_session_store
 from autoloop_agent.chat.session_selector import SessionSelector, NEW_SESSION
 from autoloop_agent.chat.tui_app import TuiApp
@@ -88,10 +90,13 @@ class ChatCLI:
 
         # ── TUI 组件 ──
         self.content_buffer = ContentBuffer()
+        # 交付轨右侧抽屉(双轨隔离:交付事件全进抽屉,交互轨留主区)
+        self._drawer = DrawerPanel()
         self.tui = TuiApp(
             content_buffer=self.content_buffer,
             model_name=model or "default",
             history_file=history_file,
+            drawer=self._drawer,
         )
         self.renderer = ChatRenderer(tui=self.tui)
         self.governor = self._create_session()
@@ -106,6 +111,12 @@ class ChatCLI:
         # 非 None 时用户输入路由给该 Future（answer 模式），而非发新消息。
         self._pending_answer: asyncio.Future | None = None
         self._pending_options: list[str] = []  # 当前问题选项（数字映射用）
+        # ── 交付轨 FIFO 队列(双轨隔离,与交互轨 _message_task 互不取消) ──
+        self._delivery_queue: deque[DeliveryItem] = deque()
+        self._delivery_runner: asyncio.Task | None = None
+        self._current_delivery_task: asyncio.Task | None = None
+        # auto 解析判交互轨后的回注入队(不抢占,等交互轨空闲)
+        self._int_inbox: deque[str] = deque()
 
     def _create_session(self) -> Governor:
         return Governor(
@@ -220,8 +231,14 @@ class ChatCLI:
         try:
             await self.tui.run()
         finally:
-            # 确保退出时取消任何正在进行的请求
+            # 确保退出时取消任何正在进行的请求(交互轨 + 交付轨)
             await self._cancel_message_task()
+            if self._delivery_runner and not self._delivery_runner.done():
+                self._delivery_runner.cancel()
+                try:
+                    await self._delivery_runner
+                except asyncio.CancelledError:
+                    pass
             await self.governor.close()
             self.renderer.render_goodbye(self.session.stats.to_dict())
 
@@ -242,8 +259,16 @@ class ChatCLI:
         # 判断是斜杠命令还是普通消息
         if text.startswith("/"):
             await self._handle_command(text)
-        else:
-            await self._handle_message(text)
+            return
+        # 交付轨分流:采纳确认 / auto 模式普通输入 -> FIFO 队列(串行,事件进右侧抽屉)
+        if self.governor.is_adoption_input(text):
+            self._enqueue_delivery(text, "adoption")
+            return
+        if self.mode == "auto":
+            self._enqueue_delivery(text, "auto")
+            return
+        # semi 普通输入 -> 交互轨(现状:抢占取消)
+        await self._handle_message(text)
 
     async def _handle_command(self, input_str: str) -> None:
         """处理斜杠命令"""
@@ -283,6 +308,103 @@ class ChatCLI:
         except asyncio.CancelledError:
             # 任务被取消是正常行为
             pass
+        # 交互轨收尾后,回注队列里等空闲的 auto→interactive 需求接上
+        self._drain_int_inbox()
+
+    # ── 交付轨 FIFO 队列 ──
+
+    def _enqueue_delivery(self, text: str, kind: str) -> None:
+        """交付类输入入队(⏳待解析)并唤醒 runner。"""
+        item = self._drawer.add_item(text, kind)
+        self._delivery_queue.append(item)
+        self.tui.invalidate()
+        if self._delivery_runner is None or self._delivery_runner.done():
+            self._delivery_runner = asyncio.create_task(self._delivery_loop())
+
+    async def _delivery_loop(self) -> None:
+        """串行消费交付队列:单项独立 task,ESC 只取消当前项,队列继续。"""
+        while self._delivery_queue:
+            item = self._delivery_queue.popleft()
+            self._current_delivery_task = asyncio.create_task(
+                self._run_delivery_item(item)
+            )
+            try:
+                await self._current_delivery_task
+            except asyncio.CancelledError:
+                item.state = "failed"
+                item.detail = "已取消"
+                self._drawer.append_log(f"✗ 需求 #{item.seq} 已取消")
+                self.tui.invalidate()
+                # runner 自身被取消(退出)则中止消费;ESC 只取消单项则继续下一项
+                if asyncio.current_task().cancelling():
+                    raise
+            finally:
+                self._current_delivery_task = None
+
+    async def _run_delivery_item(self, item: DeliveryItem) -> None:
+        """单项生命周期:pending -> parsing -> parsed -> executing -> done/failed;
+        解析判交互轨 -> to_interactive 回注主区。"""
+        try:
+            if item.kind == "adoption":
+                item.state = "executing"
+                self.tui.invalidate()
+                await self._drain_delivery_events(self.governor.adopt_flow())
+            else:
+                item.state = "parsing"
+                self.tui.invalidate()
+                await self._drain_delivery_events(
+                    self.governor.parse_flow(item.text)
+                )
+                if self.governor.last_track == "interactive":
+                    item.state = "to_interactive"
+                    self.tui.invalidate()
+                    self._inject_interactive(item.text)
+                    return
+                item.state = "parsed"
+                self.tui.invalidate()
+                item.state = "executing"
+                self.tui.invalidate()
+                await self._drain_delivery_events(
+                    self.governor.deliver_flow(self.governor.last_spec)
+                )
+            item.state = "done"
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            item.state = "failed"
+            item.detail = str(e)[:30]
+            self._drawer.append_log(f"✗ 需求 #{item.seq} 异常({str(e)[:80]})")
+        self.tui.invalidate()
+
+    async def _drain_delivery_events(self, events) -> None:
+        """交付事件流(governor TEXT 消息)-> 抽屉日志。"""
+        async for event in events:
+            text = event.data.get("text")
+            if text:
+                self._drawer.append_log(text)
+                self.tui.invalidate()
+
+    # ── auto→interactive 回注(不抢占) ──
+
+    def _inject_interactive(self, text: str) -> None:
+        self._int_inbox.append(text)
+        self._drain_int_inbox()
+
+    def _drain_int_inbox(self) -> None:
+        if self._int_inbox and (
+            self._message_task is None or self._message_task.done()
+        ):
+            text = self._int_inbox.popleft()
+            self._message_task = asyncio.create_task(self._inject_runner(text))
+
+    async def _inject_runner(self, text: str) -> None:
+        """回注需求直通交互轨(forced interactive,不二次解析);收尾接下一个。"""
+        try:
+            await self._stream_events(text, forced_track="interactive")
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._drain_int_inbox()
 
     async def _cancel_message_task(self) -> None:
         """取消正在进行的消息处理任务并等待其结束（幂等）"""
@@ -323,9 +445,11 @@ class ChatCLI:
         if self.session.is_processing:
             self.session.cancel()
 
-        # 2. 取消消息处理任务
+        # 2. 取消消息处理任务;交互轨空闲时取消交付轨当前项(队列保留)
         if self._message_task and not self._message_task.done():
             self._message_task.cancel()
+        elif self._current_delivery_task and not self._current_delivery_task.done():
+            self._current_delivery_task.cancel()
 
     # ── 命令回调接口（供 commands.py 调用） ──
 

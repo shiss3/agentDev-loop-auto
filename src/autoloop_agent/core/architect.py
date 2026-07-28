@@ -170,17 +170,23 @@ REQUIREMENT_PARSER_PROMPT = """\
   模块内依赖（先建表再 API 再前端）由执行器内部消化，不上调度层。
   粒度硬约束：每模块全部子任务 intended_files 并集 5~15 个源码文件。
   - <5 文件：过碎，向上归并到相关业务能力的父模块（附属小功能不独立成模块）。
-  - >15 文件：过大，按子能力再拆——但仅当两半无依赖且文件完全隔离才拆，否则保持大模块。宁大勿碎。
-  多模块仅限【无跨模块依赖 + 操作文件完全隔离】的组合（为并行执行创造条件）；
-  有依赖或文件重叠的功能必须收进同一模块。每项：
+  - >15 文件：过大，按子能力再拆——两半文件无交集即可拆；子域间有逻辑硬依赖的拆开后
+    填 deps 串行，不要为躲依赖硬捏成大模块。
+  多模块拆分按依赖类型分三类处理：
+  - 文件重叠：必须收进同一模块（调度层对文件重叠强制串行，拆开无并行收益只有 merge 开销）。
+  - 逻辑硬依赖但文件不重叠：拆成独立模块并显式填 deps。调度层按 deps 分层串行，
+    被依赖模块先 merge，依赖方 worktree 从含上游产物的 main 拉分支，能正常编译/测试。
+  - 软偏好（顺序建议非硬依赖）：拆，不填 deps，保并行。
+  每项：
   - module_id：业务能力的英文 slug（小写+下划线，如 payment/user_auth/session），需求内唯一。
   - summary：模块核心目标（自包含，执行器看不到你的上下文）。
   - acceptance：模块级可验证验收要点。
   - subtasks：模块内开发步骤清单（建表/接口/前端各一步）。每项：
     id（模块内唯一 "t1","t2",...）、summary、acceptance、intended_files（探索后填，禁止留空——
     留空=无法判定文件隔离=被强制与其他模块串行，并行机会丧失）。
-  - deps：依赖的同批 module_id 列表（真实硬依赖才填，如"订单模块依赖用户模块的 users 表"；
-    软偏好不填。文件重叠会被调度层强制串行，与此无关）。
+  - deps：依赖的同批 module_id 列表。逻辑硬依赖必填（如"订单模块依赖用户模块的 users 表"
+    ——漏填=两模块判为无依赖并行跑，依赖方看不到上游产物直接失败）；软偏好不填。
+    文件重叠会被调度层强制串行，与此无关。
 ## 调用指引
 - 分析完成后必须调用 submit_analysis_plan 提交任务单，不要只输出文本。
 - submit_analysis_plan 参数 = 任务单各字段（task_summary/acceptance_criteria/.../modules），
@@ -189,7 +195,8 @@ REQUIREMENT_PARSER_PROMPT = """\
 ## 纪律
 - 严格锚定原始需求，所有验收项可追溯到需求原文。
 - 模块 summary/subtasks 描述必须自包含（执行器看不到你的上下文）。
-- deps 按真实硬跨模块依赖填，软偏好不填；模块内步骤顺序由执行器自主决定，无需标注。
+- deps 按真实硬跨模块依赖必填（漏填=依赖方并行起跑、看不到上游产物而失败），软偏好不填；
+  模块内步骤顺序由执行器自主决定，无需标注。
 - 仅做语义层面的歧义补全，遵循项目通用规范与行业默认最佳实践；补全决策在 task_summary
   或 acceptance_criteria 中体现可追溯性。
 - 模糊时取保守（change_type 倾向 feature、file_count_bucket 倾向 6+、cross_domain 倾向 true、
@@ -233,6 +240,7 @@ def validate_modules(modules: list[dict]) -> list[str]:
     """拆分机械校验,返回告警串列表(accept-with-warning,不重解析)。
 
     - 模块文件数(子任务 intended_files 归一并集)<5: 过碎,建议并入父模块;>15: 过大,建议再拆
+      (子域文件无交集即可拆,逻辑硬依赖填 deps 串行,勿为躲依赖合一)
     - intended_files 全空: 无法判定文件隔离,将被强制与一切串行
     - 模块内 subtask id 重复: 完成判定按集合,重复 id 会提前判完成
     """
@@ -245,7 +253,10 @@ def validate_modules(modules: list[dict]) -> list[str]:
         elif n < 5:
             warnings.append(f"模块 {mid} 仅 {n} 文件,过碎,建议并入父模块")
         elif n > 15:
-            warnings.append(f"模块 {mid} 达 {n} 文件,过大,建议按子能力再拆")
+            warnings.append(
+                f"模块 {mid} 达 {n} 文件,过大,建议按子能力再拆"
+                "(子域文件无交集即可拆,逻辑硬依赖填 deps 串行,勿为躲依赖合一)"
+            )
         ids = [st["id"] for st in m.get("subtasks") or []]
         if len(ids) != len(set(ids)):
             warnings.append(f"模块 {mid} 子任务 id 重复,完成判定可能提前")
@@ -311,6 +322,9 @@ class Governor:
         self._pending_plan: dict | None = None
         self._resident = self._build_resident_session()
         self._last_text: str | None = None
+        # parse_flow 产物(双轨交付队列消费):最近一次的 spec 与判定轨道
+        self.last_spec: dict | None = None
+        self.last_track: str = "interactive"
     @property
     def session(self) -> BaseAgentSession:
         """穿透到常驻执行体（commands.py 的 cli.session.* 零改动，Step 6 用）。"""
@@ -572,6 +586,56 @@ class Governor:
         async for event in self._run_delivery(plan):
             yield event
         self._pending_plan = None
+    # ── 双轨交付队列公开入口(chat 层 DeliveryRunner 消费) ──
+    def is_adoption_input(self, text: str) -> bool:
+        """公开采纳判定(chat 层分流用):命中则该输入应入交付队列而非发交互轨。"""
+        return self._is_adoption_input(text)
+
+    async def adopt_flow(self) -> AsyncIterator[ChatEvent]:
+        """采纳段公开入口,透传 _adopt_plan(保留 monkeypatch 点)。"""
+        async for event in self._adopt_plan():
+            yield event
+
+    async def deliver_flow(self, spec: dict) -> AsyncIterator[ChatEvent]:
+        """交付段公开入口,透传 _run_delivery(保留 monkeypatch 点)。"""
+        async for event in self._run_delivery(spec):
+            yield event
+
+    async def parse_flow(self, text: str) -> AsyncIterator[ChatEvent]:
+        """auto 解析段:寒暄短路 + 🔍 开始 + _parse_requirement + 🔀 调度。
+        结果存 self.last_spec / self.last_track;不碰 resident,
+        交互执行由调用方按 last_track 路由(交付队列只跑解析+交付)。
+        """
+        self._last_text = text
+        self.last_spec = None
+        self.last_track = "interactive"
+        if self._is_casual_input(text):
+            # 寒暄/确认等非需求输入直接常驻交互,跳过 LLM 解析省 token
+            self.last_spec = {
+                "task_summary": text,
+                "acceptance_criteria": [],
+                "risk_level": "low",
+                "suggest_track": "interactive",
+            }
+            yield _build_message(f"🔀 调度: interactive（{text[:40]}）")
+            return
+        yield _build_message(f"🔍 解析需求: {text[:40]}")
+        try:
+            spec = await self._parse_requirement(
+                text,
+                context_continuation=self._resident.stats.turn_count > 0,
+            )
+        except Exception as e:
+            yield _build_message(
+                f"⚠️ 需求解析异常({str(e)[:80]}),已降级为交互轨直接执行。"
+            )
+            return
+        self.last_spec = spec
+        self.last_track = self._decide_track(spec)
+        yield _build_message(
+            f"🔀 调度: {self.last_track}（{spec.get('task_summary', '')[:40]}）"
+        )
+
     async def handle_user_input(
         self, text: str, *, forced_track: str | None = None
     ) -> AsyncIterator[ChatEvent]:
@@ -618,28 +682,16 @@ class Governor:
                 return
             track = "delivery"
         else:
-            if self._is_casual_input(text):
-                # 寒暄/确认等非需求输入直接常驻交互,跳过 LLM 解析省 token
-                track = "interactive"
-                spec = {
-                    "task_summary": text,
-                    "acceptance_criteria": [],
-                    "risk_level": "low",
-                    "suggest_track": "interactive",
-                }
-            else:
-                try:
-                    spec = await self._parse_requirement(
-                        text, context_continuation=context_continuation
-                    )
-                except Exception as e:
-                    yield _build_message(
-                        f"⚠️ 需求解析异常({str(e)[:80]}),已降级为交互轨直接执行。"
-                    )
-                    async for event in self._resident.send(text):
-                        yield event
-                    return
-                track = self._decide_track(spec)
+            # auto:解析段组合(🔍/🔀/降级告警由 parse_flow 产出)
+            async for event in self.parse_flow(text):
+                yield event
+            if self.last_track == "interactive":
+                async for event in self._resident.send(text):
+                    yield event
+                return
+            async for event in self._run_delivery(self.last_spec):
+                yield event
+            return
         yield _build_message(
             f"🔀 调度: {track}（{spec.get('task_summary', '')[:40]}）"
         )
@@ -860,7 +912,13 @@ class Governor:
             ))
             try:
                 proc = await spawn_executor(args, worktree_path, log_path)
-                exit_code = await proc.wait()
+                try:
+                    exit_code = await proc.wait()
+                except BaseException:
+                    # 取消/异常时杀 executor 子进程,防孤儿继续写 worktree
+                    if proc.returncode is None:
+                        proc.kill()
+                    raise
             except Exception as e:
                 await evq.put(_build_message(f"⚠️ 模块 {mid} spawn 失败({str(e)[:80]})"))
                 continue
