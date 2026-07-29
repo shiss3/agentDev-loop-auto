@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 
 from claude_agent_sdk import (
@@ -111,6 +112,7 @@ class ChatCLI:
         # 非 None 时用户输入路由给该 Future（answer 模式），而非发新消息。
         self._pending_answer: asyncio.Future | None = None
         self._pending_options: list[str] = []  # 当前问题选项（数字映射用）
+        self._pending_echo: Callable[[str], None] | None = None  # 回答回显目标(交互轨=主区,交付轨=抽屉)
         # ── 交付轨 FIFO 队列(双轨隔离,与交互轨 _message_task 互不取消) ──
         self._delivery_queue: deque[DeliveryItem] = deque()
         self._delivery_runner: asyncio.Task | None = None
@@ -131,12 +133,31 @@ class ChatCLI:
     async def _can_use_tool(
         self, tool_name: str, tool_input: dict, context: ToolPermissionContext
     ) -> PermissionResult:
-        """常驻执行体权限回调（跑在 prompt_toolkit 同一事件循环）。
-        非 AskUserQuestion 直接放行不问用户；AskUserQuestion 渲染问题卡 +
-        切 answer 模式，逐问题等用户输入（数字=选编号选项，文字=自定义答案）。
-        """
+        """常驻执行体权限回调：非 AskUserQuestion 直接放行；
+        AskUserQuestion 走公共反问流程（渲染目标=主区 content_buffer）。"""
         if tool_name != "AskUserQuestion":
             return PermissionResultAllow()
+        return await self._ask_questions(
+            tool_input,
+            render_card=self.content_buffer.append_question_card,
+            echo=self.content_buffer.append_plain,
+        )
+
+    async def _ask_questions(
+        self,
+        tool_input: dict,
+        *,
+        render_card: Callable[[str, list[str]], None],
+        echo: Callable[[str], None],
+    ) -> PermissionResult:
+        """AskUserQuestion 公共流程(双轨共用):渲染卡 -> 排队占槽 -> 逐问等答 -> 回注 answers。
+
+        竞态:已有 pending answer(另一轨提问中)时先等其了结再占槽(后到排队)。
+        render_card/echo 由调用方定渲染目标:交互轨=content_buffer,交付轨=drawer。
+        """
+        prev = self._pending_answer
+        if prev is not None and not prev.done():
+            await asyncio.wait([prev])  # 不传播 prev 的取消/异常;自身取消照常抛出
         answers: dict[str, str] = {}
         for q in tool_input.get("questions", []):
             question_text = q.get("question", "")
@@ -146,12 +167,14 @@ class ChatCLI:
                 if o.get("description") else o.get("label", "")
                 for o in q.get("options", [])
             ]
-            self.content_buffer.append_question_card(question_text, display)
+            render_card(question_text, display)
+            self.tui.invalidate()
             loop = asyncio.get_running_loop()
             fut: asyncio.Future = loop.create_future()
             self._pending_answer = fut
             # 数字映射用纯 label（answers 值）；display 仅供卡片展示
             self._pending_options = labels
+            self._pending_echo = echo
             self.tui.set_answer_mode(True)
             try:
                 answer = await fut
@@ -161,6 +184,7 @@ class ChatCLI:
             finally:
                 self._pending_answer = None
                 self._pending_options = []
+                self._pending_echo = None
                 self.tui.set_answer_mode(False)
             answers[question_text] = answer
         return PermissionResultAllow(
@@ -178,7 +202,8 @@ class ChatCLI:
             idx = int(text)
             if 1 <= idx <= len(self._pending_options):
                 answer = self._pending_options[idx - 1]
-        self.content_buffer.append_plain(f"回答> {answer}")
+        echo = self._pending_echo or self.content_buffer.append_plain
+        echo(f"回答> {answer}")
         fut.set_result(answer)
 
     @property
