@@ -83,7 +83,7 @@ def patch_query(monkeypatch):
 @pytest.fixture
 def stub_executors(monkeypatch):
     """stub _run_executors 为空 async gen(测调度/降级/拦截时不真 spawn claude/git)。"""
-    async def _stub(self, modules, req_id, spec):
+    async def _stub(self, modules, req_id, spec, *, resume=None):
         if False:
             yield  # 标记 async generator,实际空跑
     monkeypatch.setattr(Governor, "_run_executors", _stub)
@@ -316,7 +316,7 @@ async def test_handle_delivery_placeholder(monkeypatch):
     """mock 解析→delivery+modules → events 含 req_id;_run_executors 收规范化模块"""
     captured: dict = {}
 
-    async def fake_executors(self, modules, req_id, spec):
+    async def fake_executors(self, modules, req_id, spec, *, resume=None):
         captured["modules"] = modules
         captured["req_id"] = req_id
         if False:
@@ -809,7 +809,7 @@ async def test_executors_parallel_layer_both_merge(orch_env, monkeypatch):
     """文件隔离两模块同层并行:都跑都 merge(声明序),都 remove"""
     governor = make_governor()
 
-    async def fake_slot(self, module, req_id, spec, wt, logs_dir, evq):
+    async def fake_slot(self, module, req_id, spec, wt, logs_dir, evq, resume_session_id=None):
         return True
 
     monkeypatch.setattr(Governor, "_run_module_slot", fake_slot)
@@ -825,7 +825,7 @@ async def test_executors_failed_pred_skips_dependent(orch_env, monkeypatch):
     """a 失败 -> 依赖 a 的 b 跳过;独立的 c 照常 merge(部分交付)"""
     governor = make_governor()
 
-    async def fake_slot(self, module, req_id, spec, wt, logs_dir, evq):
+    async def fake_slot(self, module, req_id, spec, wt, logs_dir, evq, resume_session_id=None):
         return module["module_id"] != "a"  # a 失败
 
     monkeypatch.setattr(Governor, "_run_module_slot", fake_slot)
@@ -844,7 +844,7 @@ async def test_executors_merge_conflict_aborts(orch_env, monkeypatch):
     """同层 a merge 冲突 -> 整轮中止,b 不 merge,worktree 保留"""
     governor = make_governor()
 
-    async def fake_slot(self, module, req_id, spec, wt, logs_dir, evq):
+    async def fake_slot(self, module, req_id, spec, wt, logs_dir, evq, resume_session_id=None):
         return True
 
     monkeypatch.setattr(Governor, "_run_module_slot", fake_slot)
@@ -867,7 +867,7 @@ async def test_executors_overlap_forces_serial_layers(orch_env, monkeypatch):
     governor = make_governor()
     timeline: list[str] = []
 
-    async def fake_slot(self, module, req_id, spec, wt, logs_dir, evq):
+    async def fake_slot(self, module, req_id, spec, wt, logs_dir, evq, resume_session_id=None):
         timeline.append(f"slot:{module['module_id']}")
         return True
 
@@ -897,7 +897,7 @@ async def test_executors_writes_module_graph_json(orch_env, monkeypatch, tmp_pat
         project_dir=str(tmp_path), session_store=MagicMock(spec=SessionStore)
     )
 
-    async def fake_slot(self, module, req_id, spec, wt, logs_dir, evq):
+    async def fake_slot(self, module, req_id, spec, wt, logs_dir, evq, resume_session_id=None):
         return True
 
     monkeypatch.setattr(Governor, "_run_module_slot", fake_slot)

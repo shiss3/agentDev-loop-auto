@@ -47,6 +47,11 @@ from autoloop_agent.core.executor import (
     spawn_executor,
     summary_rel_path,
 )
+from autoloop_agent.core.executor_registry import (
+    extract_session_id,
+    lookup as registry_lookup,
+    register_executor,
+)
 from autoloop_agent.core.module_affinity import normalize_module_id
 from autoloop_agent.core.module_scheduler import (
     build_execution_layers,
@@ -473,11 +478,16 @@ class Governor:
         )
         prefix = "接续修改" if context_continuation else "全新任务"
         prompt = f"[{prefix}] {text}"
+
+        async def _prompt_stream():
+            # can_use_tool 回调要求流式输入(SDK 限制):字符串 prompt 会报
+            # "can_use_tool callback requires streaming mode",单条 user 消息包 AsyncIterable。
+            yield {"type": "user", "message": {"role": "user", "content": prompt}}
         in_tokens = out_tokens = tool_calls = 0
         _turns: list[dict] = []  # 逐轮 token 分布(判定冷启动大头:盲探 vs 定向探索)
         _start = datetime.datetime.now()
         try:
-            async for msg in query(prompt=prompt, options=opts):
+            async for msg in query(prompt=_prompt_stream(), options=opts):
                 # 流兜底:handler 未触发时从 AssistantMessage 提取 tool_use input
                 if isinstance(msg, AssistantMessage):
                     _tools: list[str] = []
@@ -554,7 +564,7 @@ class Governor:
         """spec.modules -> 规范化模块列表（normalize module_id + 重复合并 + deps 去未知/自引用）。
         交付轨（_run_delivery）与采纳闭环（_adopt_plan）共用。"""
         raw = spec.get("modules") or []
-        req_id = self._new_req_id()
+        req_id = spec.get("_req_id") or self._new_req_id()
         merged: dict[str, dict] = {}
         order: list[str] = []
         for m in raw:
@@ -622,6 +632,46 @@ class Governor:
         """交付段公开入口,透传 _run_delivery(保留 monkeypatch 点)。"""
         async for event in self._run_delivery(spec):
             yield event
+
+    def lookup_executor(self, module_id: str) -> dict | None:
+        """执行器注册表查询(chat 层 @模块名 分流用)。"""
+        return registry_lookup(self.project_dir, module_id)
+
+    async def continuation_flow(
+        self, module_id: str, prompt: str, session_id: str, req_id: str
+    ) -> AsyncIterator[ChatEvent]:
+        """续作段公开入口:合成单模块 spec + resume 执行器会话,走完整交付流程(跳过解析)。
+        req_id=原交付 req_id(注册表存):worktree 路径 deliver-<req_id>-<mid> 复原 = resume 命中前提。"""
+        module = {
+            "module_id": module_id,
+            "summary": prompt,
+            "acceptance": [],
+            "subtasks": [
+                {"id": "follow-1", "summary": prompt,
+                 "intended_files": [], "acceptance": []}
+            ],
+            "deps": [],
+        }
+        spec = {
+            "task_summary": prompt,
+            "risk_level": "low",
+            "modules": [module],
+            "_req_id": req_id,
+        }
+        async for event in self._run_delivery(spec, resume={module_id: session_id}):
+            yield event
+
+    def _register_executor_session(
+        self, logs_dir: Path, module_id: str, req_id: str
+    ) -> str | None:
+        """merge 成功后登记执行器会话:扫 attempt 2->0 首个含 init 的日志,写注册表。
+        无日志/无 init -> None(不写表)。"""
+        for attempt in (2, 1, 0):
+            sid = extract_session_id(str(logs_dir / f"executor-{module_id}-{attempt}.log"))
+            if sid:
+                register_executor(self.project_dir, module_id, sid, req_id)
+                return sid
+        return None
 
     async def parse_flow(self, text: str) -> AsyncIterator[ChatEvent]:
         """auto 解析段:寒暄短路 + 🔍 开始 + _parse_requirement + 🔀 调度。
@@ -724,8 +774,11 @@ class Governor:
         # track == "delivery"
         async for event in self._run_delivery(spec):
             yield event
-    async def _run_delivery(self, spec: dict) -> AsyncIterator[ChatEvent]:
-        """交付轨：modules 规范化 -> 校验告警 -> _run_executors 分层执行。"""
+    async def _run_delivery(
+        self, spec: dict, *, resume: dict[str, str] | None = None
+    ) -> AsyncIterator[ChatEvent]:
+        """交付轨：modules 规范化 -> 校验告警 -> _run_executors 分层执行。
+        resume: module_id -> session_id(@模块名 续作),None=全新执行。"""
         modules_raw = spec.get("modules") or []
         is_high = spec.get("risk_level") == "high"
         if not modules_raw:
@@ -744,10 +797,11 @@ class Governor:
         yield _build_message(
             f"🌐 交付轨 req_id={req_id}：{len(modules)} 个模块"
         )
-        async for event in self._run_executors(modules, req_id, spec):
+        async for event in self._run_executors(modules, req_id, spec, resume=resume):
             yield event
     async def _run_executors(
-        self, modules: list[dict], req_id: str, spec: dict
+        self, modules: list[dict], req_id: str, spec: dict,
+        *, resume: dict[str, str] | None = None,
     ) -> AsyncIterator[ChatEvent]:
         """交付轨执行器编排:Kahn 分层 -> 逐层(建 worktree -> 层内并发跑模块 -> 顺序 merge)。
         并行门:同层模块无跨模块依赖且文件无交集(module_scheduler 保证);其余拓扑串行。
@@ -850,7 +904,10 @@ class Governor:
 
             async def _slot_runner(m: dict, wt: str) -> bool:
                 try:
-                    ok = await self._run_module_slot(m, req_id, spec, wt, logs_dir, evq)
+                    ok = await self._run_module_slot(
+                        m, req_id, spec, wt, logs_dir, evq,
+                        resume_session_id=(resume or {}).get(m["module_id"]),
+                    )
                 except Exception as e:
                     await evq.put(_build_message(
                         f"⚠️ 模块 {m['module_id']} 执行异常({str(e)[:80]})"
@@ -893,6 +950,16 @@ class Governor:
                 await asyncio.to_thread(remove_worktree, self.project_dir, req_id, mid)
                 merged.append(mid)
                 yield _build_message(f"✅ 模块 {mid} 交付完成(merge + 验证通过)")
+                # 登记执行器会话(@模块名 续作用):最高 attempt 日志 init 行 -> 注册表
+                old = self.lookup_executor(mid)
+                try:
+                    sid = self._register_executor_session(logs_dir, mid, req_id)
+                    if sid and old and old.get("req_id") != req_id:
+                        yield _build_message(
+                            f"⚠️ @{mid} 执行器换绑:{old['req_id']} -> {req_id}"
+                        )
+                except Exception as e:
+                    yield _build_message(f"⚠️ 模块 {mid} 执行器会话登记失败({str(e)[:60]})")
         yield _build_message(
             f"🏁 req_id={req_id} 交付结束: 已 merge {len(merged)}/{len(modules)}"
             + (f",未交付: {','.join(m['module_id'] for m in modules if m['module_id'] not in merged)}" if len(merged) < len(modules) else "")
@@ -905,6 +972,7 @@ class Governor:
         worktree_path: str,
         logs_dir: Path,
         evq: asyncio.Queue,
+        resume_session_id: str | None = None,
     ) -> bool:
         """单模块执行槽:最多 3 次 spawn(摘要文件续跑) -> 删摘要 -> commit -> 验证(merge 前)。
         完成判定: 子任务 id 集 ⊆ 摘要 [x] 集(替代旧 is_req_done/has_pending/reset_claimed)。
@@ -920,7 +988,7 @@ class Governor:
             if sub_ids <= read_summary_completed(worktree_path, mid):
                 break
             log_path = str(logs_dir / f"executor-{mid}-{attempt}.log")
-            args = build_executor_args(prompt, max_turns)
+            args = build_executor_args(prompt, max_turns, resume_session_id=resume_session_id)
             # 调度清单:spawn 前写完整 argv + prompt + 禁用能力,供排查"传了啥/砍了啥"
             manifest = build_dispatch_manifest(
                 args, req_id=req_id, module_id=mid, attempt=attempt,
