@@ -466,6 +466,24 @@ def test_register_executor_session_no_logs_returns_none(tmp_path):
     g = make_governor(tmp_path)
     assert g._register_executor_session(tmp_path, "auth", "req-9") is None
     assert g.lookup_executor("auth") is None
+
+
+def test_rebind_warning_pattern(tmp_path):
+    """换绑检测模式:merge 分支注册前 lookup 拿旧 req_id,新 req_id 不同 -> 发换绑警告。"""
+    from autoloop_agent.core.executor_registry import register_executor
+    register_executor(str(tmp_path), "auth", "sess-a", "reqA")
+    g = make_governor(tmp_path)
+    old = g.lookup_executor("auth")  # merge 分支在注册前做这步
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "executor-auth-0.log").write_text(
+        json.dumps({"type": "system", "subtype": "init", "session_id": "sess-b"}) + "\n",
+        encoding="utf-8",
+    )
+    sid = g._register_executor_session(logs, "auth", "reqB")
+    assert sid == "sess-b"
+    assert old["req_id"] == "reqA"  # != "reqB" -> 调用方发 ⚠️ 换绑警告
+    assert g.lookup_executor("auth")["session_id"] == "sess-b"
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -552,11 +570,18 @@ from autoloop_agent.core.executor_registry import (
 merge 成功分支（`merged.append(mid)` + `✅` 事件之后）加：
 
 ```python
+                old = self.lookup_executor(mid)
                 try:
-                    self._register_executor_session(logs_dir, mid, req_id)
+                    sid = self._register_executor_session(logs_dir, mid, req_id)
+                    if sid and old and old.get("req_id") != req_id:
+                        yield _build_message(
+                            f"⚠️ @{mid} 执行器换绑:{old['req_id']} -> {req_id}"
+                        )
                 except Exception as e:
                     yield _build_message(f"⚠️ 模块 {mid} 执行器会话登记失败({str(e)[:60]})")
 ```
+
+（换绑警告：同名模块二次交付覆盖注册时告知用户续作目标已切换——2026-07-29 用户确认加这层。）
 
 3e. `_run_module_slot` 签名加 `resume_session_id: str | None = None`，`build_executor_args(prompt, max_turns)` 改 `build_executor_args(prompt, max_turns, resume_session_id=resume_session_id)`。
 
