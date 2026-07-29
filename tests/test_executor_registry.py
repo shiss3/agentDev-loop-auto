@@ -73,3 +73,22 @@ def test_load_corrupted_json_returns_empty(tmp_path):
     p.write_text("{corrupted", encoding="utf-8")
     assert load_registry(str(tmp_path)) == {}
     assert lookup(str(tmp_path), "auth") is None
+
+
+# ── build_executor_args --resume 变体 ──
+
+def test_build_executor_args_without_resume():
+    """默认不变:无 --resume。"""
+    from autoloop_agent.core.executor import build_executor_args
+    args = build_executor_args("p", 40)
+    assert "--resume" not in args
+    assert args[args.index("-p") + 1] == "p"
+    assert args[args.index("--max-turns") + 1] == "40"
+
+
+def test_build_executor_args_with_resume():
+    """resume_session_id 命中:argv 尾部追加 --resume <id>,其余不动。"""
+    from autoloop_agent.core.executor import build_executor_args
+    args = build_executor_args("p", 40, resume_session_id="sess-abc")
+    assert args[-2:] == ["--resume", "sess-abc"]
+    assert "--disallowed-tools" in args  # 原有尾部字段仍在

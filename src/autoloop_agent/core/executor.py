@@ -72,7 +72,9 @@ def build_module_prompt(module: dict, task_summary: str, summary_path: str) -> s
     )
 
 
-def build_executor_args(module_prompt: str, max_turns: int) -> list[str]:
+def build_executor_args(
+    module_prompt: str, max_turns: int, *, resume_session_id: str | None = None
+) -> list[str]:
     """组装 claude CLI argv(不含 claude 前缀,spawn_executor 前置 _build_claude_prefix)。
 
     固定:
@@ -81,8 +83,10 @@ def build_executor_args(module_prompt: str, max_turns: int) -> list[str]:
     --output-format stream-json --verbose --permission-mode acceptEdits
     --allowed-tools <EXECUTOR_ALLOWED_TOOLS> --disallowed-tools Bash
     (Bash 硬禁:acceptEdits 下 Bash 非自动接受会卡死无人值守执行器)
+    resume_session_id 非 None 时尾部追加 --resume <id>(@模块名 续作复用执行器会话;
+    须 cwd 复原原 worktree 路径才命中,spike 2026-07-29 实测)。
     """
-    return [
+    args = [
         "-p", module_prompt,
         "--bare",
         "--append-system-prompt", EXECUTOR_SYSTEM_PROMPT,
@@ -95,6 +99,9 @@ def build_executor_args(module_prompt: str, max_turns: int) -> list[str]:
         "--allowed-tools", EXECUTOR_ALLOWED_TOOLS,
         "--disallowed-tools", "Bash",
     ]
+    if resume_session_id:
+        args += ["--resume", resume_session_id]
+    return args
 
 
 def build_dispatch_manifest(
