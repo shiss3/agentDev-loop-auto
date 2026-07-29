@@ -1,8 +1,9 @@
-"""指定执行器续作(architect 层) 单元测试
+"""指定执行器续作(architect 层 + repl 层) 单元测试
 不拉真 claude CLI:_run_delivery monkeypatch 捕获 spec/resume;注册 helper 用 tmp_path 假日志。
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import MagicMock
 
@@ -125,3 +126,80 @@ def test_rebind_warning_pattern(tmp_path):
     assert sid == "sess-b"
     assert old["req_id"] == "reqA"  # != "reqB" -> 调用方发 ⚠️ 换绑警告
     assert g.lookup_executor("auth")["session_id"] == "sess-b"
+
+
+# ── repl 层 @分流 ──
+
+from autoloop_agent.chat.content_buffer import ContentBuffer
+from autoloop_agent.chat.repl import ChatCLI
+
+
+def make_cli() -> ChatCLI:
+    return ChatCLI(project_dir=".", session_store=MagicMock(spec=SessionStore))
+
+
+def buf_text(buf: ContentBuffer) -> str:
+    return "".join(frag[1] for frag in buf.get_formatted_text())
+
+
+async def _noop_flow(*a, **k):
+    return
+    yield
+
+
+async def _stop_runner(cli: ChatCLI) -> None:
+    if cli._delivery_runner and not cli._delivery_runner.done():
+        cli._delivery_runner.cancel()
+
+
+async def test_at_registered_enqueues_continuation():
+    """@已注册模块:入交付队列 kind=continuation target=模块名,直跑到 done。"""
+    cli = make_cli()
+    cli.governor = MagicMock()
+    cli.governor.lookup_executor.return_value = {"session_id": "s1", "req_id": "r1"}
+    cli.governor.continuation_flow = _noop_flow
+    await cli._on_user_input("@auth 把错误码改中文")
+    await asyncio.sleep(0.1)
+    await _stop_runner(cli)
+    item = cli._drawer.items[-1]
+    assert item.kind == "continuation"
+    assert item.target == "auth"
+    assert item.state == "done"
+
+
+async def test_at_unregistered_warns_and_falls_back():
+    """@未注册模块:主区提示 + 落回普通 auto 流程(kind=auto 入队)。"""
+    cli = make_cli()
+    cli.governor = MagicMock()
+    cli.governor.lookup_executor.return_value = None
+    cli.governor.is_adoption_input.return_value = False
+    cli.governor.parse_flow = _noop_flow
+    await cli._on_user_input("@ghost 做点什么")
+    await asyncio.sleep(0.1)
+    await _stop_runner(cli)
+    assert "未注册" in buf_text(cli.content_buffer)
+    item = cli._drawer.items[-1]
+    assert item.kind == "auto"
+
+
+async def test_non_at_input_unaffected():
+    """非 @ 输入:不触发分流,走原 auto 流程。"""
+    cli = make_cli()
+    cli.governor = MagicMock()
+    cli.governor.is_adoption_input.return_value = False
+    cli.governor.parse_flow = _noop_flow
+    await cli._on_user_input("普通需求")
+    await asyncio.sleep(0.1)
+    await _stop_runner(cli)
+    cli.governor.lookup_executor.assert_not_called()
+    assert cli._drawer.items[-1].kind == "auto"
+
+
+def test_delivery_item_target_default_empty():
+    """DeliveryItem.target 默认空串;add_item 可带 target。"""
+    from autoloop_agent.chat.drawer import DrawerPanel
+    drawer = DrawerPanel()
+    i1 = drawer.add_item("普通需求", "auto")
+    assert i1.target == ""
+    i2 = drawer.add_item("@auth 改错误码", "continuation", target="auth")
+    assert i2.target == "auth"

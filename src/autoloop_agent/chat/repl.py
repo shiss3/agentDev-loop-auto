@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
@@ -51,6 +52,9 @@ logger = logging.getLogger(__name__)
 _sdk_logger = logging.getLogger("claude_agent_sdk")
 _sdk_logger.addHandler(logging.NullHandler())
 _sdk_logger.propagate = False
+
+# @模块名 续作:@name + 空白 + 提示词(无提示词不匹配,落普通流程)
+_CONTINUATION_RE = re.compile(r"^@(\S+)\s+(.+)$")
 
 
 class ChatCLI:
@@ -297,6 +301,17 @@ class ChatCLI:
             self._resolve_answer(text)
             return
 
+        # @模块名 续作分流:注册表命中 -> 交付队列(跳过解析,resume 执行器会话)
+        m = _CONTINUATION_RE.match(text)
+        if m and self.governor.lookup_executor(m.group(1)):
+            self._enqueue_delivery(text, "continuation", target=m.group(1))
+            return
+        if m:
+            self.renderer.render_command_result(
+                f"执行器 @{m.group(1)} 未注册(未交付过该模块),按普通需求处理"
+            )
+            # 不 return:落回普通流程
+
         # 判断是斜杠命令还是普通消息
         if text.startswith("/"):
             await self._handle_command(text)
@@ -354,9 +369,9 @@ class ChatCLI:
 
     # ── 交付轨 FIFO 队列 ──
 
-    def _enqueue_delivery(self, text: str, kind: str) -> None:
+    def _enqueue_delivery(self, text: str, kind: str, *, target: str = "") -> None:
         """交付类输入入队(⏳待解析)并唤醒 runner。"""
-        item = self._drawer.add_item(text, kind)
+        item = self._drawer.add_item(text, kind, target=target)
         self._delivery_queue.append(item)
         self.tui.invalidate()
         if self._delivery_runner is None or self._delivery_runner.done():
@@ -390,6 +405,24 @@ class ChatCLI:
                 item.state = "executing"
                 self.tui.invalidate()
                 await self._drain_delivery_events(self.governor.adopt_flow())
+            elif item.kind == "continuation":
+                entry = self.governor.lookup_executor(item.target)
+                if entry is None:
+                    item.state = "failed"
+                    item.detail = "执行器未注册"
+                    self._drawer.append_log(
+                        f"✗ 需求 #{item.seq} 执行器 @{item.target} 未注册"
+                    )
+                    self.tui.invalidate()
+                    return
+                item.state = "executing"
+                self.tui.invalidate()
+                prompt = _CONTINUATION_RE.match(item.text).group(2)
+                await self._drain_delivery_events(
+                    self.governor.continuation_flow(
+                        item.target, prompt, entry["session_id"], entry["req_id"]
+                    )
+                )
             else:
                 item.state = "parsing"
                 self.tui.invalidate()

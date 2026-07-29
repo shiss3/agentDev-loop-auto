@@ -28,13 +28,14 @@ PANEL_WIDTH = 44
 
 @dataclass
 class DeliveryItem:
-    """交付队列项:auto=auto 模式需求;adoption=semi/auto 采纳方案进交付。"""
+    """交付队列项:auto=auto 模式需求;adoption=semi/auto 采纳方案进交付;continuation=@模块名续作。"""
 
     seq: int
     text: str
-    kind: str  # "auto" | "adoption"
+    kind: str  # "auto" | "adoption" | "continuation"
     state: str = "pending"
     detail: str = ""  # 调度结果/失败原因摘要(可选,追加在行尾)
+    target: str = ""  # continuation: 目标模块 module_id
 
 
 class DrawerPanel:
@@ -52,8 +53,8 @@ class DrawerPanel:
         """有历史项即显示(含全部完成的遗留列表)。"""
         return bool(self.items)
 
-    def add_item(self, text: str, kind: str) -> DeliveryItem:
-        item = DeliveryItem(seq=self._next_seq, text=text, kind=kind)
+    def add_item(self, text: str, kind: str, *, target: str = "") -> DeliveryItem:
+        item = DeliveryItem(seq=self._next_seq, text=text, kind=kind, target=target)
         self._next_seq += 1
         self.items.append(item)
         return item
