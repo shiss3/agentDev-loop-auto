@@ -143,6 +143,19 @@ class ChatCLI:
             echo=self.content_buffer.append_plain,
         )
 
+    async def _delivery_can_use_tool(
+        self, tool_name: str, tool_input: dict, context: ToolPermissionContext
+    ) -> PermissionResult:
+        """交付轨解析 query 权限回调：非 AskUserQuestion 一律拒绝（保解析只读）；
+        AskUserQuestion 走公共反问流程（渲染目标=右侧抽屉）。"""
+        if tool_name != "AskUserQuestion":
+            return PermissionResultDeny(message="解析阶段仅允许只读工具与反问")
+        return await self._ask_questions(
+            tool_input,
+            render_card=self._drawer.append_question_card,
+            echo=self._drawer.append_log,
+        )
+
     async def _ask_questions(
         self,
         tool_input: dict,
@@ -155,9 +168,11 @@ class ChatCLI:
         竞态:已有 pending answer(另一轨提问中)时先等其了结再占槽(后到排队)。
         render_card/echo 由调用方定渲染目标:交互轨=content_buffer,交付轨=drawer。
         """
-        prev = self._pending_answer
-        if prev is not None and not prev.done():
-            await asyncio.wait([prev])  # 不传播 prev 的取消/异常;自身取消照常抛出
+        # 竞态:已有 pending answer(另一轨提问中)时循环等其真正释放再占槽。
+        # 用 while 而非 if:对端多问流答完一问会立刻占槽渲下一问(新 future),
+        # 单次 wait 返回时槽可能已被重新占用,须重判直到真正空闲。
+        while self._pending_answer is not None and not self._pending_answer.done():
+            await asyncio.wait([self._pending_answer])  # 不传播 prev 的取消/异常;自身取消照常抛出
         answers: dict[str, str] = {}
         for q in tool_input.get("questions", []):
             question_text = q.get("question", "")
