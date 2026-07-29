@@ -425,7 +425,7 @@ class Governor:
           handler 截获 args 存闭包变量;流 AssistantMessage.tool_use 兜底(handler 未触发时)。
         - mcp_servers:plan_capture(SDK MCP,装 submit_analysis_plan)+ codegraph(stdio,探索工具)。
         - allowed_tools:只放读工具(codegraph_explore/Read/Glob/Grep)+ submit_analysis_plan,
-          disallowed_tools 禁一切写工具/任务工具/问答工具,保解析只读不副作用。
+          disallowed_tools 禁一切写工具/任务工具;AskUserQuestion 经 can_use_tool 回调反问,保解析只读不副作用。
         - strict_mcp_config=True:保留 model/env,禁 settings.json 的外部 MCP server。
         - max_turns=40:探索+拆任务+调用工具需多轮,4 turn 不够。
         截获失败 -> RuntimeError(降级交互轨,handle_user_input :363 catch)。

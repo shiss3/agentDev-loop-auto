@@ -4,4 +4,4 @@ from importlib.metadata import PackageNotFoundError, version
 try:
     __version__ = version("autoloop-agent")
 except PackageNotFoundError:
-    __version__ = "0.6.2"
+    __version__ = "0.0.0"
