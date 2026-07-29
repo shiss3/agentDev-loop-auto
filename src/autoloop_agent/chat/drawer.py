@@ -63,6 +63,14 @@ class DrawerPanel:
         for line in text.splitlines() or [""]:
             self.log_buf.append_plain(line)
 
+    def append_question_card(self, question: str, options: list[str]) -> None:
+        """解析反问卡(进流水):边框样式对齐 ContentBuffer.append_question_card。"""
+        self.append_log("┌ 解析反问 ──────────────────")
+        self.append_log(f"│ {question}")
+        for i, opt in enumerate(options, 1):
+            self.append_log(f"│  {i}. {opt}")
+        self.append_log("└ 输入编号选择，或直接输入自定义答案")
+
     def _item_row(self, item: DeliveryItem) -> StyleAndTextTuples:
         icon = _STATE_ICON.get(item.state, "?")
         summary = item.text.replace("\n", " ")[:30]

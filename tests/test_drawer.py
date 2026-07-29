@@ -61,3 +61,16 @@ def test_log_below_queue_rows():
     panel.append_log("LOG-MARK")
     text = _flat(panel)
     assert text.index("#1") < text.index("LOG-MARK")
+
+
+def test_append_question_card_into_log():
+    """解析反问卡：头部/问题/编号选项/footer 全进抽屉流水。"""
+    from autoloop_agent.chat.drawer import DrawerPanel
+    drawer = DrawerPanel()
+    drawer.append_question_card("用哪个方案？", ["方案A — 快", "方案B — 稳"])
+    text = "".join(frag[1] for frag in drawer.log_buf.get_formatted_text())
+    assert "┌ 解析反问" in text
+    assert "用哪个方案？" in text
+    assert "1. 方案A — 快" in text
+    assert "2. 方案B — 稳" in text
+    assert "└" in text
