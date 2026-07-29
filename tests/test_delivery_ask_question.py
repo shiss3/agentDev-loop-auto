@@ -136,3 +136,9 @@ async def test_esc_cancel_deny_not_dangling():
     assert isinstance(result, PermissionResultDeny)
     assert cli._pending_answer is None
     assert not cli.tui.answer_mode
+
+
+def test_governor_injected_with_delivery_callback():
+    """ChatCLI._create_session：Governor 挂 _delivery_can_use_tool 为解析回调。"""
+    cli = make_cli()
+    assert cli.governor._parse_can_use_tool == cli._delivery_can_use_tool

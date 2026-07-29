@@ -126,6 +126,7 @@ class ChatCLI:
             model=self.model,
             session_store=self.session_store,
             can_use_tool=self._can_use_tool,
+            parse_can_use_tool=self._delivery_can_use_tool,
         )
 
     # ── 权限回调（注入常驻执行体；ask 态触发）──
