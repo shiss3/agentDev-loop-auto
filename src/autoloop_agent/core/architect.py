@@ -159,6 +159,7 @@ REQUIREMENT_PARSER_PROMPT = """\
 0. 先判 request_kind（分类约定见下"request_kind 分类"）：meta_request/question 不探索代码、不拆 modules，直接跳第 2 步。
 1. 探索项目（仅 dev_task）：用 codegraph_explore 查符号/文件/调用路径，用 Read/Grep/Glob 读相关模块。
    先看代码再拆任务，intended_files 才有依据。不探索直接拆=盲拆，禁止。
+   需求关键信息缺失或有歧义且探索代码无法确定时，调用 AskUserQuestion 反问用户（少而精，能靠探索确定的不要问）。
 2. 调用 submit_analysis_plan 提交结构化任务单（参数=任务单各字段）。
 ## 输出字段
 - task_summary：一句话概括任务核心目标。
@@ -317,6 +318,7 @@ class Governor:
         *,
         session_store: SessionStore | None = None,
         can_use_tool: CanUseTool | None = None,
+        parse_can_use_tool: CanUseTool | None = None,
     ) -> None:
         self.project_dir = project_dir
         self.model = model
@@ -327,6 +329,12 @@ class Governor:
         # rebuild 经 _build_resident_session 复读本字段，重建后仍生效。
         self._can_use_tool = (
             can_use_tool if can_use_tool is not None else _default_can_use_tool
+        )
+        # 交付轨解析 query 的权限回调（chat 层注入；None 时默认拒绝反问，无头不悬挂）。
+        self._parse_can_use_tool = (
+            parse_can_use_tool
+            if parse_can_use_tool is not None
+            else _default_can_use_tool
         )
         # resident_plan：常驻会话方案生成工具截获的待采纳方案（Governor 持有，rebuild 不丢）。
         # 用户回复"采用方案"时消费（直接走完整交付流程）。
@@ -442,6 +450,7 @@ class Governor:
             model=self.model,
             max_turns=40,  # 探索+拆任务+调用工具需多轮
             strict_mcp_config=True,  # 禁外部 MCP(只留传入的 plan_capture/codegraph),保留 model/env
+            can_use_tool=self._parse_can_use_tool,
             mcp_servers={
                 "plan_capture": plan_server,
                 "codegraph": {
@@ -455,10 +464,11 @@ class Governor:
                 "Read", "Glob", "Grep",
                 "mcp__plan_capture__submit_analysis_plan",
             ],
+            # 写工具/任务工具/计划模式全禁;AskUserQuestion 移出,经 can_use_tool 回调反问
             disallowed_tools=[
                 "Bash", "Edit", "Write", "WebSearch", "WebFetch",
                 "TaskCreate", "TaskList", "TaskUpdate", "TaskGet",
-                "EnterPlanMode", "ExitPlanMode", "AskUserQuestion",
+                "EnterPlanMode", "ExitPlanMode",
             ],
         )
         prefix = "接续修改" if context_continuation else "全新任务"

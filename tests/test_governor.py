@@ -19,7 +19,9 @@ import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, SessionStore, ToolUseBlock
 from autoloop_agent.chat.events import EventType, text_event
 from autoloop_agent.core import architect
-from autoloop_agent.core.architect import Governor, validate_modules
+from autoloop_agent.core.architect import Governor, _default_can_use_tool, validate_modules
+from autoloop_agent.core.base_session import BaseAgentSession
+import autoloop_agent.core.architect as architect_module
 # ── 辅助 ──────────────────────────────────────────────
 def make_fake_assistant_msg(spec=None, usage=None):
     """构造能通过 isinstance(msg, AssistantMessage) 检查的 fake 消息。
@@ -199,7 +201,7 @@ async def test_parse_requirement_explores_project(monkeypatch):
     assert "Write" in opts.disallowed_tools
     assert "WebSearch" in opts.disallowed_tools
     assert "TaskCreate" in opts.disallowed_tools
-    assert "AskUserQuestion" in opts.disallowed_tools
+    assert "AskUserQuestion" not in opts.disallowed_tools  # 经 can_use_tool 回调反问,不禁掉
 
 # ── 3. _decide_track 全满足(patch+1-5+cross_domain=False) -> interactive ──
 def test_decide_track_all_patch_interactive():
@@ -993,3 +995,47 @@ def test_is_adoption_input_public():
     assert governor.is_adoption_input("采用方案") is True
     assert governor.is_adoption_input("采用方案。") is True  # 末尾标点归一化
     assert governor.is_adoption_input("请采用方案重构") is False  # 精确匹配不误吞
+
+
+async def test_parse_query_wires_can_use_tool_and_allows_ask(monkeypatch):
+    """_parse_requirement 的 ClaudeAgentOptions：can_use_tool 挂载注入回调，
+    disallowed_tools 不含 AskUserQuestion（走回调拦截而非禁掉）。"""
+    seen = {}
+
+    async def fake_query(*, prompt, options):
+        seen["options"] = options
+        return
+        yield  # 空 async generator -> captured_spec None -> RuntimeError
+
+    monkeypatch.setattr(architect_module, "query", fake_query)
+    callback = AsyncMock()
+    governor = Governor(
+        project_dir=".",
+        session_store=MagicMock(spec=SessionStore),
+        parse_can_use_tool=callback,
+    )
+    with pytest.raises(RuntimeError):
+        await governor._parse_requirement("做个登录页", context_continuation=False)
+    opts = seen["options"]
+    assert opts.can_use_tool is callback
+    assert "AskUserQuestion" not in (opts.disallowed_tools or [])
+
+
+async def test_parse_can_use_tool_default_denies_ask():
+    """未注入时缺省 _default_can_use_tool：AskUserQuestion 拒绝（无头不悬挂）。"""
+    governor = Governor(project_dir=".", session_store=MagicMock(spec=SessionStore))
+    assert governor._parse_can_use_tool is _default_can_use_tool
+
+
+async def test_rebuild_retains_parse_can_use_tool(monkeypatch):
+    """rebuild 后注入的 parse_can_use_tool 仍在（字段挂 Governor 不挂 resident）。"""
+    callback = AsyncMock()
+    governor = Governor(
+        project_dir=".",
+        session_store=MagicMock(spec=SessionStore),
+        parse_can_use_tool=callback,
+    )
+    monkeypatch.setattr(BaseAgentSession, "start", AsyncMock())
+    monkeypatch.setattr(BaseAgentSession, "close", AsyncMock())
+    await governor.rebuild()
+    assert governor._parse_can_use_tool is callback
