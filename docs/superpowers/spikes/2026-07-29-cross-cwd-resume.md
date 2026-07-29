@@ -3,7 +3,7 @@
 日期：2026-07-29
 计划：`docs/superpowers/plans/2026-07-29-executor-continuation.md` Task 0
 
-## 结论：**不可行**
+## 结论：跨 cwd 不可行；**同路径重建 cwd 后 resume 可行（采用此路）**
 
 ## 实测
 
@@ -35,8 +35,23 @@ claude -p --resume c56ba1d2-a6aa-4dc3-8ab7-3772382618a6 "暗号是什么?只回�
 
 session 存储按 cwd 项目 slug 分目录（`~/.claude/projects/<slug-of-cwd>/`），`--resume` 只在**当前 cwd 对应的项目目录**下查找 session。cwd 不同 = 查不到。
 
-对本特性的影响：模块执行器 session 建于已删除的 worktree（`.worktrees/deliver-<req>-<mid>`），续作在新 worktree（路径不同），`--resume` 必然查不到 → 不可行。
+### Step 3（补充）: 同路径重建 cwd 后 resume —— **可行** ✅
 
-## 下一步
+```bash
+# 删掉 resume-a 后,重建同路径空目录
+mkdir -p .spike/resume-a && cd .spike/resume-a
+claude -p --resume c56ba1d2-... "暗号是什么?只回答暗号本身。" (同前 flags)
+```
 
-按 spec §5 降级：**上下文重注入**——不 resume，把该模块历史 dispatch manifest + 交付摘要拼进 prompt。降级方案需用户确认后实施（spec 既定流程）。
+- result 正常完成（duration_ms=6881），模型回复 **`蓝鲸42`** ✅
+- 结论：session 查找只看 cwd 路径字符串；目录曾删除、同路径重建空目录不影响。
+
+## 对本特性的落地方案
+
+worktree 路径确定性：`deliver-<req_id>-<module_id>`（worktree.py:29）。**续作时用注册表里的原 req_id 重建 worktree = 恢复原 cwd = resume 命中**，无需降级重注入：
+
+1. 注册表 `req_id` 字段（spec 已定）正是关键。
+2. `continuation_flow` 把原 req_id 放进合成 spec（`_req_id` 键），`_spec_to_modules` 优先吃它而非新生成。
+3. 分支从当前 HEAD 重建（模块代码已 merge 主干，起点正确）；`create_delivery_worktree` 幂等处理残留。
+
+前提：同一台机器（session 存本机 `~/.claude/projects/`）——本地工具，成立。

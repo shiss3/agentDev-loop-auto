@@ -63,6 +63,9 @@ git commit -m "test: spike 跨 cwd resume 可行性实测结论"
 
 **Gate:** spike 结论"可行"才继续 Task 1；"不可行"停止，报用户确认降级（spec §5）。
 
+**Spike 实测结论（2026-07-29，已记录于 spikes/2026-07-29-cross-cwd-resume.md）：**
+跨 cwd resume 不可行，但**同路径重建 cwd 后 resume 可行**（session 查找只看 cwd 路径字符串；目录删除后同路径重建不影响）。落地方案：续作用注册表里的**原 req_id** 重建 worktree（路径确定性 `deliver-<req_id>-<mid>`）= 恢复原 cwd = resume 命中。Task 3 的 `continuation_flow` 因此多收一个 `req_id` 参数并透传进 spec（`_req_id` 键，`_spec_to_modules` 优先吃它）。
+
 ---
 
 ### Task 1: executor_registry.py + extract_session_id
@@ -340,9 +343,10 @@ git commit -m "feat: build_executor_args 支持 --resume 续作变体"
 **Interfaces:**
 - Consumes: Task 1 `executor_registry`（`lookup`/`register_executor`/`extract_session_id`）；Task 2 `build_executor_args(resume_session_id=...)`。
 - Produces:
-  - `Governor.continuation_flow(module_id: str, prompt: str, session_id: str) -> AsyncIterator[ChatEvent]`（Task 4 消费）
-  - `Governor.lookup_executor(module_id: str) -> dict | None`（Task 4 消费）
+  - `Governor.continuation_flow(module_id: str, prompt: str, session_id: str, req_id: str) -> AsyncIterator[ChatEvent]`（Task 4 消费；req_id=注册表里的原 req_id，决定 worktree 路径=resume 命中前提）
+  - `Governor.lookup_executor(module_id: str) -> dict | None`（Task 4 消费；entry 含 `session_id` 与 `req_id`）
   - `Governor._run_delivery(spec: dict, *, resume: dict[str, str] | None = None)`（resume 为 `module_id -> session_id`，默认 None 行为不变）
+  - `_spec_to_modules` 优先吃 `spec["_req_id"]`（无则 `_new_req_id()`，行为不变）
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -371,7 +375,7 @@ async def _collect(events) -> list:
 
 
 async def test_continuation_flow_synthesizes_single_module_spec(tmp_path, monkeypatch):
-    """continuation_flow:合成单模块 spec(follow-1 子任务)+ resume 映射,走 _run_delivery。"""
+    """continuation_flow:合成单模块 spec(follow-1 子任务)+ resume 映射 + _req_id 透传,走 _run_delivery。"""
     seen = {}
 
     async def fake_run_delivery(self, spec, *, resume=None):
@@ -382,9 +386,10 @@ async def test_continuation_flow_synthesizes_single_module_spec(tmp_path, monkey
 
     monkeypatch.setattr(Governor, "_run_delivery", fake_run_delivery)
     g = make_governor(tmp_path)
-    await _collect(g.continuation_flow("auth", "把错误码改中文", "sess-abc"))
+    await _collect(g.continuation_flow("auth", "把错误码改中文", "sess-abc", "req-orig"))
     spec, resume = seen["spec"], seen["resume"]
     assert resume == {"auth": "sess-abc"}
+    assert spec["_req_id"] == "req-orig"  # 原 req_id:worktree 同路径=resume 命中前提
     assert spec["task_summary"] == "把错误码改中文"
     modules = spec["modules"]
     assert len(modules) == 1
@@ -395,6 +400,16 @@ async def test_continuation_flow_synthesizes_single_module_spec(tmp_path, monkey
     assert m["subtasks"] == [
         {"id": "follow-1", "summary": "把错误码改中文", "intended_files": [], "acceptance": []}
     ]
+
+
+def test_spec_to_modules_honors_req_id_override(tmp_path):
+    """_spec_to_modules:spec 带 _req_id 用它(续作同路径);不带则新生成(行为不变)。"""
+    g = make_governor(tmp_path)
+    spec = {"_req_id": "req-orig", "modules": [{"module_id": "auth", "subtasks": []}]}
+    req_id, _ = g._spec_to_modules(spec)
+    assert req_id == "req-orig"
+    req_id2, _ = g._spec_to_modules({"modules": []})
+    assert req_id2 and req_id2 != "req-orig"
 
 
 async def test_run_delivery_default_resume_none_unchanged(tmp_path, monkeypatch):
@@ -478,9 +493,10 @@ from autoloop_agent.core.executor_registry import (
         return registry_lookup(self.project_dir, module_id)
 
     async def continuation_flow(
-        self, module_id: str, prompt: str, session_id: str
+        self, module_id: str, prompt: str, session_id: str, req_id: str
     ) -> AsyncIterator[ChatEvent]:
-        """续作段公开入口:合成单模块 spec + resume 执行器会话,走完整交付流程(跳过解析)。"""
+        """续作段公开入口:合成单模块 spec + resume 执行器会话,走完整交付流程(跳过解析)。
+        req_id=原交付 req_id(注册表存):worktree 路径 deliver-<req_id>-<mid> 复原 = resume 命中前提。"""
         module = {
             "module_id": module_id,
             "summary": prompt,
@@ -491,7 +507,12 @@ from autoloop_agent.core.executor_registry import (
             ],
             "deps": [],
         }
-        spec = {"task_summary": prompt, "risk_level": "low", "modules": [module]}
+        spec = {
+            "task_summary": prompt,
+            "risk_level": "low",
+            "modules": [module],
+            "_req_id": req_id,
+        }
         async for event in self._run_delivery(spec, resume={module_id: session_id}):
             yield event
 
@@ -538,6 +559,14 @@ merge 成功分支（`merged.append(mid)` + `✅` 事件之后）加：
 ```
 
 3e. `_run_module_slot` 签名加 `resume_session_id: str | None = None`，`build_executor_args(prompt, max_turns)` 改 `build_executor_args(prompt, max_turns, resume_session_id=resume_session_id)`。
+
+3f. `_spec_to_modules`（architect.py:562）req_id 生成行改：
+
+```python
+        req_id = spec.get("_req_id") or self._new_req_id()
+```
+
+（`continuation_flow` 传原 req_id → worktree 同路径；其他调用方 spec 无 `_req_id` → 行为不变。）
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -730,7 +759,7 @@ _CONTINUATION_RE = re.compile(r"^@(\S+)\s+(.+)$")
                 prompt = _CONTINUATION_RE.match(item.text).group(2)
                 await self._drain_delivery_events(
                     self.governor.continuation_flow(
-                        item.target, prompt, entry["session_id"]
+                        item.target, prompt, entry["session_id"], entry["req_id"]
                     )
                 )
 ```
