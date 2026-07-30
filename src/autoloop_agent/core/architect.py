@@ -763,6 +763,10 @@ class Governor:
                 return
             async for event in self._run_delivery(self.last_spec):
                 yield event
+            if self.last_track == "interactive":
+                # 交付段无模块降级 -> 本流内直接补跑常驻轨(无队列层时保持原语义)
+                async for event in self._resident.send(text):
+                    yield event
             return
         yield _build_message(
             f"🔀 调度: {track}（{spec.get('task_summary', '')[:40]}）"
@@ -787,9 +791,10 @@ class Governor:
                     "⚠️ 高风险需求但解析未拆出模块（模型违规），已拦截不执行（常驻不直写高风险）。请人工介入或重述需求。"
                 )
                 return
+            # 不在交付事件流内跑 resident(chat 层会把流 drain 进右栏抽屉);
+            # 置回 interactive 由调用方回注左栏常驻轨执行(与解析异常降级同路径)。
+            self.last_track = "interactive"
             yield _build_message("⚠️ 交付轨无模块，降级交互轨执行。")
-            async for event in self._resident.send(self._last_text):
-                yield event
             return
         req_id, modules = self._spec_to_modules(spec)
         for w in validate_modules(modules):

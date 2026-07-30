@@ -441,6 +441,12 @@ class ChatCLI:
                 await self._drain_delivery_events(
                     self.governor.deliver_flow(self.governor.last_spec)
                 )
+                if self.governor.last_track == "interactive":
+                    # 交付段无模块降级 -> 回注左栏常驻轨(同解析判交互轨路径)
+                    item.state = "to_interactive"
+                    self.tui.invalidate()
+                    self._inject_interactive(item.text)
+                    return
             item.state = "done"
         except asyncio.CancelledError:
             raise
