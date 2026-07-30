@@ -1,6 +1,6 @@
 # agentDev-autoLoop
 
-> 基于 Claude Agent SDK 的需求自动循环开发系统
+> 基于 Claude Agent SDK 的 需求解析 - 需求调度 - 需求执行 的自动循环开发系统
 
 ## 安装 (使用 pip)
 
