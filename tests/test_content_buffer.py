@@ -2,7 +2,7 @@
 
 from prompt_toolkit.formatted_text import FormattedText
 
-from harness_agent.chat.content_buffer import ContentBuffer
+from autoloop_agent.chat.content_buffer import ContentBuffer
 
 
 class TestContentBufferBasics:

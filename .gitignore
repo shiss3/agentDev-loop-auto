@@ -19,7 +19,7 @@ env/
 *.swo
 
 # Environment
-//.env
+.env
 
 # OS
 .DS_Store
@@ -32,3 +32,18 @@ htmlcov/
 
 # uv
 uv.lock
+
+# AutoLoop worktrees (Phase 2 L0 Full mode)
+.autoloop/
+
+# 交付 worktree 副本（git worktree，非主仓内容）
+.claude/worktrees/
+
+# 本机交付日志(交付轨 run 产物,含本机路径)
+.claude/delivery-logs/
+
+# 本机解析日志(自测 AUTOLOOP_PARSE_LOG=1 产物)
+.claude/parse-logs/
+
+# Task queue DB (Step 2)
+*.db

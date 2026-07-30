@@ -1,20 +1,23 @@
 """ContextProvider 接口测试"""
 
-from harness_agent.context.provider import (
+from autoloop_agent.context.provider import (
     ContextProvider,
     DefaultContextProvider,
+    SystemPromptType,
 )
 
 
-def test_default_provider_passthrough():
+def test_default_provider_returns_claude_code_preset():
+    """默认提供者返回 Claude Code preset"""
     provider = DefaultContextProvider()
     result = provider.build_system_prompt("base prompt", "/project")
-    assert result == "base prompt"
+    # 返回纯 Claude Code preset，无任何追加
+    assert result == {"type": "preset", "preset": "claude_code"}
 
 
 def test_default_provider_summary():
     provider = DefaultContextProvider()
-    assert "未配置" in provider.get_context_summary()
+    assert "Claude Code" in provider.get_context_summary()
 
 
 def test_default_provider_context_never_changes():
@@ -43,7 +46,8 @@ def test_custom_provider_duck_typing():
     """自定义实现不需要显式继承，只要方法签名匹配"""
 
     class MyProvider:
-        def build_system_prompt(self, base_prompt: str, project_dir: str) -> str:
+        def build_system_prompt(self, base_prompt: str, project_dir: str) -> SystemPromptType:
+            # 自定义返回字符串格式
             return f"[{project_dir}] {base_prompt}"
 
         def on_turn_end(self, prompt: str, response_summary: str, tool_calls: list) -> None:

@@ -4,12 +4,11 @@
 不测试 prompt_toolkit Application（需要真实终端）。
 """
 
-from harness_agent.chat.content_buffer import ContentBuffer
-from harness_agent.chat.tui_app import TuiApp
-from harness_agent.chat.renderer import ChatRenderer
-from harness_agent.chat.events import (
+from autoloop_agent.chat.content_buffer import ContentBuffer
+from autoloop_agent.chat.tui_app import TuiApp
+from autoloop_agent.chat.renderer import ChatRenderer
+from autoloop_agent.chat.events import (
     ChatEvent,
-    EventType,
     text_event,
     tool_use_event,
     tool_result_event,

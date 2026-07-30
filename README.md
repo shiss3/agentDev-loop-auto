@@ -27,17 +27,17 @@ cp .env.example .env
 
 ## 使用 CLI
 
-确保虚拟环境已激活后，您可以直接运行 `harness` 命令：
+确保虚拟环境已激活后，您可以直接运行 `autoloop` 命令：
 
 ```bash
 # 查看版本
-harness --version
+autoloop --version
 
 # 执行开发任务
-harness run "创建一个 hello_world.py"
+autoloop run "创建一个 hello_world.py"
 
 # 指定项目目录运行
-harness run "重构 user.py" --project ./my-app
+autoloop run "重构 user.py" --project ./my-app
 ```
 
 ## 运行测试
